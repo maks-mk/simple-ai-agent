@@ -1,0 +1,26 @@
+# LLM и LangChain
+langchain
+langchain-core
+langchain-google-genai
+langgraph
+langchain-openai
+
+# MCP адаптер для LangChain
+langchain-mcp-adapters
+
+# Переменные окружения
+python-dotenv
+
+# UI и CLI
+streamlit
+rich
+prompt_toolkit
+
+# Дополнительные зависимости
+pydantic
+httpx
+pygments
+watchdog
+#long_term_memory
+chromadb
+sentence-transformers

@@ -1,0 +1,33 @@
+{
+  "filesystem": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "{filesystem_path}"],
+    "transport": "stdio",
+    "enabled": true
+  },
+  "duckduckgo": {
+    "command": "uvx",
+    "args": ["duckduckgo-mcp-server"],
+    "transport": "stdio",
+    "enabled": false
+  },
+  "fetch": {
+    "command": "uvx",
+    "args": ["mcp-server-fetch"],
+    "transport": "stdio",
+    "enabled": false
+  },
+  "win-cli": {
+    "command": "npx",
+    "args": ["@simonb97/server-win-cli", "--config", "./win-cli-config.json"],
+    "transport": "stdio",
+    "enabled": true
+  },
+  "tavily-remote-mcp": {
+    "command": "npx",
+    "args": ["-y", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=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"],
+    "env": {},
+    "transport": "stdio",
+    "enabled": true
+  }
+}

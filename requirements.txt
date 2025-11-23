@@ -24,3 +24,4 @@ watchdog
 #long_term_memory
 chromadb
 sentence-transformers
+nest_asyncio

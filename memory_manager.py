@@ -14,7 +14,10 @@ try:
     import chromadb
     from sentence_transformers import SentenceTransformer
 except ImportError:
-    raise ImportError("Для работы памяти установите: pip install chromadb sentence-transformers")
+    # Позволяем коду, который импортирует MemoryManager через agent.py,
+    # самостоятельно обработать отсутствие зависимостей.
+    chromadb = None  # type: ignore
+    SentenceTransformer = None  # type: ignore
 
 # Настройка логгера
 logger = logging.getLogger(__name__)
@@ -32,6 +35,9 @@ class MemoryManager:
         """
         Инициализация MemoryManager.
         """
+        if chromadb is None or SentenceTransformer is None:  # type: ignore[truthy-function]
+            raise ImportError("Для работы памяти установите: pip install chromadb sentence-transformers")
+
         self.db_path = db_path
         self.embedding_model_name = embedding_model
         self.top_k = top_k
@@ -78,16 +84,16 @@ class MemoryManager:
             results = self.collection.query(
                 query_embeddings=[query_emb],
                 n_results=n_results,
-                include=["documents"]
             )
             
             # Находим ID документов, которые нужно удалить
-            # Поскольку ID генерируется через SHA256 от текста, 
-            # мы можем использовать найденный текст для перегенерации ID, 
+            # Поскольку ID генерируется через SHA256 от текста,
+            # мы можем использовать найденный текст для перегенерации ID,
             # чтобы быть уверенными в удалении точного факта.
-            ids_to_delete = []
-            if results.get("documents", []) and results["documents"][0]:
-                for doc_text in results["documents"][0]:
+            ids_to_delete: List[str] = []
+            docs = results.get("documents") or []
+            if docs and len(docs) > 0 and docs[0]:
+                for doc_text in docs[0]:
                     ids_to_delete.append(self._generate_id(doc_text))
 
             if not ids_to_delete:

@@ -66,8 +66,14 @@
 
 ```bash
 python start.py  # Меню (CLI/UI)
+
 python start.py cli  # Терминал
+или
+python agent_cli.py
+
 python start.py ui   # Web (http://localhost:8501)
+или
+streamlit run ui.py
 ```
 
 ### MCP Конфиг (`mcp.json`)

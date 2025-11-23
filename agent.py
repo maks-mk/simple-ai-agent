@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Any, Dict, Optional
 from dataclasses import dataclass
 from functools import lru_cache
+from datetime import datetime
 
 # LangChain / LangGraph
 from dotenv import load_dotenv
@@ -17,7 +18,6 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import tool
-from datetime import datetime
 
 # Локальные импорты
 from logging_config import setup_logging
@@ -54,51 +54,54 @@ class AgentConfig:
     mcp_config_path: str = "mcp.json"
     prompt_path: str = "prompt.txt"
     system_prompt_default: str = "Ты полезный AI-ассистент."
-    
-    #session_size: int = int(os.getenv("SESSION_SIZE", "6"))
-
     # Настройки памяти (читаем из .env)
     use_long_term_memory: bool = os.getenv("LONG_TERM_MEMORY", "false").lower() == "true"
     memory_db_path: str = "./memory_db"
     session_size: int = int(os.getenv("SESSION_SIZE", "6"))
 
-#@lru_cache(maxsize=1)
+@lru_cache(maxsize=1)
+def _read_prompt_template(path_str: str) -> str:
+    base_dir = Path(__file__).parent
+    path = base_dir / path_str
+    default = "Ты полезный AI-ассистент."
+    
+    if path.exists():
+        try:
+            return path.read_text(encoding='utf-8')
+        except Exception as e:
+            # Используем глобальный объект logger, который вы создали выше через setup_logging()
+            logger.error(f"Ошибка чтения промпта {path}: {e}")
+            return default
+    return default
+
+# 2. Публичная функция: собирает промпт с актуальным временем (НЕ кэшируется)
 def load_system_prompt(path_str: str = "prompt.txt") -> str:
     """
     Читает системный промпт с диска и внедряет динамические переменные (дата, CWD).
     """
-    path = Path.cwd() / path_str
-    default = "Ты полезный AI-ассистент."
-    
-    # 1. Читаем исходный текст
-    if path.exists():
-        try:
-            content = path.read_text(encoding='utf-8')
-        except Exception as e:
-            logger.error(f"Ошибка чтения промпта {path}: {e}")
-            content = default
-    else:
-        content = default
+    # Получаем текст из кэша
+    content = _read_prompt_template(path_str)
 
-    # 2. Вычисляем текущую дату и время
+    # Вычисляем свежее время
     now = datetime.now()
-    # Формат: 2023-10-27 (Friday) | 14:30
     current_date_str = now.strftime("%Y-%m-%d (%A)")
     current_time_str = now.strftime("%H:%M")
 
-    # 3. Подставляем переменную {{current_date}}
+    # Подставляем переменные
     if "{{current_date}}" in content:
         content = content.replace("{{current_date}}", current_date_str)
+        # Можно добавить поддержку времени, если нужно
+        if "{{current_time}}" in content:
+             content = content.replace("{{current_time}}", current_time_str)
     else:
-        # Если переменной нет в файле, добавляем дату в конец, чтобы агент всё равно её знал
+        # Если меток нет, добавляем блок в конец
         content += f"\n\n[System Info]\nCurrent Date: {current_date_str}\nCurrent Time: {current_time_str}"
 
-    # 4. Добавляем рабочий каталог (CWD)
     return f"{content}\n\nCWD: {Path.cwd()}"
-
+    
 def load_mcp_config(path_str: str = "mcp.json") -> Dict[str, Any]:
     """Читает конфиг MCP серверов."""
-    path = Path.cwd() / path_str
+    path = Path(__file__).parent / path_str
     if not path.exists():
         return {}
     
@@ -127,8 +130,14 @@ def create_memory_tools(db_path: str, session_size: int) -> List[Any]:
     """Создает инструменты для работы с памятью, если включено."""
     try:
         from memory_manager import MemoryManager
-        
-        memory = MemoryManager(db_path=db_path, session_size=session_size)
+
+        # Конструктор MemoryManager может упасть из-за проблем с ChromaDB/файловой системой.
+        try:
+            memory = MemoryManager(db_path=db_path, session_size=session_size)
+        except Exception as db_err:
+            logger.error(f"ChromaDB init failed: {db_err}")
+            return []
+
         print(f"🧠 Long-term memory loaded from {db_path}")
 
         # === 1. Инструмент сохранения ===
@@ -241,26 +250,34 @@ def create_llm(config: Optional[AgentConfig] = None) -> BaseChatModel:
     """Создает LLM (Gemini или OpenAI) на основе конфига."""
     if config is None:
         config = AgentConfig()
-        
-    if config.provider == "gemini":
+    
+    provider = config.provider
+    if provider not in ("gemini", "openai"):
+        raise ValueError(f"Неподдерживаемый PROVIDER: {provider}")
+    
+    if provider == "gemini":
+        if not config.gemini_key:
+            raise RuntimeError("GEMINI_API_KEY не задан. Установите его в .env")
         return ChatGoogleGenerativeAI(
             model=config.gemini_model,
-            temperature=0.2,
+            temperature=config.temperature,
             google_api_key=config.gemini_key,
             max_retries=config.max_retries,
             streaming=True
         )
     else:
+        if not config.openai_key:
+            raise RuntimeError("OPENAI_API_KEY не задан. Установите его в .env")
         return ChatOpenAI(
             model=config.openai_model,
-            temperature=0.2,
+            temperature=config.temperature,
             api_key=config.openai_key,
             base_url=config.openai_base_url,
             streaming=True
         )
 
 async def create_agent_graph(config: Optional[AgentConfig] = None):
-    """Сборка всего графа агента."""
+    """Сборка всего графа агента с гарантированным Retry."""
     if config is None:
         config = AgentConfig()
         
@@ -268,10 +285,27 @@ async def create_agent_graph(config: Optional[AgentConfig] = None):
     llm = create_llm(config)
     prompt = load_system_prompt(config.prompt_path)
 
+    # === ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНЫЙ RETRY ===
+    
+    # 1. Сначала привязываем инструменты.
+    # Это важно сделать ДО retry, чтобы модель знала о функциях.
+    llm_with_tools = llm.bind_tools(tools)
+    
+    # 2. Оборачиваем модель с инструментами в логику повторов.
+    # stop_after_attempt - сколько всего попыток (включая первую).
+    # wait_exponential_jitter - умная задержка (1с, 2с, 4с...), чтобы не дудосить API.
+    llm_robust = llm_with_tools.with_retry(
+        stop_after_attempt=config.max_retries,
+        wait_exponential_jitter=True
+    )
+    
+    # 3. Создаем агента, передавая уже "обернутую" модель.
     agent = create_react_agent(
-        llm,
-        tools,
+        model=llm_robust,  # Передаем модель с Retry
+        tools=tools,
         prompt=prompt,
         checkpointer=MemorySaver()
     )
+    # =========================================
+    
     return agent

@@ -1,13 +1,18 @@
 import streamlit as st
 import asyncio
 import uuid
-import time # <--- NEW: Нужен для sleep в retry_delay
+import time  # <--- Нужен для sleep в retry_delay
+import nest_asyncio  # Для безопасной работы asyncio внутри Streamlit
 from langchain_core.messages import HumanMessage
 from agent import create_agent_graph, AgentConfig
 
 # ----------------------------
 # 1. КОНФИГ UI
 # ----------------------------
+
+# Патчим asyncio для работы внутри Streamlit
+nest_asyncio.apply()
+
 st.set_page_config(page_title="AI Agent", page_icon="🤖", layout="wide")
 
 st.markdown("""
@@ -27,30 +32,25 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ----------------------------
-# 2. "ВЕЧНАЯ" ИНИЦИАЛИЗАЦИЯ (Singleton)
+# 2. ИНИЦИАЛИЗАЦИЯ ГРАФА (Singleton)
 # ----------------------------
-# Теперь функция зависит от параметров. Если они меняются — агент пересоздается.
+# Теперь кэшируем только граф агента и конфиг, без event loop.
 @st.cache_resource
-def get_agent_bundle(temperature, max_retries, retry_delay):
-    """
-    Создает агента с динамическими настройками.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # === NEW: Передаем параметры из UI в конфиг ===
-    # Мы создаем конфиг, переопределяя значения из .env значениями из UI
+def get_agent_graph(temperature, max_retries, retry_delay):
+    """Создает и кэширует граф агента с динамическими настройками."""
+
+    # Переопределяем значения из .env значениями из UI
     config = AgentConfig(
         temperature=temperature,
         max_retries=max_retries,
-        retry_delay=retry_delay
+        retry_delay=retry_delay,
     )
-    # ==============================================
-    
-    agent = loop.run_until_complete(create_agent_graph(config))
-    
+
+    # Однократное создание графа агента
+    agent = asyncio.run(create_agent_graph(config))
+
     print(f"✅ SYSTEM: Агент инициализирован (Temp: {temperature})")
-    return loop, agent, config
+    return agent, config
 
 # ----------------------------
 # 3. УПРАВЛЕНИЕ СЕССИЕЙ
@@ -94,7 +94,7 @@ with st.sidebar:
             value=default_cfg.retry_delay
         )
     # ================================
-
+    
     st.divider()
     
     model_name = default_cfg.gemini_model if default_cfg.provider == "gemini" else default_cfg.openai_model
@@ -116,10 +116,10 @@ with st.sidebar:
 # === ИНИЦИАЛИЗАЦИЯ С ПАРАМЕТРАМИ ===
 try:
     # Передаем значения из слайдеров в функцию кэширования
-    cached_loop, cached_agent, current_config = get_agent_bundle(
-        ui_temperature, 
-        ui_max_retries, 
-        ui_retry_delay
+    cached_agent, current_config = get_agent_graph(
+        ui_temperature,
+        ui_max_retries,
+        ui_retry_delay,
     )
 except Exception as e:
     st.error(f"Ошибка инициализации агента: {e}")
@@ -191,7 +191,7 @@ if user_input:
                             content = str(message.content)
                             with status_box.expander(f"✅ Результат: {tool_name}", expanded=False):
                                 st.code(content[:1000] + ("..." if len(content) > 1000 else ""))
-
+                    
                     resp_container.markdown(text_buffer)
                     status_box.update(label="Готово", state="complete", expanded=False)
                     return text_buffer
@@ -209,7 +209,8 @@ if user_input:
                     return f"Error: {e}"
 
             try:
-                final_res = cached_loop.run_until_complete(process_stream())
+                # Запускаем асинхронную логику через asyncio.run
+                final_res = asyncio.run(process_stream())
                 if final_res:
                     st.session_state.messages.append(("assistant", final_res))
             except RuntimeError as e:

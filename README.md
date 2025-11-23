@@ -91,7 +91,7 @@ python start.py ui   # Web (http://localhost:8501)
 | ------------------- | -------------------------------------------- |
 | `agent.py`          | Ядро агента (LangGraph + инструменты).       |
 | `memory_manager.py` | Долговременная память (ChromaDB).            |
-| `prompt.md`         | Системный промпт (правила МЫСЛЬ → ДЕЙСТВИЕ). |
+| `prompt.txt`         | Системный промпт (правила МЫСЛЬ → ДЕЙСТВИЕ). |
 | `agent_cli.py`      | CLI-интерфейс (`rich`/`prompt_toolkit`).     |
 | `ui.py`             | Web UI (Streamlit).                          |
 | `start.py`          | Запуск (CLI/UI).                             |

@@ -15,7 +15,7 @@
     "command": "uvx",
     "args": ["mcp-server-fetch"],
     "transport": "stdio",
-    "enabled": false
+    "enabled": true
   },
   "win-cli": {
     "command": "npx",
@@ -25,7 +25,7 @@
   },
   "tavily-remote-mcp": {
     "command": "npx",
-    "args": ["-y", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=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"],
+    "args": ["-y", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=your-api-key"],
     "env": {},
     "transport": "stdio",
     "enabled": true

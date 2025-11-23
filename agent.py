@@ -48,7 +48,7 @@ class AgentConfig:
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o")
     openai_base_url: Optional[str] = os.getenv("OPENAI_BASE_URL")
     mcp_config_path: str = "mcp.json"
-    prompt_path: str = "prompt.md"
+    prompt_path: str = "prompt.txt"
     system_prompt_default: str = "Ты полезный AI-ассистент."
     #session_size: int = int(os.getenv("SESSION_SIZE", "6"))
 

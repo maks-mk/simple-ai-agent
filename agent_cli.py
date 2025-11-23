@@ -55,7 +55,7 @@ async def interactive_loop(agent):
         lexer=PygmentsLexer(MarkdownLexer),
     )
     
-    console.print("\n[bold green]Чат начат[/] (Enter = Отправить, Esc+Enter = Новая строка, 'exit' = Выход)\n")
+    console.print("\n[bold green]Чат начат[/] (Enter = Отправить, Alt+Enter = Новая строка, 'exit' = Выход)\n")
 
     while True:
         try:
@@ -79,6 +79,7 @@ async def interactive_loop(agent):
                     {"messages": [HumanMessage(content=user_input)]},
                     config=config,
                     stream_mode="messages"
+                    # recursion_limit=50
                 ):
                     message, metadata = event
                     node = metadata.get("langgraph_node")
@@ -118,6 +119,9 @@ async def interactive_loop(agent):
         except Exception as e:
             logger.exception("Runtime Error")
             console.print(f"\n[bold red]Ошибка цикла: {e}[/]")
+            delay = int(os.getenv("RETRY_DELAY", "2"))
+            console.print(f"[dim]Повторная попытка ввода через {delay} сек...[/]")
+            time.sleep(delay)
 
 async def main():
     if os.name == "nt": os.system("cls")

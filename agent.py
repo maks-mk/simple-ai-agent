@@ -16,7 +16,8 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_core.language_models import BaseChatModel
-from langchain_core.tools import tool # Добавить этот импорт
+from langchain_core.tools import tool
+from datetime import datetime
 
 # Локальные импорты
 from logging_config import setup_logging
@@ -47,9 +48,13 @@ class AgentConfig:
     openai_key: Optional[str] = os.getenv("OPENAI_API_KEY")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o")
     openai_base_url: Optional[str] = os.getenv("OPENAI_BASE_URL")
+    temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.5"))
+    max_retries: int = int(os.getenv("MAX_RETRIES", "3"))
+    retry_delay: int = int(os.getenv("RETRY_DELAY", "2"))
     mcp_config_path: str = "mcp.json"
     prompt_path: str = "prompt.txt"
     system_prompt_default: str = "Ты полезный AI-ассистент."
+    
     #session_size: int = int(os.getenv("SESSION_SIZE", "6"))
 
     # Настройки памяти (читаем из .env)
@@ -57,21 +62,39 @@ class AgentConfig:
     memory_db_path: str = "./memory_db"
     session_size: int = int(os.getenv("SESSION_SIZE", "6"))
 
-@lru_cache(maxsize=1)
-def load_system_prompt(path_str: str = "prompt.md") -> str:
-    """Читает системный промпт с диска с кэшированием."""
+#@lru_cache(maxsize=1)
+def load_system_prompt(path_str: str = "prompt.txt") -> str:
+    """
+    Читает системный промпт с диска и внедряет динамические переменные (дата, CWD).
+    """
     path = Path.cwd() / path_str
     default = "Ты полезный AI-ассистент."
     
-    if not path.exists():
-        return default
-    
-    try:
-        content = path.read_text(encoding='utf-8')
-        return f"{content}\n\nCWD: {Path.cwd()}"
-    except Exception as e:
-        logger.error(f"Ошибка чтения промпта {path}: {e}")
-        return default
+    # 1. Читаем исходный текст
+    if path.exists():
+        try:
+            content = path.read_text(encoding='utf-8')
+        except Exception as e:
+            logger.error(f"Ошибка чтения промпта {path}: {e}")
+            content = default
+    else:
+        content = default
+
+    # 2. Вычисляем текущую дату и время
+    now = datetime.now()
+    # Формат: 2023-10-27 (Friday) | 14:30
+    current_date_str = now.strftime("%Y-%m-%d (%A)")
+    current_time_str = now.strftime("%H:%M")
+
+    # 3. Подставляем переменную {{current_date}}
+    if "{{current_date}}" in content:
+        content = content.replace("{{current_date}}", current_date_str)
+    else:
+        # Если переменной нет в файле, добавляем дату в конец, чтобы агент всё равно её знал
+        content += f"\n\n[System Info]\nCurrent Date: {current_date_str}\nCurrent Time: {current_time_str}"
+
+    # 4. Добавляем рабочий каталог (CWD)
+    return f"{content}\n\nCWD: {Path.cwd()}"
 
 def load_mcp_config(path_str: str = "mcp.json") -> Dict[str, Any]:
     """Читает конфиг MCP серверов."""
@@ -162,7 +185,7 @@ def create_memory_tools(db_path: str, session_size: int) -> List[Any]:
     except Exception as e:
         logger.error(f"⚠️ Ошибка инициализации памяти: {e}")
         return []        
-#(начало функции init_tools) ...
+
 async def init_tools(config: Optional[AgentConfig] = None) -> List[Any]:
     """Инициализирует MCP клиент и локальные инструменты."""
     if config is None:
@@ -224,6 +247,7 @@ def create_llm(config: Optional[AgentConfig] = None) -> BaseChatModel:
             model=config.gemini_model,
             temperature=0.2,
             google_api_key=config.gemini_key,
+            max_retries=config.max_retries,
             streaming=True
         )
     else:

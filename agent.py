@@ -1,6 +1,6 @@
 import os
 import json
-import logging
+#import logging
 import warnings
 import asyncio
 from pathlib import Path
@@ -32,8 +32,8 @@ except ImportError:
 logger = setup_logging()
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*create_react_agent has been moved.*")
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
+#logging.getLogger("httpx").setLevel(logging.WARNING)
+#logging.getLogger("openai").setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -263,6 +263,7 @@ def create_llm(config: Optional[AgentConfig] = None) -> BaseChatModel:
             temperature=config.temperature,
             google_api_key=config.gemini_key,
             max_retries=config.max_retries,
+            transport="rest",
             streaming=True
         )
     else:

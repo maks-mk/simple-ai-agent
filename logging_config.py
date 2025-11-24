@@ -1,25 +1,20 @@
-"""
-Настройка логирования для Smart Gemini Agent
-"""
-
+# logging_config.py
 import logging
 import os
+import sys  # <--- Добавлено для stderr
 from typing import Optional
 
 class IgnoreSchemaWarnings(logging.Filter):
-    """Фильтр для подавления предупреждений о схемах"""
-
+    """Фильтр для подавления предупреждений о схемах LangChain."""
     def filter(self, record):
         ignore_messages = [
-            "Key 'additionalProperties' is not supported in schema, ignoring",
-            "Key '$schema' is not supported in schema, ignoring",
+            "Key 'additionalProperties' is not supported",
+            "Key '$schema' is not supported",
         ]
         return not any(msg in record.getMessage() for msg in ignore_messages)
 
-
 class MaxLevelFilter(logging.Filter):
-    """Фильтр, который пропускает только сообщения не выше заданного уровня."""
-
+    """Пропускает сообщения только до определенного уровня (для stdout)."""
     def __init__(self, max_level: int) -> None:
         super().__init__()
         self.max_level = max_level
@@ -27,58 +22,52 @@ class MaxLevelFilter(logging.Filter):
     def filter(self, record) -> bool:  # type: ignore[override]
         return record.levelno <= self.max_level
 
-
 def setup_logging(
     level: Optional[int] = None,
     log_file: Optional[str] = None,
-    format_string: str = "%(asctime)s - %(levelname)s - %(message)s"
+    format_string: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 ) -> logging.Logger:
-    """
-    Настройка логирования для агента.
     
-    Если параметры не переданы, пытается взять их из переменных окружения:
-    - LOG_LEVEL (DEBUG, INFO, WARNING, ERROR)
-    - LOG_FILE (путь к файлу)
-    """
-    
-    # Определяем уровень логирования
     if level is None:
         env_level = os.getenv("LOG_LEVEL", "INFO").upper()
         level = getattr(logging, env_level, logging.INFO)
 
-    # Определяем файл логов
     if log_file is None:
         log_file = os.getenv("LOG_FILE", "ai_agent.log")
 
-    # Создаем обработчики
     handlers: list[logging.Handler] = []
-    
-    # 1. Console Handler (Stdout) - только до WARNING
-    # Мы хотим видеть обычные логи в консоли, но ошибки - красным цветом (если Rich) 
-    # или просто отдельно. В данной конфигурации фильтруем ERROR/CRITICAL, 
-    # чтобы они не дублировались, если приложение само их печатает.
-    stream_handler = logging.StreamHandler()
-    stream_handler.addFilter(MaxLevelFilter(logging.WARNING))
-    handlers.append(stream_handler)
 
-    # 2. File Handler
+    # 1. STDOUT: Только INFO и WARNING (обычные сообщения)
+    # Это не сломает CLI интерфейс Rich, так как туда обычно идут только print()
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.addFilter(MaxLevelFilter(logging.WARNING))
+    stdout_handler.setFormatter(logging.Formatter(format_string))
+    handlers.append(stdout_handler)
+
+    # 2. STDERR: Только ERROR и CRITICAL (Ошибки всегда должны быть видны!)
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.ERROR)
+    stderr_handler.setFormatter(logging.Formatter(format_string))
+    handlers.append(stderr_handler)
+
+    # 3. FILE: Все подряд (для отладки)
     if log_file:
         try:
             file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter(format_string))
             handlers.append(file_handler)
         except Exception as e:
-            print(f"⚠️ Не удалось создать лог-файл {log_file}: {e}")
+            print(f"⚠️ Не удалось создать лог-файл: {e}", file=sys.stderr)
 
-    # Базовая настройка
-    # force=True нужен, чтобы переопределить конфигурацию, если она уже была создана
-    logging.basicConfig(level=level, format=format_string, handlers=handlers, force=True)
+    # Настройка root логгера
+    logging.basicConfig(level=level, handlers=handlers, force=True)
 
-    # Применить фильтр схем ко всем обработчикам
+    # Фильтр схем (применяем ко всем)
     schema_filter = IgnoreSchemaWarnings()
-    for handler in logging.root.handlers:
+    for handler in handlers:
         handler.addFilter(schema_filter)
 
-    # Подавление шума от библиотек
+    # Подавление шума библиотек (Ваш список корректен для вашего стека)
     noisy_loggers = [
         "langchain_mcp_adapters",
         "mcp",
@@ -87,15 +76,13 @@ def setup_logging(
         "httpcore",
         "httpx",
         "openai",
-        "chromadb",     # <-- ДОБАВЛЕНО: подавление логов ChromaDB
-        "hnswlib"
+        "chromadb", 
+        "hnswlib",
+        "google.ai.generativelanguage" # Иногда тоже шумит
     ]
     
-    # Если мы в DEBUG режиме, возможно мы хотим видеть часть этого, 
-    # но обычно библиотеки слишком болтливы.
     lib_level = logging.ERROR if level > logging.DEBUG else logging.WARNING
-    
-    for logger_name in noisy_loggers:
-        logging.getLogger(logger_name).setLevel(lib_level)
+    for name in noisy_loggers:
+        logging.getLogger(name).setLevel(lib_level)
 
-    return logging.getLogger(__name__)
+    return logging.getLogger("AgentCore") # Даем имя логгеру, чтобы видеть источник

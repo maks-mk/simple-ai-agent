@@ -21,7 +21,7 @@
     "command": "npx",
     "args": ["@simonb97/server-win-cli", "--config", "./win-cli-config.json"],
     "transport": "stdio",
-    "enabled": true
+    "enabled": false
   },
   "tavily-remote-mcp": {
     "command": "npx",

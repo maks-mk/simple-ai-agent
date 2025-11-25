@@ -2,20 +2,21 @@ import streamlit as st
 import asyncio
 import uuid
 import time
-from typing import Optional
+from typing import Dict, Any, Optional
 
-# Проверка зависимостей
+# === ПРОВЕРКА ЗАВИСИМОСТЕЙ ===
 try:
     import nest_asyncio
 except ImportError:
     st.error("Библиотека nest_asyncio не найдена. Установите: pip install nest_asyncio")
     st.stop()
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, BaseMessage
+# Импортируем из нашего обновленного agent.py
 from agent import create_agent_graph, AgentConfig
 
 # ----------------------------
-# 1. КОНФИГ UI
+# 1. КОНФИГУРАЦИЯ СТРАНИЦЫ И СТИЛИ
 # ----------------------------
 
 # Патчим asyncio для работы внутри Streamlit
@@ -25,79 +26,179 @@ st.set_page_config(page_title="Smart AI Agent", page_icon="🤖", layout="wide")
 
 st.markdown("""
 <style>
-    /* ---------------------------------------------------- */
-    /* 1. ОБЩИЕ НАСТРОЙКИ UI (Скрытие стандартных элементов) */
-    /* ---------------------------------------------------- */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+    /* 1. ГЛАВНОЕ: Тянем контент вверх */
+    .block-container {
+        padding-top: 1rem !important; /* Было ~6rem, ставим 1.5rem */
+        padding-bottom: 2rem !important;
+        margin-top: 0 !important;
+    }
 
-    /* ------------------------------------------- */
-    /* 2. НАСТРОЙКИ ШАПКИ (Header) */
-    /* ------------------------------------------- */
-    header[data-testid="stHeader"] {
-        height: 1.5rem !important;
+    /* 2. Сжимаем контейнер шапки */
+        header[data-testid="stHeader"] {
+        height: 2rem !important;
         min-height: 1.5rem !important;
         padding-top: 0.25rem !important;
         padding-bottom: 0.25rem !important;
-        background-color: rgba(0, 0, 0, 0.8) !important;
+        background-color: rgba(0, 0, 0, 0.2) !important;
     }
 
     /* Уменьшаем верхний отступ основного контейнера */
-    .main .block-container {
-        padding-top: 1rem !important;
+        .main .block-container {
+            padding-top: 1rem !important;
+    }
+    
+    /* 3. Убираем радужную полоску сверху (она занимает место) */
+    div[data-testid="stDecoration"] {
+        display: none;
     }
 
-    /* ------------------------------------------- */
-    /* 3. СТИЛИ ДЛЯ ЧАТА И КОДА */
-    /* ------------------------------------------- */
-
-    /* Стили для сообщений */
-    .stChatMessage {
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 10px;
-        padding: 1rem;
+    /* 4. Поднимаем кнопки меню (гамбургер и Deploy), чтобы они влезли в узкую шапку */
+    div[data-testid="stToolbar"] {
+        top: 0rem !important; /* Прижимаем к самому верху */
+        right: 2rem !important;
+        height: 2.5rem !important;
     }
-
-    /* Темный фон для кода в Markdown */
-    .stMarkdown code {
-        background-color: #262730 !important;
-        color: #ffffff !important;
-        border-radius: 4px;
-        padding: 0.2rem 0.4rem;
+    
+    /* (Опционально) Убираем лишние отступы у кнопок внутри меню */
+    div[data-testid="stToolbar"] button {
+        border: none;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # ----------------------------
-# 2. ИНИЦИАЛИЗАЦИЯ ГРАФА (Singleton)
+# 2. ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ
+# ----------------------------
+
+class TokenTracker:
+    """Класс для подсчета токенов в стриме."""
+    def __init__(self):
+        self.usage_stats: Dict[str, Dict[str, int]] = {}
+
+    def update(self, message: BaseMessage):
+        """Обновляет статистику на основе метаданных сообщения."""
+        if not hasattr(message, "usage_metadata") or not message.usage_metadata:
+            return
+
+        msg_id = getattr(message, "id", "unknown")
+        new_usage = message.usage_metadata
+
+        if msg_id in self.usage_stats:
+            current = self.usage_stats[msg_id]
+            # Берем MAX, так как в стриме данные могут приходить кумулятивно
+            self.usage_stats[msg_id] = {
+                "input_tokens": max(current.get("input_tokens", 0), new_usage.get("input_tokens", 0)),
+                "output_tokens": max(current.get("output_tokens", 0), new_usage.get("output_tokens", 0)),
+            }
+        else:
+            self.usage_stats[msg_id] = new_usage
+
+    def get_totals(self) -> Dict[str, int]:
+        total_in = sum(s.get("input_tokens", 0) for s in self.usage_stats.values())
+        total_out = sum(s.get("output_tokens", 0) for s in self.usage_stats.values())
+        return {"in": total_in, "out": total_out, "total": total_in + total_out}
+
+    def get_display_html(self) -> str:
+        stats = self.get_totals()
+        if stats['total'] == 0:
+            return ""
+        return f"""
+        <div class='token-badge'>
+            🪙 Tokens: <b>{stats['total']}</b> (In: {stats['in']} / Out: {stats['out']})
+        </div>
+        """
+
+# ----------------------------
+# 3. ИНИЦИАЛИЗАЦИЯ АГЕНТА (Cached)
 # ----------------------------
 @st.cache_resource(show_spinner=False)
-def get_agent_graph(temperature: float, max_retries: int, retry_delay: int):
+def init_agent_system(
+    provider: str,
+    model: str, 
+    temp: float, 
+    max_retries: int
+):
     """
-    Создает и кэширует граф агента.
-    Пересоздается только если меняются аргументы (температура и т.д.).
+    Создает и кэширует граф агента. 
+    Используем параметры примитивных типов для корректного хеширования кэша.
     """
-    
-    with st.spinner(f"🔌 Инициализация агента (Temp: {temperature})... Подключение инструментов..."):
-        config = AgentConfig(
-            temperature=temperature,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-        )
+    with st.spinner("🔌 Подключение нейронных сетей..."):
+        # 1. Загружаем базу из ENV
+        config = AgentConfig.from_env()
         
-        # === ИСПРАВЛЕНИЕ #1: Инициализация в текущем цикле ===
-        # Используем get_event_loop().run_until_complete() вместо asyncio.run()
+        # 2. Применяем оверрайды из UI
+        config.provider = provider
+        config.temperature = temp
+        config.max_retries = max_retries
+        
+        if provider == "gemini":
+            config.gemini_model = model
+        else:
+            config.openai_model = model
+
+        # 3. Создаем цикл и агента
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             agent = loop.run_until_complete(create_agent_graph(config))
             return agent, config, loop
         except Exception as e:
-            st.error(f"Critical Error during Agent Creation: {e}")
+            st.error(f"Critical Error: {e}")
             raise e
 
 # ----------------------------
-# 3. УПРАВЛЕНИЕ СЕССИЕЙ
+# 4. SIDEBAR И НАСТРОЙКИ
+# ----------------------------
+with st.sidebar:
+    st.title("🎛️ Control Panel")
+    
+    # Загружаем дефолты, чтобы показать в UI
+    env_config = AgentConfig.from_env()
+    
+    st.subheader("Model Config")
+    
+    # Выбор провайдера (если ключи есть)
+    provider_options = []
+    if env_config.gemini_key: provider_options.append("gemini")
+    if env_config.openai_key: provider_options.append("openai")
+    
+    if not provider_options:
+        st.error("Нет API ключей в .env!")
+        st.stop()
+        
+    selected_provider = st.selectbox("Provider", provider_options, index=provider_options.index(env_config.provider) if env_config.provider in provider_options else 0)
+    
+    # Модель (просто текстовое поле для гибкости)
+    default_model = env_config.gemini_model if selected_provider == "gemini" else env_config.openai_model
+    selected_model = st.text_input("Model Name", value=default_model)
+    
+    st.subheader("Generation")
+    ui_temperature = st.slider("Temperature", 0.0, 1.0, env_config.temperature, 0.1)
+    ui_max_retries = st.slider("Max Retries", 1, 5, env_config.max_retries)
+    
+    st.divider()
+    
+    if st.button("🗑️ Очистить историю", use_container_width=True):
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.rerun()
+
+    with st.expander("Session Info"):
+        st.caption(f"ID: {st.session_state.get('session_id', 'init')}")
+
+# Инициализация (Singleton)
+try:
+    agent, config, agent_loop = init_agent_system(
+        selected_provider, 
+        selected_model, 
+        ui_temperature, 
+        ui_max_retries
+    )
+except Exception:
+    st.stop()
+
+# ----------------------------
+# 5. УПРАВЛЕНИЕ СОСТОЯНИЕМ ЧАТА
 # ----------------------------
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
@@ -106,174 +207,116 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # ----------------------------
-# 4. SIDEBAR (НАСТРОЙКИ)
-# ----------------------------
-with st.sidebar:
-    st.title("🤖 AI Control Center")
-    
-    default_cfg = AgentConfig()
-    
-    st.markdown("### ⚙️ Настройки генерации")
-    
-    ui_temperature = st.slider(
-        "Temperature (Креативность)", 
-        min_value=0.0, max_value=1.0, 
-        value=default_cfg.temperature, 
-        step=0.1,
-        help="0 - строгая логика, 1 - творческий полет."
-    )
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        ui_max_retries = st.number_input(
-            "Max Retries", 
-            min_value=1, max_value=10, 
-            value=default_cfg.max_retries,
-            help="Попыток при ошибке API"
-        )
-    with col2:
-        ui_retry_delay = st.number_input(
-            "Delay (s)", 
-            min_value=0, max_value=10, 
-            value=default_cfg.retry_delay,
-            help="Пауза между попытками"
-        )
-    
-    st.divider()
-    
-    # Инфо о провайдере
-    model_name = default_cfg.gemini_model if default_cfg.provider == "gemini" else default_cfg.openai_model
-    provider_color = "green" if default_cfg.provider == "openai" else "blue"
-    st.markdown(f"🧠 Провайдер: **:{provider_color}[{default_cfg.provider.upper()}]**")
-    st.caption(f"Модель: `{model_name}`")
-    
-    st.divider()
-    
-    col_new, col_info = st.columns([2, 1])
-    with col_new:
-        if st.button("🔄 Новый чат", type="primary", use_container_width=True):
-            st.session_state.session_id = str(uuid.uuid4())
-            st.session_state.messages = []
-            st.rerun()
-            
-    with st.expander("🛠️ Debug Info"):
-        st.text(f"Session: {st.session_state.session_id[:8]}")
-        st.markdown("""
-        **Tools:**
-        - 🧠 Memory (ChromaDB)
-        - 📂 File System
-        - 🔌 MCP Servers
-        """)
-
-# === ИНИЦИАЛИЗАЦИЯ ===
-try:
-    cached_agent, current_config, agent_loop = get_agent_graph(
-        ui_temperature,
-        ui_max_retries,
-        ui_retry_delay,
-    )
-except Exception:
-    st.stop()
-
-# ----------------------------
-# 5. ОТРИСОВКА ЧАТА
+# 6. ОТРИСОВКА ИСТОРИИ
 # ----------------------------
 chat_container = st.container()
 
 with chat_container:
     if not st.session_state.messages:
-        st.markdown(f"### 👋 Привет! Я Smart Agent.\nЯ умею работать с файлами, помнить контекст и использовать внешние инструменты.")
+        st.info("👋 Привет! Я готов к работе. Задай мне вопрос или попроси выполнить задачу.")
         
-    for role, text in st.session_state.messages:
-        with st.chat_message(role):
-            st.markdown(text)
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            # Отрисовка статистики токенов, если она есть в истории
+            if "tokens_html" in msg:
+                st.markdown(msg["tokens_html"], unsafe_allow_html=True)
 
 # ----------------------------
-# 6. ЛОГИКА АГЕНТА
+# 7. ЛОГИКА ОБРАБОТКИ (STREAM)
 # ----------------------------
-async def process_stream(user_input: str, status_box):
-    """Асинхронный генератор ответа"""
-    config = {"configurable": {"thread_id": st.session_state.session_id}}
-    text_buffer = ""
-    resp_container = st.empty()
+async def run_agent_stream(user_input: str, status_placeholder):
+    """Асинхронный запуск агента с обновлением UI."""
     
+    cfg = {"configurable": {"thread_id": st.session_state.session_id}}
+    
+    full_text = ""
+    token_tracker = TokenTracker()
+    response_placeholder = st.empty()
+    
+    # Таймер
+    start_time = time.time()
+
     try:
-        async for event in cached_agent.astream(
+        # Запуск стрима
+        async for event in agent.astream(
             {"messages": [HumanMessage(content=user_input)]},
-            config=config,
+            config=cfg,
             stream_mode="messages"
         ):
             message, meta = event
             node = meta.get("langgraph_node")
             
-            # 1. Обработка текста от LLM
-            if node == "agent" and message.content:
-                chunk = message.content
-                if isinstance(chunk, list):
-                    chunk = "".join(p.get("text", "") for p in chunk if isinstance(p, dict))
-                
-                if isinstance(chunk, str) and chunk:
-                    text_buffer += chunk
-                    resp_container.markdown(text_buffer + "▌")
-                    
-            # 2. Обработка вызова инструментов (Tool Calls)
-            elif node == "agent" and hasattr(message, "tool_calls") and message.tool_calls:
-                if text_buffer.strip():
-                    status_box.markdown(f"**💭 Мысль:**\n{text_buffer}")
-                    status_box.markdown("---")
-                    text_buffer = "" 
-                    resp_container.empty()
-                
-                for tc in message.tool_calls:
-                    status_box.write(f"🛠️ **Вызов инструмента:** `{tc['name']}`")
+            # 1. Считаем токены
+            token_tracker.update(message)
             
-            # 3. Обработка результата инструментов
+            # 2. Обработка ответа агента (LLM)
+            if node == "agent":
+                # Обработка вызова инструментов
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    for tc in message.tool_calls:
+                        status_placeholder.write(f"🛠️ **Использую инструмент:** `{tc['name']}`")
+                
+                # Обработка текстового контента
+                elif message.content:
+                    chunk = message.content
+                    if isinstance(chunk, list):
+                         # Мультимодальный контент -> текст
+                        chunk = "".join(x["text"] for x in chunk if "text" in x)
+                    
+                    if chunk:
+                        full_text += chunk
+                        response_placeholder.markdown(full_text + "▌")
+
+            # 3. Обработка результата инструмента
             elif node == "tools":
-                tool_name = getattr(message, "name", "Tool")
-                content = str(message.content)
-                with status_box.expander(f"✅ Результат: {tool_name}", expanded=False):
-                    st.code(content[:1500] + ("..." if len(content) > 1500 else ""))
+                tool_name = getattr(message, "name", "tool")
+                content_preview = str(message.content)[:500]
+                if len(str(message.content)) > 500: content_preview += "..."
+                
+                with status_placeholder.expander(f"✅ Результат: {tool_name}", expanded=False):
+                    st.code(content_preview)
 
-        # Финальный вывод
-        resp_container.markdown(text_buffer)
-        return text_buffer
+        # Финализация
+        response_placeholder.markdown(full_text)
+        duration = time.time() - start_time
         
+        return full_text, token_tracker.get_display_html()
+
     except Exception as e:
-        # Обработка ошибок внутри стрима
-        if current_config.retry_delay > 0:
-             status_box.warning(f"Ошибка потока. Пауза {current_config.retry_delay}с...")
-             time.sleep(current_config.retry_delay)
-        raise e
-
+        # Логируем, но не крашим весь UI
+        st.error(f"Ошибка потока: {e}")
+        return full_text, ""
 
 # ----------------------------
-# 7. ОБРАБОТКА ВВОДА
+# 8. ОБРАБОТКА ВВОДА ПОЛЬЗОВАТЕЛЯ
 # ----------------------------
-if user_input := st.chat_input("Введите запрос..."):
-    # 1. Добавляем вопрос пользователя
-    st.session_state.messages.append(("user", user_input))
+if prompt := st.chat_input("Введите сообщение..."):
+    # 1. Сохраняем и показываем вопрос
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with chat_container:
         with st.chat_message("user"):
-            st.markdown(user_input)
-            
-    # 2. Запускаем ответ ассистента
+            st.markdown(prompt)
+
+    # 2. Генерируем ответ
     with chat_container:
         with st.chat_message("assistant"):
-            status_box = st.status("🧠 Анализирую запрос...", expanded=True)
+            # Контейнер для статуса (мысли, инструменты)
+            status_box = st.status("🧠 Думаю...", expanded=True)
             
-            try:
-                # === ИСПРАВЛЕНИЕ #2: Запуск стрима в текущем цикле ===
-                # Это гарантирует, что мы используем цикл, в котором был создан агент.
-                full_response = agent_loop.run_until_complete(process_stream(user_input, status_box))
-                # ======================================================
-                
-                # Успешное завершение
-                status_box.update(label="Готово", state="complete", expanded=False)
-                
-                # Сохраняем в историю ТОЛЬКО финальный текст (без мыслей)
-                if full_response:
-                    st.session_state.messages.append(("assistant", full_response))
-                    
-            except Exception as e:
-                status_box.update(label="Произошла ошибка", state="error")
-                st.error(f"Ошибка выполнения: {e}")
+            # Запуск внутри сохраненного цикла событий
+            response_text, token_html = agent_loop.run_until_complete(
+                run_agent_stream(prompt, status_box)
+            )
+            
+            # Завершение статуса
+            status_box.update(label="Готово", state="complete", expanded=False)
+            
+            # Если ответ пустой (ошибка), не добавляем в историю
+            if response_text:
+                st.markdown(token_html, unsafe_allow_html=True)
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response_text,
+                    "tokens_html": token_html
+                })

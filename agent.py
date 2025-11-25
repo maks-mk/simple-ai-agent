@@ -51,7 +51,7 @@ class AgentConfig:
     gemini_key: Optional[str] = field(default=None)
     gemini_model: str = field(default=None)
     openai_key: Optional[str] = field(default=None)
-    openai_model: str = field(default="gpt-4o")
+    openai_model: str = field(default=None)
     openai_base_url: Optional[str] = field(default=None)
     
     # Parameters
@@ -77,7 +77,7 @@ class AgentConfig:
             gemini_key=os.getenv("GEMINI_API_KEY"),
             gemini_model=os.getenv("GEMINI_MODEL"),
             openai_key=os.getenv("OPENAI_API_KEY"),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            openai_model=os.getenv("OPENAI_MODEL"),
             openai_base_url=os.getenv("OPENAI_BASE_URL"),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.5")),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),

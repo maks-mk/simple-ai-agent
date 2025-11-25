@@ -4,29 +4,24 @@ import sys
 from pathlib import Path
 from typing import Optional, List
 
+# Импорт Rich для красивого вывода
+from rich.logging import RichHandler
+from rich.console import Console
+
 class IgnoreSchemaWarnings(logging.Filter):
-    """Фильтр для подавления специфических предупреждений схем Pydantic/LangChain."""
+    """Фильтр для подавления специфических предупреждений."""
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
         return "Key 'additionalProperties' is not supported" not in msg and \
                "Key '$schema' is not supported" not in msg
 
-class MaxLevelFilter(logging.Filter):
-    """Пропускает сообщения только до определенного уровня (для разделения stdout/stderr)."""
-    def __init__(self, max_level: int) -> None:
-        super().__init__()
-        self.max_level = max_level
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.levelno <= self.max_level
-
 def setup_logging(
     level: Optional[int] = None,
     log_file: Optional[str] = None,
-    format_string: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format_string: str = "%(message)s" # Rich сам добавит время и уровень
 ) -> logging.Logger:
     
-    # 1. Определение уровня логирования
+    # 1. Определение уровня (по умолчанию INFO)
     if level is None:
         env_level = os.getenv("LOG_LEVEL", "INFO").upper()
         level = getattr(logging, env_level, logging.INFO)
@@ -36,37 +31,39 @@ def setup_logging(
         log_file = os.getenv("LOG_FILE", "ai_agent.log")
 
     handlers: List[logging.Handler] = []
-    formatter = logging.Formatter(format_string)
 
-    # --- H1: STDOUT (INFO и ниже, без ошибок) ---
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(logging.DEBUG) # Принимаем всё, фильтр отсечет лишнее
-    stdout_handler.addFilter(MaxLevelFilter(logging.WARNING))
-    stdout_handler.setFormatter(formatter)
-    handlers.append(stdout_handler)
+    # --- H1: КРАСИВЫЙ КОНСОЛЬНЫЙ ВЫВОД (RICH) ---
+    # markup=True позволяет использовать [bold red]...[/] прямо в логах
+    # rich_tracebacks=True делает красивые стектрейсы ошибок
+    console_handler = RichHandler(
+        rich_tracebacks=True,
+        markup=True,
+        show_path=False, # Скрываем путь к файлу (line 123), чтобы не засорять вид
+        show_time=True,
+        omit_repeated_times=False
+    )
+    console_handler.setLevel(level)
+    # Формат для Rich проще, так как он сам строит колонки
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    handlers.append(console_handler)
 
-    # --- H2: STDERR (ERROR и CRITICAL) ---
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.ERROR)
-    stderr_handler.setFormatter(formatter)
-    handlers.append(stderr_handler)
-
-    # --- H3: FILE (Всё подряд) ---
+    # --- H2: ФАЙЛОВЫЙ ВЫВОД (КЛАССИЧЕСКИЙ) ---
     if log_file:
         try:
             log_path = Path(log_file)
-            # Создаем директорию логов, если её нет
             log_path.parent.mkdir(parents=True, exist_ok=True)
             
+            # В файл пишем подробно с датой
+            file_fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
             file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
             file_handler.setLevel(logging.DEBUG) # В файл пишем всё
-            file_handler.setFormatter(formatter)
+            file_handler.setFormatter(file_fmt)
             handlers.append(file_handler)
         except Exception as e:
-            # Пишем в stderr, так как логгер еще не настроен
             sys.stderr.write(f"⚠️ Не удалось создать лог-файл: {e}\n")
 
     # Настройка корневого логгера
+    # Убираем существующие хендлеры, чтобы не было дублей при перезагрузке
     logging.basicConfig(level=level, handlers=handlers, force=True)
 
     # Применение фильтров
@@ -74,11 +71,13 @@ def setup_logging(
     for h in handlers:
         h.addFilter(schema_filter)
 
-    # Подавление шума сторонних библиотек
+    # --- ПОДАВЛЕНИЕ ШУМА ---
+    # Добавлен sentence_transformers, чтобы убрать технические логи загрузки PyTorch
     noisy_modules = [
         "langchain_mcp_adapters", "mcp", "jsonschema", "langchain_google_genai",
         "httpcore", "httpx", "openai", "chromadb", "hnswlib", 
-        "google.ai.generativelanguage", "urllib3", "multipart"
+        "google.ai.generativelanguage", "urllib3", "multipart",
+        "sentence_transformers", "filelock" # <-- Новые добавления
     ]
     
     # Если общий уровень DEBUG, библиотеки ставим в ERROR, иначе WARNING

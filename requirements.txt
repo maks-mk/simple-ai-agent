@@ -12,7 +12,7 @@ langchain-mcp-adapters
 python-dotenv
 
 # UI и CLI
-streamlit
+#streamlit
 rich
 prompt_toolkit
 
@@ -21,7 +21,9 @@ pydantic
 httpx
 pygments
 watchdog
+beautifulsoup4
+tiktoken
 #long_term_memory
 chromadb
 sentence-transformers
-nest_asyncio
+#nest_asyncio

@@ -2,25 +2,18 @@ import os
 import asyncio
 import warnings
 import time
-from typing import Dict, Any, Optional
+import re
+from typing import Dict, Tuple, Optional, Set, Any
+import logging
 
-# === IMPORTS FROM CORE AGENT ===
-from agent import create_agent_graph, AgentConfig, logger
-
-# === LANGCHAIN ===
-from langchain_core.messages import HumanMessage, BaseMessage
-
-# === RICH UI ===
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.markdown import Markdown
-from rich.rule import Rule
 from rich.live import Live
-from rich.padding import Padding
 from rich.spinner import Spinner
+from rich.padding import Padding
 from rich.text import Text
 
-# === PROMPT TOOLKIT ===
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
@@ -28,201 +21,349 @@ from prompt_toolkit.lexers import PygmentsLexer
 from pygments.lexers.markup import MarkdownLexer
 from prompt_toolkit.history import FileHistory
 
-# === SETUP ===
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk
+
+try:
+    from agent import AgentWorkflow, logger
+except ImportError:
+    import sys
+    sys.path.append(".")
+    from agent import AgentWorkflow, logger
+
+# Импорт tiktoken для эвристики UI
+try:
+    import tiktoken
+    _ENCODER = tiktoken.get_encoding("cl100k_base")
+except ImportError:
+    _ENCODER = None
+
+warnings.filterwarnings("ignore")
 console = Console()
 
-# === HELPER CLASSES ===
+_THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.DOTALL)
 
+# ======================================================
+# TOKEN TRACKER (Версия 3.0 - Updates + Metadata)
+# ======================================================
 class TokenTracker:
-    """Класс для накопления статистики использования токенов в потоке."""
     def __init__(self):
-        self.usage_stats: Dict[str, Dict[str, int]] = {}
+        self.max_input = 0
+        self.total_output = 0
+        self._seen_ids = set()
+        self._streaming_text = "" 
 
-    def update(self, message: BaseMessage):
-        """Обновляет статистику на основе метаданных сообщения."""
-        if not hasattr(message, "usage_metadata") or not message.usage_metadata:
-            return
-
-        msg_id = getattr(message, "id", "unknown")
-        new_usage = message.usage_metadata
-
-        if msg_id in self.usage_stats:
-            current = self.usage_stats[msg_id]
-            # Берем MAX, так как в стриме данные могут приходить кумулятивно
-            self.usage_stats[msg_id] = {
-                "input_tokens": max(current.get("input_tokens", 0), new_usage.get("input_tokens", 0)),
-                "output_tokens": max(current.get("output_tokens", 0), new_usage.get("output_tokens", 0)),
-            }
-        else:
-            self.usage_stats[msg_id] = new_usage
-
-    def display(self, duration: float) -> str:
-        """Формирует строку статистики для вывода."""
-        total_in = sum(s.get("input_tokens", 0) for s in self.usage_stats.values())
-        total_out = sum(s.get("output_tokens", 0) for s in self.usage_stats.values())
+    def update_from_message(self, msg: Any):
+        """Обновление из стрима сообщений"""
+        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+            self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
         
-        # Собираем текст статистики
-        text = f"⏱ {duration:.1f}s"
-        if total_in + total_out > 0:
-            text += f" | 🪙 In: {total_in} / Out: {total_out}"
+        # Эвристика для live-режима
+        if isinstance(msg, (AIMessage, AIMessageChunk)):
+            content = msg.content
+            chunk = ""
+            if isinstance(content, str):
+                chunk = content
+            elif isinstance(content, list):
+                chunk = "".join(x.get("text", "") for x in content if isinstance(x, dict))
             
-        # Оборачиваем весь текст в [bright_black] (ярко-черный = серый)
-        # [dim] можно добавить дополнительно, если нужно еще тусклее
-        return f"[bright_black]{text}[/]"
-# === MAIN LOGIC ===
+            if isinstance(msg, AIMessageChunk):
+                self._streaming_text += chunk
+            elif not msg.usage_metadata:
+                self._streaming_text = chunk
 
-def setup_key_bindings() -> KeyBindings:
-    """Настройка горячих клавиш: Enter отправляет, Alt+Enter переносит строку."""
+    def update_from_node_update(self, update: Dict):
+        """Обновление из результата узла (Гарантированные данные)"""
+        agent_data = update.get("agent")
+        if not agent_data: return
+
+        messages = agent_data.get("messages", [])
+        if not isinstance(messages, list): messages = [messages]
+
+        for msg in messages:
+            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
+
+    def _apply_metadata(self, usage: Dict, msg_id: str = None):
+        is_new = True
+        if msg_id and msg_id in self._seen_ids:
+            is_new = False
+        
+        in_t = usage.get("input_tokens", 0)
+        if in_t > self.max_input:
+            self.max_input = in_t
+        
+        out_t = usage.get("output_tokens", 0)
+        if out_t > 0:
+            if is_new:
+                self.total_output += out_t
+                if msg_id: self._seen_ids.add(msg_id)
+                self._streaming_text = ""
+
+    def render(self, duration: float) -> str:
+        display_out = self.total_output
+        if self._streaming_text:
+            est = 0
+            if _ENCODER: est = len(_ENCODER.encode(self._streaming_text))
+            else: est = len(self._streaming_text) // 3
+            display_out += est
+
+        txt = f"⏱ {duration:.1f}s"
+        txt += f" | In: {self.max_input} Out: {display_out}"
+        return f"[bright_black]{txt}[/]"
+
+# ======================================================
+# UI UTILS
+# ======================================================
+def get_key_bindings():
     kb = KeyBindings()
-
     @kb.add('enter')
     def _(event):
-        # Если буфер пуст, ничего не делаем
-        if not event.current_buffer.text.strip():
-            return
-        event.current_buffer.validate_and_handle()
-
-    @kb.add('escape', 'enter') # Alt+Enter
+        buf = event.current_buffer
+        if not buf.text.strip(): return
+        buf.validate_and_handle()
+    @kb.add('escape', 'enter')
     def _(event):
         event.current_buffer.insert_text("\n")
-        
     return kb
 
-async def interactive_loop(agent):
-    """Главный цикл взаимодействия с пользователем."""
+def parse_thought(text: str) -> Tuple[str, str, bool]:
+    match = _THOUGHT_RE.search(text)
+    if match:
+        return match.group(1).strip(), _THOUGHT_RE.sub('', text).strip(), True
+    if "<thought>" in text and "</thought>" not in text:
+        start = text.find("<thought>") + len("<thought>")
+        return text[start:].strip(), text[:text.find("<thought>")], False
+    return "", text, False
+
+def print_padded_markdown(text: str, padding: tuple = (1, 1)):
+    if not text.strip(): return
+    clean_text = re.sub(r'\n{3,}', '\n\n', text)
+    console.print(Padding(Markdown(clean_text), padding))
+
+def format_tool_output(name: str, content: str, is_error: bool) -> str:
+    """UX Magic: Делает вывод инструмента кратким и понятным."""
+    content = str(content).strip()
     
-    # Конфигурация сессии LangGraph
-    thread_id = "main"
-    config = {"configurable": {"thread_id": thread_id}}
+    if is_error:
+        # Если ошибка короткая, показываем целиком, иначе обрезаем
+        return f"[red]{content[:120]}...[/]" if len(content) > 120 else f"[red]{content}[/]"
     
-    # Стили prompt_toolkit
-    style = Style.from_dict({
-        "myself": "#00ffff bold",
-    })
+    if "web_search" in name:
+        count = content.count("http")
+        return f"Found {count} results"
     
+    elif "fetch" in name or "read" in name:
+        size = len(content)
+        return f"Loaded {size} chars"
+    
+    elif "write" in name or "save" in name:
+        return "File saved successfully"
+    
+    elif "list" in name:
+        items = len(content.split("\n"))
+        return f"Listed {items} items"
+        
+    # Fallback: показываем начало текста
+    preview = (content[:80] + "...") if len(content) > 80 else content
+    return preview.replace("\n", " ")
+
+# ======================================================
+# STREAM LOOP
+# ======================================================
+async def process_stream(agent_app, user_input: str, thread_id: str, max_loops: int = 25):
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": max_loops * 4
+    }
+    
+    tracker = TokenTracker()
+    start_time = time.time()
+    accumulated_text = ""
+    printed_thoughts = set()
+    printed_tool_ids = set()
+    
+    spinner_status = "Thinking..."
+    
+    try:
+        # Используем transient=True, чтобы спиннер исчезал после завершения
+        with Live(Spinner("dots", text=spinner_status, style="cyan"), 
+                  refresh_per_second=12, 
+                  console=console, 
+                  transient=True) as live:
+            
+            async for mode, payload in agent_app.astream(
+                {"messages": [HumanMessage(content=user_input)], "steps": 0},
+                config=config,
+                stream_mode=["messages", "updates"]
+            ):
+                # ВАЖНО: Даем время циклу событий отрисовать анимацию
+                await asyncio.sleep(0.001)
+
+                # --- UPDATE TRACKER ---
+                if mode == "updates":
+                    tracker.update_from_node_update(payload)
+                    # Обновляем UI (текст + спиннер), чтобы показать актуальный статус
+                    renderable = Group(
+                        Padding(Markdown(accumulated_text or ""), (0, 1)),
+                        Spinner("dots", text=spinner_status, style="cyan")
+                    )
+                    live.update(renderable)
+                    continue
+
+                # --- MESSAGE STREAM ---
+                if mode == "messages":
+                    msg, metadata = payload
+                    node = metadata.get("langgraph_node")
+                    
+                    tracker.update_from_message(msg)
+
+                    # 1. АГЕНТ (МЫСЛИ + ВЫЗОВЫ)
+                    if node == "agent" and isinstance(msg, (AIMessage, AIMessageChunk)):
+                        # A. Инструменты (Запрос)
+                        if msg.tool_calls:
+                            if accumulated_text.strip():
+                                 _, clean, _ = parse_thought(accumulated_text)
+                                 if clean.strip():
+                                     live.console.print(Padding(Markdown(clean), (0, 1)))
+                                     accumulated_text = ""
+
+                            for tc in msg.tool_calls:
+                                t_id = tc.get("id")
+                                t_name = tc.get("name")
+                                if t_id and t_name and t_id not in printed_tool_ids:
+                                    live.console.print(Padding(f"🌍 [bold cyan]Call:[/] {t_name}", (0, 0, 0, 2)))
+                                    printed_tool_ids.add(t_id)
+                                    spinner_status = f"[bold cyan]Calling:[/] {t_name}"
+                        
+                        # B. Текст (Мысли/Ответ)
+                        if msg.content:
+                            chunk = msg.content if isinstance(msg.content, str) else ""
+                            if isinstance(msg.content, list):
+                                chunk = "".join(x.get("text", "") for x in msg.content if isinstance(x, dict))
+
+                            if isinstance(msg, AIMessageChunk):
+                                accumulated_text += chunk
+                            else:
+                                if not accumulated_text: accumulated_text = chunk
+                            
+                            thought, clean_text, is_complete = parse_thought(accumulated_text)
+                            
+                            if thought:
+                                spinner_status = f"[yellow italic]{thought}...[/]"
+                                if is_complete and thought not in printed_thoughts:
+                                    live.console.print(Padding(f"➤ [italic yellow]{thought}[/]", (0, 0, 0, 2)))
+                                    printed_thoughts.add(thought)
+                                    accumulated_text = clean_text
+                            elif clean_text.strip() and "<thought>" not in accumulated_text:
+                                spinner_status = "Typing..."
+                                # Рендерим Группу: Текст сверху, Спиннер снизу
+                                pretty_md = re.sub(r'\n{3,}', '\n\n', clean_text)
+                                live.update(Group(
+                                    Padding(Markdown(pretty_md), (1, 1)),
+                                    Spinner("dots", text=spinner_status, style="cyan")
+                                ))
+                                continue
+
+                    # 2. ИНСТРУМЕНТЫ (ОТВЕТЫ - UX FIX)
+                    elif node == "tools" and isinstance(msg, ToolMessage):
+                        content_str = str(msg.content)
+                        is_error = False
+                        
+                        if getattr(msg, "status", "") == "error":
+                            is_error = True
+                        elif content_str.startswith(("Error", "Ошибка")):
+                            is_error = True
+                            
+                        icon = "❌" if is_error else "✅"
+                        color = "red" if is_error else "green"
+                        
+                        summary = format_tool_output(msg.name, content_str, is_error)
+                        
+                        live.console.print(Padding(f"[{color}]{icon} {msg.name}:[/] [dim]{summary}[/]", (0, 0, 0, 4)))
+                        spinner_status = "Analyzing..."
+
+                # Обновляем дефолтное состояние (если не попали в ветку с текстом)
+                if accumulated_text.strip():
+                     _, clean_text, _ = parse_thought(accumulated_text)
+                     pretty_md = re.sub(r'\n{3,}', '\n\n', clean_text)
+                     renderable = Group(
+                        Padding(Markdown(pretty_md), (1, 1)),
+                        Spinner("dots", text=spinner_status, style="cyan")
+                     )
+                else:
+                    renderable = Spinner("dots", text=spinner_status, style="cyan")
+                
+                live.update(renderable)
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        console.print("\n[bold red]🛑 Stopped by user[/]")
+        return 
+
+    # Финальный вывод
+    _, final_clean, _ = parse_thought(accumulated_text)
+    if final_clean.strip():
+        print_padded_markdown(final_clean, padding=(0, 1, 1, 1))
+    
+    console.print(tracker.render(time.time() - start_time), justify="right")
+
+# ======================================================
+# MAIN
+# ======================================================
+async def main():
+    os.system("cls" if os.name == "nt" else "clear")
+    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v3.4"))
+
+    previous_level = logger.getEffectiveLevel()
+    logger.setLevel(logging.WARNING)
+
+    try:
+        with console.status("[bold green]Initializing system...[/]", spinner="dots"):
+            workflow = AgentWorkflow()
+            await workflow.initialize_resources()
+            agent_app = workflow.build_graph()
+        console.print("[bold green]System Ready![/]")
+
+    except Exception as e:
+        console.print(f"[bold red]Init Error:[/] {e}")
+        return
+    finally:
+        logger.setLevel(previous_level)
+        
+    model = workflow.config.gemini_model if workflow.config.provider == "gemini" else workflow.config.openai_model
+    tools = len(workflow.tools)
+    max_loops = workflow.config.max_loops
+
+    console.print(f"[dim]Model:[/] [bold cyan]{model}[/] [dim]Tools:[/] [bold cyan]{tools}[/] [dim]Max Loops:[/] [bold cyan]{max_loops}[/]")
+    console.print("[bold blue]Enter[/] [bold green]↵[/] — send  |  [bold blue]Alt+Enter[/] [bold yellow]⎇↵[/] — new line\n")
+
     session = PromptSession(
-        multiline=True, 
-        key_bindings=setup_key_bindings(), 
-        style=style, 
-        history=FileHistory(".agent_history"),
-        prompt_continuation=lambda w, l, c: ". ", 
-        lexer=PygmentsLexer(MarkdownLexer),
+        history=FileHistory(".history"),
+        style=Style.from_dict({"prompt": "bold cyan"}),
+        key_bindings=get_key_bindings(),
+        lexer=PygmentsLexer(MarkdownLexer)
     )
-    
-    console.print("\n[bold green]Чат начат[/] (Enter = Отправить, Alt+Enter = Новая строка)\n")
+
+    thread_id = "main_session"
 
     while True:
         try:
-            console.print(Rule(style="dim cyan"))
-            user_input = await session.prompt_async([("class:myself", "You > ")])
+            user_input = await session.prompt_async("You > ")
             user_input = user_input.strip()
-            
-            # Команды управления
             if not user_input: continue
             if user_input.lower() in ["exit", "quit"]: break
-            if user_input.lower() in ["reset", "clear"]:
-                thread_id = f"session-{time.time()}"
-                config["configurable"]["thread_id"] = thread_id
-                console.print("[yellow]♻  Контекст сброшен (новая сессия)[/]")
+            if user_input.lower() in ["clear", "reset"]:
+                thread_id = f"session_{int(time.time())}"
+                console.print("[yellow]♻ New session started[/]")
                 continue
 
-            # Инициализация переменных для обработки ответа
-            accumulated_text = ""
-            start_time = time.time()
-            tracker = TokenTracker()
-            
-            # Визуализация процесса
-            with Live(Spinner("dots", text="Думаю...", style="cyan"), refresh_per_second=12, console=console) as live:
-                
-                async for event in agent.astream(
-                    {"messages": [HumanMessage(content=user_input)]},
-                    config=config,
-                    stream_mode="messages"
-                ):
-                    message, metadata = event
-                    node = metadata.get("langgraph_node")
-                    
-                    # 1. Обновляем токены
-                    tracker.update(message)
+            await process_stream(agent_app, user_input, thread_id, max_loops=max_loops)
+            console.print()
 
-                    # 2. Обработка текстового ответа от Агента
-                    if node == "agent":
-                        # Если сообщение содержит вызовы инструментов
-                        if hasattr(message, "tool_calls") and message.tool_calls:
-                            # Если был накоплен текст до вызова инструмента, выводим его
-                            if accumulated_text.strip():
-                                live.console.print(Padding(Markdown(accumulated_text), (0, 1, 0, 1)))
-                                accumulated_text = "" 
-                            
-                            for tc in message.tool_calls:
-                                live.update(Spinner("earth", text=f"[bold cyan]Выполняю:[/] {tc['name']}", style="cyan"))
-                        
-                        # Если сообщение содержит контент (текст)
-                        elif message.content:
-                            chunk = message.content
-                            # Обработка списка (иногда бывает в мультимодальных ответах)
-                            if isinstance(chunk, list):
-                                chunk = "".join([p["text"] for p in chunk if "text" in p])
-                            
-                            if chunk:
-                                accumulated_text += chunk
-                                live.update(Padding(Markdown(accumulated_text), (0, 1, 0, 1)))
-
-                    # 3. Обработка результатов инструментов
-                    elif node == "tools":
-                        name = getattr(message, "name", "tool")
-                        
-                        # Форматирование вывода инструмента
-                        res_str = str(message.content)
-                        if len(res_str) > 200:
-                            preview = res_str[:200] + f"... [dim](+{len(res_str)-200} chars)[/]"
-                        else:
-                            preview = res_str
-                            
-                        # Вывод блока инструмента "над" текущим спиннером
-                        live.console.print(Padding(f"[dim green]✓ {name}: {preview}[/]", (0, 0, 0, 4)))
-                        live.update(Spinner("dots", text="Анализирую результат...", style="cyan"))
-
-            # Вывод финальной статистики
-            console.print(tracker.display(time.time() - start_time))
-
-        except KeyboardInterrupt:
-            console.print("\n[bold red]Прервано пользователем[/]")
-            break
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            console.print("\n[yellow]Cancelled. Type 'exit' to quit.[/]")
+            continue
         except Exception as e:
-            logger.exception("Runtime Error in CLI loop")
-            console.print(f"\n[bold red]Ошибка цикла: {e}[/]")
-            # Небольшая задержка перед повтором, чтобы не спамить ошибками
-            await asyncio.sleep(1)
-
-async def main():
-    # Очистка консоли
-    os.system("cls" if os.name == "nt" else "clear")
-    
-    console.print(Panel.fit("[bold blue]AI Agent CLI[/] [dim](LangGraph + MCP)[/]", style="blue"))
-
-    try:
-        console.print(Rule("Инициализация", style="blue"))
-        
-        # 1. Загрузка конфига через новый фабричный метод
-        config = AgentConfig.from_env()
-
-        # Вывод инфо
-        model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
-        console.print(f"[dim]Провайдер:[/] [bold cyan]{config.provider.upper()}[/] | [dim]Модель:[/] [bold cyan]{model_name}[/]")
-        
-        # 2. Создание графа
-        agent = await create_agent_graph(config)
-        
-        console.print(Panel(f"[green]Агент готов к работе[/]", style="green"))
-        
-        # 3. Запуск цикла
-        await interactive_loop(agent)
-        
-    except Exception as e:
-        console.print(f"[bold red]Критическая ошибка запуска: {e}[/]")
-        # logger.exception("Critical startup error") # Раскомментировать если нужно логировать старт
+            console.print(f"[bold red]Error:[/] {e}")
 
 if __name__ == "__main__":
     try:

@@ -14,7 +14,6 @@ OPENAI_API_KEY=sk-mega-5273e9a9f5a9c......
 OPENAI_MODEL=moonshotai/kimi-k2-instruct-0905
 #OPENAI_BASE_URL=https://openrouter.ai/api/v1
 OPENAI_BASE_URL=https://ai.megallm.io/v1
-#OPENAI_BASE_URL=https://api.xiaomimimo.com/v1
 
 # ===== RETRY НАСТРОЙКИ =====
 # Количество повторных попыток при ошибке 500
@@ -26,6 +25,6 @@ RETRY_DELAY=2
 # Показывать полный traceback при ошибках
 DEBUG=false
 LONG_TERM_MEMORY=false
-SESSION_SIZE=10
+SESSION_SIZE=12
 PROMPT_PATH=prompt.txt
 MAX_LOOPS=25

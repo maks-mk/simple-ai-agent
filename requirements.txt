@@ -1,29 +1,31 @@
-# LLM и LangChain
+# --- CORE FRAMEWORK ---
 langchain
 langchain-core
 langchain-google-genai
-langgraph
 langchain-openai
+langgraph
+# Обязательно для pydantic v2 (используется в agent.py для настроек)
+pydantic-settings
 
-# MCP адаптер для LangChain
+# --- TOOLS & API ---
+# Поиск и чтение сайтов (Главная зависимость теперь)
+tavily-python
+
+# MCP адаптер (нужен, если у вас есть mcp.json и вы планируете расширять тулы)
 langchain-mcp-adapters
 
-# Переменные окружения
-python-dotenv
-
-# UI и CLI
-#streamlit
-rich
-prompt_toolkit
-
-# Дополнительные зависимости
-pydantic
-httpx
-pygments
-watchdog
-beautifulsoup4
-tiktoken
-#long_term_memory
+# --- MEMORY (RAG) ---
+# Векторная база данных и эмбеддинги для памяти
 chromadb
 sentence-transformers
-#nest_asyncio
+
+# --- UTILS ---
+# Загрузка .env
+python-dotenv
+# Подсчет токенов (используется в agent.py для логики сжатия)
+tiktoken
+
+# --- UI / CLI ---
+rich
+prompt_toolkit
+pygments

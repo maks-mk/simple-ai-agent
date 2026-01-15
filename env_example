@@ -1,0 +1,31 @@
+PROVIDER=openai
+#PROVIDER=gemini
+GEMINI_MODEL=gemini-flash-latest
+GEMINI_API_KEY=api_key
+
+# ==============================================
+# НАСТРОЙКИ OPENAI / OpenAI-совместимых API
+# ==============================================
+# Используется если PROVIDER=openai
+# API ключ (обязательно)
+#openrouter_api_key
+
+OPENAI_API_KEY=api_key
+
+# Модель (обязательно)
+OPENAI_MODEL=x-ai/grok-4.1-fast:free
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+
+# ===== RETRY НАСТРОЙКИ =====
+# Количество повторных попыток при ошибке 500
+MAX_RETRIES=3
+
+# Задержка между попытками (в секундах)
+RETRY_DELAY=2
+
+# ===== Другое =====
+# Показывать полный traceback при ошибках
+DEBUG=false
+LONG_TERM_MEMORY=true
+SESSION_SIZE=6
+LLM_TEMPERATURE=0.5

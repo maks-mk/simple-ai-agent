@@ -1,258 +1,335 @@
+import os
+import logging
 import asyncio
-import httpx
-import re
-import urllib.parse
-import json
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import List
+from typing import Optional, List, Any, Union
 
-from bs4 import BeautifulSoup
-from langchain_core.tools import tool
+logger = logging.getLogger(__name__)
+
+# --- Инициализация Tavily ---
+try:
+    from tavily import AsyncTavilyClient
+except ImportError:
+    AsyncTavilyClient = None
+    logger.warning("Tavily SDK not installed. Search tools will be disabled.")
+
+_client: Optional[Any] = None
+
+def get_tavily_client() -> Optional[Any]:
+    global _client
+    if _client is not None:
+        return _client
+
+    if AsyncTavilyClient is None:
+        logger.error("Tavily SDK is not available (ImportError).")
+        return None
+
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        logger.error("TAVILY_API_KEY is not set.")
+        return None
+
+    try:
+        _client = AsyncTavilyClient(api_key=api_key)
+        return _client
+    except Exception as e:
+        logger.error(f"Failed to initialize Tavily client: {e}")
+        return None
 
 
-# ======================================================
-# RATE LIMITER
-# ======================================================
+# ----------------------------
+# Tool 1: Web Search (Широкий поиск)
+# ----------------------------
 
-class RateLimiter:
+async def web_search(query: str, max_results: int = 5) -> str:
     """
-    Simple async rate limiter (requests per minute).
+    Search internet for information. Returns snippets from multiple sources + AI summary.
+    Use for: quick facts, news, comparing sources. Don't use for full article text.
     """
+    client = get_tavily_client()
+    if not client:
+        return "System: Search is unavailable due to missing configuration."
 
-    def __init__(self, rpm: int = 30):
-        self.rpm = rpm
-        self.calls: List[datetime] = []
+    query = (query or "").strip()
+    if not query:
+        return "System: Search completed: empty query provided."
 
-    async def acquire(self):
-        now = datetime.now()
-        self.calls = [t for t in self.calls if now - t < timedelta(minutes=1)]
+    response = None
+    last_error = None
 
-        if len(self.calls) >= self.rpm:
-            wait_time = 60 - (now - self.calls[0]).total_seconds()
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-
-        self.calls.append(now)
-
-
-# ======================================================
-# DATA STRUCTURES
-# ======================================================
-
-@dataclass
-class SearchResult:
-    title: str
-    url: str
-    snippet: str
-    position: int
-
-
-# ======================================================
-# DUCKDUCKGO SEARCH CLIENT
-# ======================================================
-
-class DuckDuckGoClient:
-    """
-    DuckDuckGo HTML search.
-    Imitates a browser to bypass basic bot protection.
-    """
-
-    BASE_URL = "https://html.duckduckgo.com/html"
-    
-    HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://duckduckgo.com/"
-    }
-
-    def __init__(self, rpm: int = 20):
-        self.limiter = RateLimiter(rpm=rpm)
-
-    async def search(self, query: str, limit: int = 5) -> List[SearchResult]:
-        await self.limiter.acquire()
-
+    # --- RETRY LOGIC ---
+    for attempt in range(3):
         try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                follow_redirects=True,
-                headers=self.HEADERS
-            ) as client:
-                response = await client.post(
-                    self.BASE_URL,
-                    data={"q": query, "b": "", "kl": ""},
-                )
-                response.raise_for_status()
-        except Exception:
-            return []
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        results: List[SearchResult] = []
-
-        for block in soup.select(".result"):
-            title_el = block.select_one(".result__a")
-            snippet_el = block.select_one(".result__snippet")
-
-            if not title_el:
-                continue
-
-            url = title_el.get("href", "")
-            if not url:
-                continue
-
-            if "y.js" in url or "duckduckgo.com" in url:
-                continue
-
-            if "/l/?uddg=" in url:
-                try:
-                    url = urllib.parse.unquote(
-                        url.split("uddg=")[1].split("&")[0]
-                    )
-                except IndexError:
-                    continue
-
-            results.append(
-                SearchResult(
-                    title=title_el.get_text(strip=True),
-                    url=url,
-                    snippet=snippet_el.get_text(strip=True) if snippet_el else "",
-                    position=len(results) + 1,
-                )
+            response = await client.search(
+                query=query,
+                max_results=max_results,
+                search_depth="basic",
+                include_answer=True,
             )
-
-            if len(results) >= limit:
-                break
-
-        return results
-
-
-# ======================================================
-# WEB PAGE FETCHER
-# ======================================================
-
-class WebFetcher:
-    """
-    Fetches web pages with improved URL validation.
-    Resilient to JSON input and argument garbage.
-    """
-
-    def __init__(self, rpm: int = 20, max_chars: int = 8000):
-        self.limiter = RateLimiter(rpm=rpm)
-        self.max_chars = max_chars
-
-    async def fetch(self, raw_input: str) -> str:
-        raw_input = str(raw_input).strip()
-        target_url = None
-
-        # 1. Try to extract URL from JSON-like structure
-        if "{" in raw_input and "}" in raw_input:
-            try:
-                json_match = re.search(r'(\{.*\})', raw_input, re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group(1))
-                    if isinstance(data, dict):
-                        for v in data.values():
-                            if isinstance(v, str) and v.startswith("http"):
-                                target_url = v
-                                break
-            except Exception:
-                pass
-
-        # 2. If no URL in JSON, look for http/https regex
-        if not target_url:
-            match = re.search(r'(https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s\'"<>\[\]{}()]*)', raw_input)
-            if match:
-                target_url = match.group(1)
-                target_url = target_url.rstrip(".,;:)'\"")
-
-        # 3. Fallback: clean the string
-        if not target_url:
-            clean = re.sub(r'[\s\'"<>\[\]{}():,]+', '', raw_input).replace("url=", "")
-            if "." in clean and len(clean) > 4:
-                target_url = f"https://{clean}"
-
-        # 4. Final Validation (English Error Message)
-        if not target_url or not target_url.startswith("http") or len(target_url) < 8:
-            return f"Error: Invalid URL input '{raw_input}'. Please provide a valid absolute URL starting with http:// or https://."
-
-        await self.limiter.acquire()
-
-        try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-                },
-                verify=False 
-            ) as client:
-                response = await client.get(target_url)
-                
-                if response.status_code == 404:
-                    return f"Error 404: Page not found ({target_url})"
-                if response.status_code in [403, 401]:
-                    return f"Error {response.status_code}: Access denied (bot protection) ({target_url})"
-                
-                response.raise_for_status()
-
+            break 
         except Exception as e:
-            return f"System Error loading {target_url}: {str(e)}"
+            last_error = e
+            logger.warning(f"Web search attempt {attempt+1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
 
-        soup = BeautifulSoup(response.text, "html.parser")
+    if response is None:
+        msg = str(last_error).lower()
+        if "401" in msg or "unauthorized" in msg:
+            return "System: Search failed due to invalid API credentials."
+        return f"System: Search failed after 3 attempts. Error: {msg}"
 
-        # Cleanup
-        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "noscript", "svg"]):
-            tag.decompose()
+    results: List[str] = []
 
-        text = soup.get_text(separator=" ")
-        text = re.sub(r"\s+", " ", text).strip()
+    # AI-generated answer
+    answer = response.get("answer")
+    if answer:
+        results.append(f"AI Overview:\n{answer}")
+        results.append("=" * 40)
 
-        if len(text) > self.max_chars:
-            text = text[: self.max_chars] + " …[truncated]"
+    items = response.get("results", [])
+    if not items:
+        if results:
+            return "\n".join(results)
+        return "System: Search completed: no results found."
+
+    # Format compact result
+    total_chars = 0
+    max_chars = 11000 
+    separator = "-" * 40
+
+    for item in items:
+        title = item.get("title") or "Untitled"
+        url = item.get("url") or ""
+        content = item.get("content") or ""
+        score = item.get("score", 0)
+
+        if not content:
+            continue
+
+        header = f"Source: {title} (score: {score:.2f})\nURL: {url}"
+        block_overhead = len(header) + len(separator) + 5
         
-        if not text:
-            return "Page loaded, but no text content found (possibly SPA/React site)."
+        available_space = max_chars - total_chars - block_overhead
+        if available_space <= 50:
+            break
 
-        return text
+        if len(content) > available_space:
+            content = content[:available_space] + "... (truncated)"
+
+        block = f"{header}\n{content}"
+        results.append(block)
+        results.append(separator)
+        total_chars += len(block) + len(separator)
+
+    results.append("[Search completed. Use the context above.]")
+    return "\n".join(results)
 
 
-# ======================================================
-# SINGLETONS
-# ======================================================
+# ----------------------------
+# Tool 2: Fetch Content (Универсальное чтение)
+# ----------------------------
 
-_ddg = DuckDuckGoClient()
-_fetcher = WebFetcher()
-
-
-# ======================================================
-# TOOLS
-# ======================================================
-
-@tool
-async def web_search(query: str) -> str:
+async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> str:
     """
-    Search for information online. Returns a list of links and snippets.
+    Extract text from one or multiple URLs. 
+    Use this to read pages after searching. Supports batching (up to 20 links).
+    
+    Args:
+        urls: A single URL string OR a list of URL strings.
+        advanced: Set True for better extraction on difficult sites (costs more).
     """
-    results = await _ddg.search(query, limit=5)
+    client = get_tavily_client()
+    if not client:
+        return "System: Fetch unavailable."
 
-    if not results:
-        return "No results found (try rephrasing the query)."
+    # 1. Нормализация входных данных
+    if isinstance(urls, str):
+        # Если пришла строка, делаем из нее список
+        urls = [urls]
+    
+    if not isinstance(urls, list) or not urls:
+        return "System: Error - 'urls' must be a string or a list of strings."
 
-    return "\n\n".join(
-        f"{r.position}. {r.title}\n{r.url}\n{r.snippet}"
-        for r in results
-    )
+    # 2. Чистка и валидация
+    clean_urls = []
+    for u in urls:
+        if isinstance(u, str):
+            u_clean = u.strip().strip('"').strip("'")
+            if u_clean.startswith("http"):
+                clean_urls.append(u_clean)
+    
+    clean_urls = list(set(clean_urls)) # Убираем дубликаты
+    
+    if not clean_urls:
+        return "System: No valid URLs provided."
+
+    if len(clean_urls) > 20:
+        clean_urls = clean_urls[:20]
+        logger.warning("Fetch batch truncated to first 20 URLs.")
+
+    # 3. Настройка параметров
+    depth = "advanced" if advanced else "basic"
+    response = None
+    last_error = None
+
+    # 4. Retry Logic
+    for attempt in range(3):
+        try:
+            response = await client.extract(urls=clean_urls, extract_depth=depth)
+            break
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Fetch attempt {attempt+1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+
+    if response is None:
+        return f"System: Fetch failed. Error: {str(last_error)}"
+
+    # 5. Формирование отчета
+    output_parts = []
+    # Если ссылка одна, даем больше лимит на символы, если много - меньше
+    max_chars_per_url = 15000 if len(clean_urls) == 1 else 6000 
+
+    results = response.get("results", [])
+    
+    # Сценарий одиночной ссылки (возвращаем чистый текст без лишних заголовков)
+    if len(clean_urls) == 1 and len(results) == 1 and not response.get("failed_results"):
+        data = results[0]
+        content = data.get("raw_content") or data.get("content") or ""
+        if not content: return "System: Empty content."
+        
+        if len(content) > max_chars_per_url:
+            content = content[:max_chars_per_url] + f"\n... [Truncated]"
+        return f"URL: {clean_urls[0]} (Mode: {depth})\n\n{content}\n\n[Content extracted]"
+
+    # Сценарий списка ссылок (Batch)
+    for item in results:
+        url = item.get("url", "Unknown URL")
+        content = item.get("raw_content") or item.get("content") or ""
+        
+        if len(content) > max_chars_per_url:
+            content = content[:max_chars_per_url] + f"\n... [Truncated]"
+        
+        if not content:
+            content = "[Empty content]"
+
+        block = (
+            f"=== SOURCE: {url} ===\n"
+            f"{content}\n"
+            f"=================================\n"
+        )
+        output_parts.append(block)
+
+    failed = response.get("failed_results", [])
+    if failed:
+        for f in failed:
+            output_parts.append(f"❌ FAILED: {f.get('url')} - {f.get('error')}")
+
+    if not output_parts:
+        return "System: No content extracted."
+
+    return "\n".join(output_parts)
 
 
-@tool
-async def fetch_url(url: str) -> str:
+# ----------------------------
+# Tool 3: Deep Search (Опционально)
+# ----------------------------
+
+async def deep_search(query: str, max_results: int = 3) -> str:
     """
-    Fetches and returns the text content of any web page by URL.
-    Input must be a URL string.
+    Deep search with full page content. Returns complete text from top results.
+    WARNING: Uses many tokens! Use only for comprehensive research/reports.
     """
-    return await _fetcher.fetch(url)
+    client = get_tavily_client()
+    if not client:
+        return "System: Deep search is unavailable due to missing configuration."
+
+    query = (query or "").strip()
+    if not query:
+        return "System: Deep search completed: empty query provided."
+
+    response = None
+    last_error = None
+
+    # --- RETRY LOGIC ---
+    for attempt in range(3):
+        try:
+            response = await client.search(
+                query=query,
+                max_results=max_results,  # Fewer results due to large volume
+                search_depth="advanced",
+                include_answer=True,
+                include_raw_content=True,  # FIXED: Boolean True instead of "text"
+            )
+            break
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Deep search attempt {attempt+1}/3 failed: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+
+    if response is None:
+        msg = str(last_error).lower()
+        if "401" in msg or "unauthorized" in msg:
+            return "System: Deep search failed due to invalid API credentials."
+        return f"System: Deep search failed after 3 attempts. Error: {msg}"
+
+    results: List[str] = []
+
+    # AI overview
+    answer = response.get("answer")
+    if answer:
+        results.append(f"AI Overview:\n{answer}")
+        results.append("=" * 40)
+
+    items = response.get("results", [])
+    if not items:
+        if results:
+            return "\n".join(results)
+        return "System: Deep search completed: no results found."
+
+    # Format detailed result with full content
+    total_chars = 0
+    max_chars = 30000  # Higher limit for deep search
+    separator = "=" * 60
+
+    for idx, item in enumerate(items, 1):
+        title = item.get("title") or "Untitled"
+        url = item.get("url") or ""
+        content = item.get("raw_content") or item.get("content") or ""
+        score = item.get("score", 0)
+
+        if not content:
+            continue
+
+        header = f"[Source {idx}] {title} (relevance: {score:.2f})\nURL: {url}\n"
+        block_overhead = len(header) + len(separator) + 10
+        
+        available_space = max_chars - total_chars - block_overhead
+        if available_space <= 100:
+            break
+
+        if len(content) > available_space:
+            content = content[:available_space] + "\n... [Content truncated]"
+
+        block = f"{header}{separator}\n{content}\n"
+        results.append(block)
+        total_chars += len(block)
+
+    results.append("[Deep search completed. Full content extracted.]")
+    return "\n".join(results)
+
+
+# ----------------------------
+# Tool Registration Metadata
+# ----------------------------
+
+web_search.name = "web_search"
+web_search.description = "Search internet. Returns snippets + AI summary. Use for quick facts/news."
+
+fetch_content.name = "fetch_content"
+fetch_content.description = "Extract text from URL(s). Can handle a single link or a list. Args: urls=['link1', 'link2']"
+
+deep_search.name = "deep_search"
+deep_search.description = "Deep search with full content. High token cost. Use for research only."

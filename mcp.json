@@ -1,13 +1,13 @@
 {
   "filesystem": {
     "command": "mcp-server-filesystem",
-    "args": ["{filesystem_path}"],
+    "args": ["."],
     "transport": "stdio",
     "enabled": true
   },
   "tavily-remote-mcp": {
     "command": "npx",
-    "args": ["-y", "--quiet", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-dev-2ylsPM.........."],
+    "args": ["-y", "--quiet", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-dev-2y............."],
     "env": {
       "npm_config_loglevel": "silent"
     },

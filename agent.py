@@ -175,7 +175,7 @@ class AgentUtils:
     def sanitize_path(path: str) -> str:
         """Чистит путь от мусора (:ru:, win-chars)."""
         path = re.sub(r'^:[a-z]{2,3}:', '', path)
-        path = re.sub(r'[<>|?*]+', '', path)
+        path = re.sub(r'[<>:"|?*]+', '', path)
         return path.strip()
 
     @staticmethod
@@ -196,15 +196,19 @@ class AgentUtils:
                 
                 # --- ЛОГИКА ОБРАБОТКИ ПУТЕЙ ---
                 if k in path_keys:
-                    if not v or v.strip() == ".":
+                    # 1. Предварительная грубая очистка от кавычек и двоеточий по краям
+                    v = v.strip().strip('"').strip("'").strip(":").strip()
+                    
+                    if not v or v == ".":
                         return f"doc_{int(time.time())}.txt"
 
                     path_obj = Path(v)
-                    # Если путь абсолютный - ДОВЕРЯЕМ ЕМУ (MCP/Tools сами проверят безопасность)
+                    
+                    # Если путь абсолютный - ДОВЕРЯЕМ ЕМУ
                     if path_obj.is_absolute():
                         return str(path_obj)
                     
-                    # Если путь относительный - чистим от ".." (Path Traversal)
+                    # Если путь относительный - чистим каждый кусок
                     clean_parts = [
                         AgentUtils.sanitize_path(p) 
                         for p in path_obj.parts 
@@ -215,7 +219,7 @@ class AgentUtils:
                          return f"doc_{int(time.time())}.txt"
                     
                     return str(Path(*clean_parts))
-
+                    
                 # --- ОБРАБОТКА URL ---
                 if name == "fetch_content" and (k in url_keys or k == "url" or k == "urls"):
                     if isinstance(v, list):
@@ -274,17 +278,19 @@ class ToolRegistry:
 
     def _load_search_tools(self):
         try:
-            from search_tools import web_search, deep_search, fetch_content
+            # 1. Импортируем batch_web_search
+            from search_tools import web_search, deep_search, fetch_content, batch_web_search
             
             if web_search and fetch_content:
-                self.tools.extend([web_search, fetch_content])
+                # 2. Добавляем в список инструментов
+                self.tools.extend([web_search, batch_web_search, fetch_content])
             
             if self.config.enable_deep_search and deep_search:
                 logger.info("🔹 Deep Search tool is ENABLED")
                 self.tools.append(deep_search)
         except ImportError:
             logger.warning("Search tools dependencies missing.")
-
+            
     def _load_memory_tools(self):
         try:
             from memory_manager import MemoryManager
@@ -292,21 +298,33 @@ class ToolRegistry:
             
             @tool
             async def remember_fact(text: str, category: str = "general") -> str:
+                """
+                Saves a piece of information to long-term memory.
+                Use this to remember user preferences, important facts, or context for future sessions.
+                """
                 return await memory.aremember(text, {"type": category})
             
             @tool
             async def recall_facts(query: str) -> str:
+                """
+                Searches long-term memory for relevant facts based on a query.
+                Use this when you need to recall past context or user details.
+                """
                 facts = await memory.arecall(query)
                 return "\n".join(f"- {f}" for f in facts) if facts else "No facts found."
             
             @tool
             async def forget_fact(query: str) -> str:
+                """
+                Removes a specific fact from memory by content query.
+                Use this only when explicitly asked to forget something.
+                """
                 return f"Forgotten: {await memory.adelete_fact_by_query(query)}"
 
             self.tools.extend([remember_fact, recall_facts, forget_fact])
         except ImportError:
             logger.warning("MemoryManager not available.")
-
+            
     async def _load_mcp_tools(self):
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -443,6 +461,19 @@ class AgentWorkflow:
 
         # 5. Патч токенов
         self._patch_token_usage(response, full_context)
+        
+        if response.tool_calls:
+            last_msg = messages[-1] if messages else None
+            if isinstance(last_msg, ToolMessage):
+                current_tool = response.tool_calls[0]['name']
+                last_tool = last_msg.name
+                
+                # Блокируем повторную запись
+                if current_tool == "write_file" and last_tool == "write_file":
+                    logger.warning("🛑 Loop Guard: Blocked repetitive write_file.")
+                    response = AIMessage(
+                        content="System: File already written. Stop overwriting. Summarize what you did."
+                    )
 
         return {"messages": [response]}
 
@@ -475,26 +506,76 @@ class AgentWorkflow:
         return SystemMessage(content=prompt)
 
     async def _invoke_llm_with_retry(self, context: List[BaseMessage]) -> AIMessage:
-        """Попытка вызова LLM с обработкой ошибок и 'ленивых' ответов."""
+        """
+        Вызов LLM с универсальным механизмом восстановления (Self-Correction) при сбоях.
+        """
+        # Список ошибок, при которых нет смысла делать Retry (сразу сдаемся)
+        FATAL_ERRORS = ["401", "unauthorized", "quota", "billing", "context_length_exceeded"]
+
         for attempt in range(3):
             try:
                 response = await self.llm_with_tools.ainvoke(context)
-                if not response.content and not response.tool_calls:
-                    raise ValueError("Empty response")
-                return response
-            except Exception as e:
-                # Авто-комплит при успешной записи файла (частый баг)
-                last_msg = context[-1] if context else None
-                if isinstance(last_msg, ToolMessage) and "Successfully wrote" in str(last_msg.content):
-                    logger.info("🛡️ Auto-completing after write_file crash.")
-                    return AIMessage(content="Файл записан. (Авто-завершение)")
                 
-                logger.debug(f"⚠️ LLM Retry {attempt+1}/3: {e}")
-                if attempt == 2:
-                    return AIMessage(content=f"System Error: {e}")
-                await asyncio.sleep(1)
-        return AIMessage(content="System Error: Unknown")
+                # Проверка на пустой ответ (бывает у некоторых API)
+                if not response.content and not response.tool_calls:
+                    raise ValueError("Empty response from LLM")
+                    
+                return response
 
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # 1. Если ошибка фатальная — прерываем сразу
+                if any(err in error_str for err in FATAL_ERRORS):
+                    logger.error(f"🛑 Fatal LLM Error: {e}")
+                    return AIMessage(content=f"System Error: API refused request ({e})")
+
+                # 2. Логика восстановления (только если это не последняя попытка)
+                if attempt < 2:
+                    # TИХИЙ ЛОГ (DEBUG)
+                    logger.debug(f"⚠️ LLM Crash (Attempt {attempt+1}): {e}. Trying to recover...")
+                    
+                    last_msg = context[-1] if context else None
+                    
+                    # Сценарий A: Упали после ToolMessage
+                    if isinstance(last_msg, ToolMessage):
+                        recovery_prompt = (
+                            "SYSTEM NOTICE: The tool execution was completed, but the subsequent AI response crashed due to a network error. "
+                            "INSTRUCTION: Look at the last ToolMessage in the context above. "
+                            "Analyze its output (whether success or error) and formulate a response to the user based on it. "
+                            "Do not mention the network crash."
+                        )
+                    # Сценарий B: Упали при ответе юзеру
+                    elif isinstance(last_msg, HumanMessage):
+                        recovery_prompt = (
+                            "SYSTEM NOTICE: Your previous attempt to answer crashed. "
+                            "INSTRUCTION: Please try to answer the user's last message again."
+                        )
+                    # Сценарий C: Прочее
+                    else:
+                        recovery_prompt = "SYSTEM NOTICE: Connection glitch. Please retry your last action."
+
+                    # --- ПОПЫТКА ВОССТАНОВЛЕНИЯ ---
+                    try:
+                        recovery_msg = SystemMessage(content=recovery_prompt)
+                        return await self.llm_with_tools.ainvoke(context + [recovery_msg])
+                    except Exception as recovery_error:
+                        # ТОЖЕ ТИХИЙ ЛОГ (DEBUG), чтобы не пугать юзера красным текстом, 
+                        # ведь у нас еще может быть следующая попытка цикла.
+                        logger.debug(f"❌ Recovery failed: {recovery_error}")
+                        await asyncio.sleep(1)
+                        continue
+                
+                # Если это была последняя попытка — тут уже ERROR нужен
+                logger.error(f"💀 All retries failed: {e}")
+                
+        # Фолбэк
+        last_tool_status = "Unknown"
+        if context and isinstance(context[-1], ToolMessage):
+            last_tool_status = "Tool executed, but AI cannot report result."
+            
+        return AIMessage(content=f"**System Failure**: Multiple API crashes. ({last_tool_status})")
+        
     def _is_unsafe_write(self, response: AIMessage, history: List[BaseMessage]) -> bool:
         """Блокирует запись файла, если в истории нет успешных чтений/поиска."""
         if not response.tool_calls: return False
@@ -539,7 +620,8 @@ class AgentWorkflow:
             response.usage_metadata = {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens
+                "total_tokens": input_tokens + output_tokens,
+                "token_source": "Manual"
             }
 
     # --- GRAPH BUILDER ---

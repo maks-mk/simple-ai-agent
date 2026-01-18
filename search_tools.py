@@ -320,10 +320,60 @@ async def deep_search(query: str, max_results: int = 3) -> str:
     results.append("[Deep search completed. Full content extracted.]")
     return "\n".join(results)
 
+# --- Добавить в конец search_tools.py ---
 
-# ----------------------------
-# Tool Registration Metadata
-# ----------------------------
+async def batch_web_search(queries: List[str]) -> str:
+    """
+    Perform multiple web searches in parallel. 
+    Use this tool when the user asks a complex question that requires researching 
+    multiple different aspects or topics simultaneously.
+    
+    Args:
+        queries: List of search query strings. Example: ["RTX 5090 price", "RTX 5090 specs"]
+    """
+    client = get_tavily_client()
+    if not client:
+        return "System: Search unavailable."
+
+    # Защита от перегрузки (максимум 5 запросов за раз)
+    if len(queries) > 5:
+        queries = queries[:5]
+        
+    tasks = []
+    for q in queries:
+        tasks.append(
+            client.search(
+                query=q,
+                max_results=4, 
+                search_depth="basic",
+                include_answer=True
+            )
+        )
+
+    try:
+        # Запускаем параллельно
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        return f"Batch search error: {e}"
+
+    output = []
+    for q, res in zip(queries, results_list):
+        output.append(f"\n=== Search: {q} ===")
+        if isinstance(res, Exception):
+            output.append(f"Error: {res}")
+            continue
+            
+        if res.get("answer"):
+            output.append(f"AI Summary: {res.get('answer')}")
+            
+        for item in res.get("results", []):
+            output.append(f"- {item.get('title')} ({item.get('url')}): {item.get('content')[:200]}...")
+            
+    return "\n".join(output)
+
+# Регистрация метаданных
+batch_web_search.name = "batch_web_search"
+batch_web_search.description = "Run multiple searches in parallel. Args: queries=['q1', 'q2']"
 
 web_search.name = "web_search"
 web_search.description = "Search internet. Returns snippets + AI summary. Use for quick facts/news."

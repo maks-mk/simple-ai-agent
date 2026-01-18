@@ -89,6 +89,7 @@ class TokenTracker:
         self.total_output = 0
         self._seen_ids = set()
         self._streaming_text = "" 
+        self.source_label = "Provider" # По умолчанию считаем, что от провайдера
 
     def update_from_message(self, msg: Any):
         if hasattr(msg, "usage_metadata") and msg.usage_metadata:
@@ -117,6 +118,10 @@ class TokenTracker:
         is_new = True
         if msg_id and msg_id in self._seen_ids: is_new = False
         
+        # Определяем источник
+        if usage.get("token_source") == "Manual":
+            self.source_label = "Manual"
+        
         in_t = usage.get("input_tokens", 0)
         if in_t > self.max_input: self.max_input = in_t
         
@@ -132,8 +137,10 @@ class TokenTracker:
         if self._streaming_text:
             est = len(_ENCODER.encode(self._streaming_text)) if _ENCODER else len(self._streaming_text) // 3
             display_out += est
-        return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out}"
-
+            
+        # Добавляем метку источника серым цветом
+        return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out} [dim]({self.source_label})[/]"
+        
 def format_tool_output(name: str, content: str, is_error: bool) -> str:
     content = str(content).strip()
     if is_error: 
@@ -233,12 +240,46 @@ class StreamProcessor:
 
     def _handle_tool_call(self, tc, live):
         t_id, t_name = tc.get("id"), tc.get("name")
+        args = tc.get("args", {})
+        
         if t_id and t_name and t_id not in self.printed_tool_ids:
-            # Выводим уведомление о туле
-            live.console.print(Padding(f"🌍 [bold cyan]Call:[/] {t_name}", (0, 0, 0, 2)))
-            self.printed_tool_ids.add(t_id)
-            self.status_text = f"[bold cyan]Calling:[/] {t_name}"
+            # --- ЛОГИКА ИЗВЛЕЧЕНИЯ АРГУМЕНТА ---
+            arg_str = ""
+            if isinstance(args, dict):
+                # Приоритетные ключи, которые мы хотим видеть
+                priority_keys = ["query", "queries", "path", "file_path", "url", "urls", "filename"]
+                for key in priority_keys:
+                    if key in args:
+                        val = args[key]
+                        # Если это список (например, urls или queries), красиво форматируем
+                        if isinstance(val, list):
+                            arg_str = str(val)
+                        else:
+                            arg_str = str(val)
+                        break
+                # Если приоритетных нет, берем первый попавшийся
+                if not arg_str and args:
+                    arg_str = str(list(args.values())[0])
+            elif isinstance(args, str):
+                arg_str = args
 
+            # --- ФОРМАТИРОВАНИЕ ---
+            arg_display = ""
+            if arg_str:
+                clean_arg = str(arg_str).strip().replace("\n", " ")
+                # Обрезаем до 60 символов
+                if len(clean_arg) > 60:
+                    clean_arg = clean_arg[:57] + "..."
+                # [dim] - это серый цвет в Rich
+                arg_display = f" [dim]{clean_arg}[/]"
+
+            # --- ОБНОВЛЕНИЕ СТАТУСА ---
+            # Выводим в спиннер: "Calling: web_search [серый аргумент]"
+            self.status_text = f"[bold cyan]Calling:[/] {t_name}{arg_display}"
+            
+            # Добавляем ID в обработанные, чтобы не мигало
+            self.printed_tool_ids.add(t_id)
+            
     def _handle_tool_result(self, msg, live):
         content_str = str(msg.content)
         is_error = getattr(msg, "status", "") == "error" or content_str.startswith(("Error", "Ошибка"))
@@ -299,7 +340,7 @@ class StreamProcessor:
 
 async def main():
     os.system("cls" if os.name == "nt" else "clear")
-    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v4.5b"))
+    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v4.7b"))
 
     # Suppress Logs during init
     prev_level = logger.getEffectiveLevel()

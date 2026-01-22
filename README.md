@@ -51,25 +51,45 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Да, вы правы. Я добавлю четкое разделение настроек для OpenAI и Gemini, чтобы было понятно, какие переменные нужны для каждого провайдера.
+
+Вот обновленный раздел **«3. Настройка .env»** для вашего `README.md`:
+
+```markdown
 ### 3. Настройка `.env`
 
-Создайте файл `.env`:
+Создайте файл `.env`. Выберите **один** из вариантов настройки провайдера (Gemini или OpenAI).
 
+#### Вариант А: Google Gemini (Рекомендуется для старта)
+```ini
+# --- ВЫБОР ПРОВАЙДЕРА ---
+PROVIDER=gemini
+
+# --- GEMINI SETTINGS ---
+GEMINI_API_KEY=AIzaSy...
+GEMINI_MODEL=gemini-1.5-flash
+# Или более мощная: gemini-1.5-pro
+
+# --- ОБЩИЕ НАСТРОЙКИ ---
+TAVILY_API_KEY=tvly-...
+MAX_LOOPS=15
+TEMPERATURE=0.2
+LONG_TERM_MEMORY=true
+```
+
+#### Вариант Б: OpenAI / DeepSeek / OpenRouter
 ```ini
 # --- ВЫБОР ПРОВАЙДЕРА ---
 PROVIDER=openai
 
-# --- API KEYS ---
-# Поддерживает OpenAI, OpenRouter, DeepSeek, AgentRouter (через base_url)
+# --- OPENAI SETTINGS ---
 OPENAI_API_KEY=sk-...
+# Для OpenRouter/DeepSeek измените base_url:
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o
 
-# --- ПОИСК (ОБЯЗАТЕЛЬНО) ---
-# Получить ключ: https://tavily.com
+# --- ОБЩИЕ НАСТРОЙКИ ---
 TAVILY_API_KEY=tvly-...
-
-# --- НАСТРОЙКИ ---
 MAX_LOOPS=15
 TEMPERATURE=0.2
 LONG_TERM_MEMORY=true

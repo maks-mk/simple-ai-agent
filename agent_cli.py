@@ -1,10 +1,21 @@
+import sys
+from pathlib import Path
+# Определение пути для EXE и скрипта ---
+if getattr(sys, 'frozen', False):
+    # Если запущено как скомпилированный EXE
+    BASE_DIR = Path(sys.executable).parent
+else:
+    # Если запущено как Python скрипт
+    BASE_DIR = Path(__file__).resolve().parent
+sys.path.append(str(BASE_DIR))
+
 import os
 import asyncio
 import warnings
 import time
-import re
 import logging
-from typing import Dict, Tuple, Any, Set, Optional
+import re
+from typing import Optional
 
 # --- UI IMPORTS ---
 from rich.console import Console, Group
@@ -13,18 +24,16 @@ from rich.markdown import Markdown
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.padding import Padding
-from rich.text import Text
 
 # --- PROMPT IMPORTS ---
 from prompt_toolkit import PromptSession
-from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 from prompt_toolkit.lexers import PygmentsLexer
 from pygments.lexers.markup import MarkdownLexer
 from prompt_toolkit.history import FileHistory
 
 # --- LANGCHAIN IMPORTS ---
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk, SystemMessage
 
 # --- LOCAL IMPORTS ---
 try:
@@ -34,12 +43,13 @@ except ImportError:
     sys.path.append(".")
     from agent import AgentWorkflow, logger
 
-# --- OPTIONAL IMPORTS ---
-try:
-    import tiktoken
-    _ENCODER = tiktoken.get_encoding("cl100k_base")
-except ImportError:
-    _ENCODER = None
+from core.cli_utils import (
+    TokenTracker, 
+    clean_markdown_text, 
+    parse_thought, 
+    format_tool_output, 
+    get_key_bindings
+)
 
 # --- CONFIG ---
 warnings.filterwarnings("ignore")
@@ -47,126 +57,7 @@ console = Console()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ======================================================
-# 1. TEXT PROCESSING UTILITIES
-# ======================================================
-
-_THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.DOTALL)
-
-def clean_markdown_text(text: str) -> str:
-    """
-    Убирает лишние отступы и двойные переносы строк перед списками.
-    Решает проблему визуальных 'дыр' в Rich Markdown.
-    """
-    if not text: return text
-    
-    # 1. Схлопываем множественные переносы (оставляем максимум 2)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    # 2. Убираем пустую строку перед элементами списка (•, -, *, 1.)
-    text = re.sub(r'\n\s*\n(\s*[•\-\*]|\d+\.)', r'\n\1', text)
-    
-    return text
-
-def parse_thought(text: str) -> Tuple[str, str, bool]:
-    """Отделяет скрытые мысли <thought> от основного текста."""
-    match = _THOUGHT_RE.search(text)
-    if match: 
-        return match.group(1).strip(), _THOUGHT_RE.sub('', text).strip(), True
-    
-    if "<thought>" in text and "</thought>" not in text:
-        start = text.find("<thought>") + len("<thought>")
-        return text[start:].strip(), text[:text.find("<thought>")], False
-        
-    return "", text, False
-
-# ======================================================
-# 2. UI UTILITIES
-# ======================================================
-
-class TokenTracker:
-    def __init__(self):
-        self.max_input = 0
-        self.total_output = 0
-        self._seen_ids = set()
-        self._streaming_text = "" 
-        self.source_label = "Provider" # По умолчанию считаем, что от провайдера
-
-    def update_from_message(self, msg: Any):
-        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-            self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
-        
-        if isinstance(msg, (AIMessage, AIMessageChunk)):
-            content = msg.content
-            chunk = ""
-            if isinstance(content, str): chunk = content
-            elif isinstance(content, list):
-                chunk = "".join(x.get("text", "") for x in content if isinstance(x, dict))
-            
-            if isinstance(msg, AIMessageChunk): self._streaming_text += chunk
-            elif not msg.usage_metadata: self._streaming_text = chunk
-
-    def update_from_node_update(self, update: Dict):
-        agent_data = update.get("agent")
-        if not agent_data: return
-        messages = agent_data.get("messages", [])
-        if not isinstance(messages, list): messages = [messages]
-        for msg in messages:
-            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
-
-    def _apply_metadata(self, usage: Dict, msg_id: str = None):
-        is_new = True
-        if msg_id and msg_id in self._seen_ids: is_new = False
-        
-        # Определяем источник
-        if usage.get("token_source") == "Manual":
-            self.source_label = "Manual"
-        
-        in_t = usage.get("input_tokens", 0)
-        if in_t > self.max_input: self.max_input = in_t
-        
-        out_t = usage.get("output_tokens", 0)
-        if out_t > 0:
-            if is_new:
-                self.total_output += out_t
-                if msg_id: self._seen_ids.add(msg_id)
-                self._streaming_text = ""
-
-    def render(self, duration: float) -> str:
-        display_out = self.total_output
-        if self._streaming_text:
-            est = len(_ENCODER.encode(self._streaming_text)) if _ENCODER else len(self._streaming_text) // 3
-            display_out += est
-            
-        # Добавляем метку источника серым цветом
-        return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out} [dim]({self.source_label})[/]"
-        
-def format_tool_output(name: str, content: str, is_error: bool) -> str:
-    content = str(content).strip()
-    if is_error: 
-        return f"[red]{content[:120]}...[/]" if len(content) > 120 else f"[red]{content}[/]"
-    
-    if "web_search" in name: return f"Found {content.count('http')} results"
-    elif "fetch" in name or "read" in name: return f"Loaded {len(content)} chars"
-    elif "write" in name or "save" in name: return "File saved successfully"
-    elif "list" in name: return f"Listed {len(content.splitlines())} items"
-    
-    return (content[:80] + "...") if len(content) > 80 else content
-
-def get_key_bindings():
-    kb = KeyBindings()
-    @kb.add('enter')
-    def _(event):
-        buf = event.current_buffer
-        if not buf.text.strip(): return
-        buf.validate_and_handle()
-    @kb.add('escape', 'enter')
-    def _(event):
-        event.current_buffer.insert_text("\n")
-    return kb
-
-# ======================================================
-# 3. STREAM PROCESSOR (STABLE LOGIC)
+# STREAM PROCESSOR
 # ======================================================
 
 class StreamProcessor:
@@ -174,9 +65,10 @@ class StreamProcessor:
     
     def __init__(self):
         self.tracker = TokenTracker()
-        self.full_text = ""          # Весь текст ответа целиком
-        self.printed_len = 0         # Сколько символов мы уже вывели "навечно"
+        self.full_text = ""          
+        self.printed_len = 0         
         self.printed_tool_ids = set()
+        self.tool_buffer = {}        
         self.status_text = "Thinking..."
         self.start_time = time.time()
 
@@ -194,93 +86,125 @@ class StreamProcessor:
                     config=config,
                     stream_mode=["messages", "updates"]
                 ):
-                    await asyncio.sleep(0.005) # Даем время Rich обновиться
+                    await asyncio.sleep(0.005) 
 
-                    # 1. ОБНОВЛЕНИЯ ОТ УЗЛОВ (Конец шага)
+                    # 1. ОБНОВЛЕНИЯ ОТ УЗЛОВ
                     if mode == "updates":
                         self.tracker.update_from_node_update(payload)
-                        # Шаг завершен: безопасно печатаем весь накопленный текст
                         self._commit_printed_text(live)
 
-                    # 2. ПОТОК СООБЩЕНИЙ (Стриминг токенов)
+                        if "agent" in payload:
+                            messages = payload["agent"].get("messages", [])
+                            if not isinstance(messages, list): messages = [messages]
+                            last_msg = messages[-1] if messages else None
+                            
+                            if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+                                for tc in last_msg.tool_calls:
+                                    self.tool_buffer[tc["id"]] = {"name": tc["name"], "args": tc["args"]}
+
+                    # 2. ПОТОК СООБЩЕНИЙ
                     elif mode == "messages":
                         msg, metadata = payload
                         node = metadata.get("langgraph_node")
                         self.tracker.update_from_message(msg)
+                        
+                        # Валидатор
+                        if node == "validator" and isinstance(msg, SystemMessage):
+                            error_preview = msg.content.split('\n')[0]
+                            live.console.print(Padding(f"🔧 [bold magenta]Self-Correction:[/bold magenta] {error_preview}", (0, 0, 0, 4)))
+                            self.status_text = "Correcting strategy..."
+                            
+                        # Quality Gate
+                        if node == "agent" and isinstance(msg, SystemMessage):
+                            warning_preview = msg.content
+                            if len(warning_preview) > 100: warning_preview = warning_preview[:97] + "..."
+                            live.console.print(Padding(f"🛡️ [bold orange3]Quality Gate:[/bold orange3] {warning_preview}", (0, 0, 0, 4)))
+                            self.status_text = "Safety protocol triggered..."
 
                         if node == "agent" and isinstance(msg, (AIMessage, AIMessageChunk)):
-                            # Если модель решила вызвать инструмент - сначала печатаем весь текст до этого момента
                             if msg.tool_calls:
                                 self._commit_printed_text(live)
                                 for tc in msg.tool_calls:
                                     self._handle_tool_call(tc, live)
                             
-                            # Накапливаем текст
                             if msg.content:
                                 chunk = msg.content if isinstance(msg.content, str) else ""
                                 if isinstance(msg.content, list):
                                     chunk = "".join(x.get("text", "") for x in msg.content if isinstance(x, dict))
-                                
-                                # Простое накопление. Merge здесь не нужен, так как LangGraph не дублирует стрим.
                                 self.full_text += chunk
 
                         elif node == "tools" and isinstance(msg, ToolMessage):
                             self._handle_tool_result(msg, live)
                             
-                    # Обновляем "живой" хвост текста (то, что еще не запечатано)
                     self._update_live_display(live)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             console.print("\n[bold red]🛑 Stopped by user[/]")
             return 
 
-        # Финальный вывод остатка
-        self._commit_printed_text(None) # None = печать в основную консоль
+        self._commit_printed_text(None)
         console.print(self.tracker.render(time.time() - self.start_time), justify="right")
 
     def _handle_tool_call(self, tc, live):
         t_id, t_name = tc.get("id"), tc.get("name")
         args = tc.get("args", {})
+        self.tool_buffer[t_id] = {"name": t_name, "args": args}
+
+        arg_str = ""
+        if isinstance(args, dict):
+            priority_keys = ["query", "queries", "path", "file_path", "url", "urls", "filename"]
+            for key in priority_keys:
+                if key in args:
+                    val = args[key]
+                    arg_str = str(val) if isinstance(val, list) else str(val)
+                    break
+            if not arg_str and args:
+                arg_str = str(list(args.values())[0])
+        elif isinstance(args, str):
+            arg_str = args
+
+        arg_display = ""
+        if arg_str:
+            clean_arg = str(arg_str).strip().replace("\n", " ")
+            if len(clean_arg) > 50: clean_arg = clean_arg[:47] + "..."
+            arg_display = f" [dim]{clean_arg}[/]"
+
+        self.status_text = f"[bold cyan]Thinking:[/] {t_name}{arg_display}"
+            
+    def _handle_tool_result(self, msg, live):
+        t_id = msg.tool_call_id
         
-        if t_id and t_name and t_id not in self.printed_tool_ids:
-            # --- ЛОГИКА ИЗВЛЕЧЕНИЯ АРГУМЕНТА ---
+        # Печатаем вызов, если его еще не было
+        if t_id in self.tool_buffer and t_id not in self.printed_tool_ids:
+            info = self.tool_buffer[t_id]
+            t_name = info["name"]
+            args = info["args"]
+            
+            # --- Формирование строки аргументов ---
             arg_str = ""
             if isinstance(args, dict):
-                # Приоритетные ключи, которые мы хотим видеть
                 priority_keys = ["query", "queries", "path", "file_path", "url", "urls", "filename"]
                 for key in priority_keys:
                     if key in args:
                         val = args[key]
-                        # Если это список (например, urls или queries), красиво форматируем
-                        if isinstance(val, list):
-                            arg_str = str(val)
-                        else:
-                            arg_str = str(val)
+                        arg_str = str(val) if isinstance(val, list) else str(val)
                         break
-                # Если приоритетных нет, берем первый попавшийся
                 if not arg_str and args:
                     arg_str = str(list(args.values())[0])
             elif isinstance(args, str):
                 arg_str = args
 
-            # --- ФОРМАТИРОВАНИЕ ---
             arg_display = ""
             if arg_str:
                 clean_arg = str(arg_str).strip().replace("\n", " ")
-                # Обрезаем до 60 символов
-                if len(clean_arg) > 60:
-                    clean_arg = clean_arg[:57] + "..."
-                # [dim] - это серый цвет в Rich
+                if len(clean_arg) > 60: clean_arg = clean_arg[:57] + "..."
                 arg_display = f" [dim]{clean_arg}[/]"
+            # --------------------------------------
 
-            # --- ОБНОВЛЕНИЕ СТАТУСА ---
-            # Выводим в спиннер: "Calling: web_search [серый аргумент]"
-            self.status_text = f"[bold cyan]Calling:[/] {t_name}{arg_display}"
-            
-            # Добавляем ID в обработанные, чтобы не мигало
+            live.console.print(Padding(f"🌍 [bold cyan]Call:[/] {t_name}{arg_display}", (0, 0, 0, 2)))
             self.printed_tool_ids.add(t_id)
-            
-    def _handle_tool_result(self, msg, live):
+
+        # Печатаем результат
         content_str = str(msg.content)
         is_error = getattr(msg, "status", "") == "error" or content_str.startswith(("Error", "Ошибка"))
         icon = "❌" if is_error else "✅"
@@ -291,39 +215,24 @@ class StreamProcessor:
         self.status_text = "Analyzing..."
 
     def _commit_printed_text(self, live: Optional[Live]):
-        """
-        Берет накопившийся текст, чистит его от тегов <thought>
-        и печатает ту часть, которая еще не была напечатана.
-        """
         _, clean_full, _ = parse_thought(self.full_text)
         
-        # Если есть новый текст для печати
         if len(clean_full) > self.printed_len:
             new_text = clean_full[self.printed_len:]
-            
-            # Чистим Markdown (убираем лишние отступы)
             cleaned_chunk = clean_markdown_text(new_text)
             
-            # Печатаем
             target = live.console if live else console
             target.print(Padding(Markdown(cleaned_chunk), (0, 0, 0, 2)))
-            
             self.printed_len = len(clean_full)
 
     def _update_live_display(self, live: Live):
-        """Показывает только статус (спиннер) и последние несколько слов."""
-        _, clean_full, _ = parse_thought(self.full_text)
+        # Используем parse_thought из утилит (вернет thought, clean_text, has_thought)
+        thought_content, clean_full, has_thought = parse_thought(self.full_text)
         
-        # Обновляем текст статуса из <thought> тегов
-        thought_match = _THOUGHT_RE.search(self.full_text)
-        if thought_match:
-            thought_content = thought_match.group(1).strip()
+        if has_thought and thought_content:
             self.status_text = f"[yellow italic]{thought_content[-60:]}...[/]"
         
-        # Хвост, который еще не запечатан.
-        # Это то, что пользователь видит "в процессе набора".
         pending = clean_full[self.printed_len:]
-        
         renderable = Spinner("dots", text=self.status_text, style="cyan")
         
         if pending.strip():
@@ -331,18 +240,16 @@ class StreamProcessor:
                 Padding(Markdown(clean_markdown_text(pending)), (0, 0, 0, 2)),
                 renderable
              )
-            
         live.update(renderable)
 
 # ======================================================
-# 4. MAIN LOOP
+# MAIN ENTRY POINT
 # ======================================================
 
 async def main():
     os.system("cls" if os.name == "nt" else "clear")
-    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v4.7b"))
+    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v6.0b"))
 
-    # Suppress Logs during init
     prev_level = logger.getEffectiveLevel()
     logger.setLevel(logging.WARNING)
 
@@ -359,7 +266,6 @@ async def main():
     finally:
         logger.setLevel(prev_level)
         
-    # Info Block
     cfg = workflow.config
     console.print(
         f"[dim]Model:[/] [bold cyan]{cfg.gemini_model if cfg.provider == 'gemini' else cfg.openai_model}[/] "
@@ -368,7 +274,6 @@ async def main():
     )
     console.print("[bold blue]Enter[/] [bold green]↵[/] — send  |  [bold blue]Alt+Enter[/] [bold yellow]⎇ ↵[/] — new line\n")
 
-    # Prompt Session
     session = PromptSession(
         history=FileHistory(".history"),
         style=Style.from_dict({"prompt": "bold cyan"}),

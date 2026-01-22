@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 from typing import Optional, List, Any, Union
+from langchain_core.tools import tool  # <--- ВАЖНЫЙ ИМПОРТ
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ def get_tavily_client() -> Optional[Any]:
 # Tool 1: Web Search (Широкий поиск)
 # ----------------------------
 
+@tool("web_search")
 async def web_search(query: str, max_results: int = 5) -> str:
     """
     Search internet for information. Returns snippets from multiple sources + AI summary.
@@ -129,6 +131,7 @@ async def web_search(query: str, max_results: int = 5) -> str:
 # Tool 2: Fetch Content (Универсальное чтение)
 # ----------------------------
 
+@tool("fetch_content")
 async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> str:
     """
     Extract text from one or multiple URLs. 
@@ -236,6 +239,7 @@ async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> 
 # Tool 3: Deep Search (Опционально)
 # ----------------------------
 
+@tool("deep_search")
 async def deep_search(query: str, max_results: int = 3) -> str:
     """
     Deep search with full page content. Returns complete text from top results.
@@ -320,8 +324,12 @@ async def deep_search(query: str, max_results: int = 3) -> str:
     results.append("[Deep search completed. Full content extracted.]")
     return "\n".join(results)
 
-# --- Добавить в конец search_tools.py ---
 
+# ----------------------------
+# Tool 4: Batch Web Search
+# ----------------------------
+
+@tool("batch_web_search")
 async def batch_web_search(queries: List[str]) -> str:
     """
     Perform multiple web searches in parallel. 
@@ -370,16 +378,3 @@ async def batch_web_search(queries: List[str]) -> str:
             output.append(f"- {item.get('title')} ({item.get('url')}): {item.get('content')[:200]}...")
             
     return "\n".join(output)
-
-# Регистрация метаданных
-batch_web_search.name = "batch_web_search"
-batch_web_search.description = "Run multiple searches in parallel. Args: queries=['q1', 'q2']"
-
-web_search.name = "web_search"
-web_search.description = "Search internet. Returns snippets + AI summary. Use for quick facts/news."
-
-fetch_content.name = "fetch_content"
-fetch_content.description = "Extract text from URL(s). Can handle a single link or a list. Args: urls=['link1', 'link2']"
-
-deep_search.name = "deep_search"
-deep_search.description = "Deep search with full content. High token cost. Use for research only."

@@ -10,9 +10,13 @@ pydantic-settings
 # --- TOOLS & API ---
 # Поиск и чтение сайтов (Главная зависимость теперь)
 tavily-python
+# System Tools
+psutil
+httpx
 
 # MCP адаптер (нужен, если у вас есть mcp.json и вы планируете расширять тулы)
 langchain-mcp-adapters
+mcp
 
 # --- MEMORY (RAG) ---
 # Векторная база данных и эмбеддинги для памяти

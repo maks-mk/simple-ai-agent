@@ -43,7 +43,7 @@ async def safe_delete_file(file_path: str) -> str:
         return f"Error: {file_path} is a directory. Use safe_delete_directory."
 
     try:
-        # Используем asyncio.to_thread для блокирующих операций ввода-вывода
+        # Use asyncio.to_thread for blocking I/O operations
         await asyncio.to_thread(target.unlink)
         logger.info(f"FILE DELETED: {target}")
         return f"Success: File {file_path} deleted."

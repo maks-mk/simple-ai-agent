@@ -128,7 +128,10 @@ class MemoryManager:
 # ==========================================
 
 # Инициализируем синглтон (параметры возьмутся дефолтные или можно настроить через конфиг позже)
-_memory = MemoryManager()
+# _memory = MemoryManager()  <-- Lazy loaded now
+
+def get_memory_instance() -> MemoryManager:
+    return MemoryManager()
 
 @tool("remember_fact")
 async def remember_fact(text: str, category: str = "general") -> str:
@@ -136,7 +139,7 @@ async def remember_fact(text: str, category: str = "general") -> str:
     Saves important information to long-term memory. 
     Use this for user preferences, facts about projects, or specific instructions.
     """
-    return await _memory.aremember(text, {"type": category})
+    return await get_memory_instance().aremember(text, {"type": category})
 
 @tool("recall_facts")
 async def recall_facts(query: str) -> str:
@@ -145,7 +148,7 @@ async def recall_facts(query: str) -> str:
     Args:
         query: The topic or question to search for in memory.
     """
-    facts = await _memory.arecall(query)
+    facts = await get_memory_instance().arecall(query)
     return "\n".join(f"- {f}" for f in facts) if facts else "No relevant facts found in memory."
 
 @tool("forget_fact")
@@ -153,4 +156,4 @@ async def forget_fact(query: str) -> str:
     """
     Removes a fact from memory that matches the query.
     """
-    return await _memory.adelete(query)
+    return await get_memory_instance().adelete(query)

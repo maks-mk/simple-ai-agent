@@ -21,3 +21,7 @@ class AgentState(TypedDict):
     
     # Счетчик попыток исправления ошибок для каждого инструмента
     tool_retries: dict
+    
+    # Список имен инструментов, разрешенных на этом шаге
+    # Если None — разрешены все.
+    allowed_tools: Optional[List[str]]

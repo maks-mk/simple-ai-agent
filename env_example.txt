@@ -1,41 +1,72 @@
-#PROVIDER=openai
-PROVIDER=gemini
+# ===========================
+# .env example (v6.1b)
+# ===========================
+#
+# ВНИМАНИЕ:
+# - Не коммитьте реальные ключи.
+# - Значения ниже — примеры/плейсхолдеры.
+#
+
+# ===========================
+# 1) Общие настройки
+# ===========================
 TEMPERATURE=0.2
-GEMINI_MODEL=models/gemini-3-flash-preview
-GEMINI_API_KEY=AIzaSyAutk..................
+MAX_LOOPS=25
+MODEL_SUPPORTS_TOOLS=true
 
-# Ваш API ключ
-#openrouter.ai
-#OPENAI_API_KEY=sk-or-v1-b27ca01c2df6d........................
-#OPENAI_BASE_URL=https://openrouter.ai/api/v1
-#megallm.io
-OPENAI_API_KEY=sk-mega-5273e9a9f5a9cdf......................
-OPENAI_MODEL=deepseek-ai/deepseek-v3.1-terminus
-OPENAI_BASE_URL=https://ai.megallm.io/v1
+# Включение/отключение подсистем
+ENABLE_SEARCH_TOOLS=true
+ENABLE_SYSTEM_TOOLS=false
+LONG_TERM_MEMORY=false
+SAFETY_GUARD_ENABLED=false
+ENABLE_TOOL_FILTERING=true
 
-# ===== RETRY НАСТРОЙКИ =====
+# Логи/отладка
+DEBUG=false
+
+# Ретраи для сетевых инструментов поиска (Tavily tools)
 MAX_RETRIES=3
 RETRY_DELAY=2
 
-# ===== ПАМЯТЬ И ЭКОНОМИЯ =====
-DEBUG=false
-LONG_TERM_MEMORY=false
-
-# 1. SESSION_SIZE: Увеличиваем до 40. 
-# Это позволит агенту помнить цепочку "Поиск -> Чтение -> Анализ -> Запись -> Исправление" целиком.
-# Если ставить меньше, вы потратите БОЛЬШЕ токенов на то, чтобы заново объяснять агенту контекст.
+# Память/сжатие контекста
 SESSION_SIZE=25
-
-# 2. SUMMARY_KEEP_LAST: (Добавьте эту настройку!)
-# Когда память переполняется (после 40 сообщений), агент сжимает старое, 
-# но оставляет эти последние N сообщений нетронутыми.
-# 10 - оптимально, чтобы он помнил название файла и последнее действие.
 SUMMARY_KEEP_LAST=10
-PROMPT_PATH=prompt.txt
-MAX_LOOPS=25
 
-#Tavily-Search
-TAVILY_API_KEY=tvly-dev-2ylsP.........
+# Путь к системному промпту (относительно корня проекта)
+PROMPT_PATH=prompt.txt
+
+# ===========================
+# 2) Поиск (Tavily)
+# ===========================
+TAVILY_API_KEY=tvly-REPLACE_WITH_YOUR_KEY
 DEEP_SEARCH=false
-#False если модель не поддерживает tool_calling 
-MODEL_SUPPORTS_TOOLS=true
+
+# ===========================
+# 3) Провайдер: Gemini (пример)
+# ===========================
+PROVIDER=gemini
+GEMINI_API_KEY=AIzaSyREPLACE_WITH_YOUR_KEY
+GEMINI_MODEL=gemini-1.5-flash
+# GEMINI_MODEL=models/gemini-3-flash-preview
+
+# ===========================
+# 4) Провайдер: OpenAI-compatible (примеры)
+# ===========================
+#
+# Оригинальный OpenAI:
+# PROVIDER=openai
+# OPENAI_API_KEY=sk-REPLACE_WITH_YOUR_KEY
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENAI_MODEL=gpt-4o
+#
+# OpenRouter:
+# PROVIDER=openai
+# OPENAI_API_KEY=sk-or-REPLACE_WITH_YOUR_KEY
+# OPENAI_BASE_URL=https://openrouter.ai/api/v1
+# OPENAI_MODEL=deepseek/deepseek-r1
+#
+# Любой другой OpenAI-compatible:
+# PROVIDER=openai
+# OPENAI_API_KEY=sk-REPLACE_WITH_YOUR_KEY
+# OPENAI_BASE_URL=https://your-provider.example/v1
+# OPENAI_MODEL=deepseek-ai/deepseek-v3.1-terminus

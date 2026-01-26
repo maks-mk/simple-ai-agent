@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Literal, Optional
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from core.constants import BASE_DIR
 
 # --- LANGCHAIN PROVIDERS ---
 # Импортируем провайдеров здесь, чтобы не засорять основной файл
@@ -11,23 +12,17 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
 class AgentConfig(BaseSettings):
-    # Универсальный способ найти папку с конфигами
-    if getattr(sys, 'frozen', False):
-        _base_dir: Path = Path(sys.executable).parent
-    else:
-        _base_dir: Path = Path(__file__).resolve().parent.parent
-        
-    # Указываем полные пути к конфигам, опираясь на _base_dir
+    # Указываем полные пути к конфигам, опираясь на BASE_DIR
     model_config = SettingsConfigDict(
-        env_file= _base_dir / '.env',
+        env_file= BASE_DIR / '.env',
         env_file_encoding='utf-8', 
         extra='ignore'
     )
     
     # Paths
-    prompt_path: Path = Field(default=_base_dir / "prompt.txt", alias="PROMPT_PATH")
-    mcp_config_path: Path = _base_dir / "mcp.json"
-    memory_db_path: str = str(_base_dir / "memory_db")
+    prompt_path: Path = Field(default=BASE_DIR / "prompt.txt", alias="PROMPT_PATH")
+    mcp_config_path: Path = BASE_DIR / "mcp.json"
+    memory_db_path: str = str(BASE_DIR / "memory_db")
     
     provider: Literal["gemini", "openai"] = "gemini"
     
@@ -43,13 +38,22 @@ class AgentConfig(BaseSettings):
     
     # Logic Settings
     enable_deep_search: bool = Field(default=False, alias="DEEP_SEARCH")
+    enable_search_tools: bool = Field(default=True, alias="ENABLE_SEARCH_TOOLS")
     model_supports_tools: bool = Field(default=True, alias="MODEL_SUPPORTS_TOOLS")
     use_long_term_memory: bool = Field(default=False, alias="LONG_TERM_MEMORY")
+    use_system_tools: bool = Field(default=True, alias="ENABLE_SYSTEM_TOOLS")
     max_loops: int = Field(default=15, description="Limit steps per request")
     
     # Summarization Settings
     summary_threshold: int = Field(default=20, alias="SESSION_SIZE")
     summary_keep_last: int = Field(default=4, alias="SUMMARY_KEEP_LAST")
+    safety_guard_enabled: bool = Field(default=True, alias="SAFETY_GUARD_ENABLED")
+    enable_tool_filtering: bool = Field(default=True, alias="ENABLE_TOOL_FILTERING")
+    
+    # Advanced Settings
+    max_retries: int = Field(default=3, alias="MAX_RETRIES")
+    retry_delay: int = Field(default=2, alias="RETRY_DELAY")
+    debug: bool = Field(default=False, alias="DEBUG")
 
     @model_validator(mode='after')
     def validate_provider_keys(self) -> 'AgentConfig':

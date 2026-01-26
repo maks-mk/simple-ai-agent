@@ -1,5 +1,4 @@
 import re
-import time
 from pathlib import Path
 from typing import List, Any, Optional, Dict
 
@@ -42,25 +41,56 @@ class ToolSanitizer:
 
         # --- СТРАТЕГИЯ 1: ФАЙЛОВЫЕ ПУТИ ---
         if any(k in key for k in ["path", "file", "dir", "dest", "src", "output"]):
-            # Удаляем запрещенные символы, НО разрешаем точку и слэши
-            clean_v = re.sub(r'[<>:"|?*]+', '', clean_v).strip()
             
-            # [FIX] Разрешаем пустой путь или точку (CWD)
-            # Это критично для list_directory, ls, cd
+            # 1. Попытка нормализации через pathlib (обработка абсолютных путей)
+            try:
+                path_obj = Path(clean_v)
+                
+                # Если путь абсолютный (например, получен от list_allowed_directories или системного вызова)
+                if path_obj.is_absolute():
+                    try:
+                        # Если файл внутри текущей рабочей директории -> делаем относительным
+                        # Это превращает "C:\Users\Project\README.md" -> "README.md"
+                        return str(path_obj.relative_to(Path.cwd()))
+                    except ValueError:
+                        # Путь абсолютный, но находится ВНЕ текущей папки (или на другом диске).
+                        # Мы НЕ должны ломать его (удалять двоеточие), но должны почистить от мусора.
+                        pass 
+            except Exception:
+                pass
+
+            # 2. Очистка строки регулярными выражениями
+            # Сценарий A: Windows Absolute Path (начинается с буквы диска, например "C:\")
+            if re.match(r'^[a-zA-Z]:[\\/]', clean_v):
+                # Сохраняем "C:", чистим остальное
+                drive = clean_v[:2]
+                rest = clean_v[2:]
+                # В хвосте пути двоеточия недопустимы (кроме потоков NTFS, которые мы режем)
+                rest_clean = re.sub(r'[<>:"|?*]+', '', rest)
+                clean_v = drive + rest_clean
+                
+            # Сценарий B: Относительный путь или Unix
+            else:
+                # Удаляем все запрещенные символы, включая двоеточие
+                clean_v = re.sub(r'[<>:"|?*]+', '', clean_v)
+
+            clean_v = clean_v.strip()
+
+            # 3. Финальная защита от Path Traversal (для относительных путей)
+            # Разрешаем пустой путь или точку (CWD)
             if not clean_v or clean_v == ".":
                 return "."
+            
+            # Если путь остался относительным, убираем попытки выхода ".."
+            # (Если путь абсолютный Windows, мы доверяем букве диска, обработанной выше)
+            if not re.match(r'^[a-zA-Z]:', clean_v) and not clean_v.startswith(("/", "\\")):
+                 path_obj = Path(clean_v)
+                 parts = [p for p in path_obj.parts if p not in (".", "..", "\\", "/")]
+                 if not parts:
+                     return "."
+                 return str(Path(*parts))
 
-            path_obj = Path(clean_v)
-            if path_obj.is_absolute():
-                return str(path_obj)
-                
-            parts = [p for p in path_obj.parts if p not in (".", "..", "\\", "/")]
-            
-            # Если после чистки ничего не осталось, возвращаем текущую директорию
-            if not parts:
-                return "."
-            
-            return str(Path(*parts))
+            return clean_v
 
         # --- СТРАТЕГИЯ 2: URL ---
         if any(k in key for k in ["url", "link", "site", "href"]):

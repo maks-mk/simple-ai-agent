@@ -1,13 +1,10 @@
 import sys
 from pathlib import Path
-# Определение пути для EXE и скрипта ---
-if getattr(sys, 'frozen', False):
-    # Если запущено как скомпилированный EXE
-    BASE_DIR = Path(sys.executable).parent
-else:
-    # Если запущено как Python скрипт
-    BASE_DIR = Path(__file__).resolve().parent
-sys.path.append(str(BASE_DIR))
+from core.constants import BASE_DIR
+
+# Используем insert(0) для приоритета модулей проекта над системными
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 import os
 import asyncio
@@ -24,6 +21,8 @@ from rich.markdown import Markdown
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.padding import Padding
+from rich.table import Table
+from rich import box
 
 # --- PROMPT IMPORTS ---
 from prompt_toolkit import PromptSession
@@ -38,10 +37,15 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMess
 # --- LOCAL IMPORTS ---
 try:
     from agent import AgentWorkflow, logger
-except ImportError:
-    import sys
-    sys.path.append(".")
-    from agent import AgentWorkflow, logger
+except ImportError as e:
+    # Если импорт не удался даже с BASE_DIR, пробуем текущую директорию как fallback
+    # но только если BASE_DIR отличается от cwd
+    if str(Path.cwd()) != str(BASE_DIR):
+        sys.path.append(".")
+    try:
+        from agent import AgentWorkflow, logger
+    except ImportError:
+        raise ImportError(f"Could not import 'agent' module. sys.path: {sys.path}. Error: {e}")
 
 from core.cli_utils import (
     TokenTracker, 
@@ -50,6 +54,7 @@ from core.cli_utils import (
     format_tool_output, 
     get_key_bindings
 )
+from core.config import AgentConfig
 
 # --- CONFIG ---
 warnings.filterwarnings("ignore")
@@ -108,9 +113,11 @@ class StreamProcessor:
                         node = metadata.get("langgraph_node")
                         self.tracker.update_from_message(msg)
                         
-                        # Валидатор
-                        if node == "validator" and isinstance(msg, SystemMessage):
-                            error_preview = msg.content.split('\n')[0]
+                        # Self-correction / validator feedback
+                        # В текущем графе нет отдельного узла "validator".
+                        # Подсказки валидации приходят как SystemMessage из узла "tools".
+                        if node == "tools" and isinstance(msg, SystemMessage):
+                            error_preview = str(msg.content).split('\n')[0]
                             live.console.print(Padding(f"🔧 [bold magenta]Self-Correction:[/bold magenta] {error_preview}", (0, 0, 0, 4)))
                             self.status_text = "Correcting strategy..."
                             
@@ -120,7 +127,7 @@ class StreamProcessor:
                             if len(warning_preview) > 100: warning_preview = warning_preview[:97] + "..."
                             live.console.print(Padding(f"🛡️ [bold orange3]Quality Gate:[/bold orange3] {warning_preview}", (0, 0, 0, 4)))
                             self.status_text = "Safety protocol triggered..."
-
+                            
                         if node == "agent" and isinstance(msg, (AIMessage, AIMessageChunk)):
                             if msg.tool_calls:
                                 self._commit_printed_text(live)
@@ -248,12 +255,28 @@ class StreamProcessor:
 
 async def main():
     os.system("cls" if os.name == "nt" else "clear")
-    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v6.0b"))
+    console.print(Panel("[bold blue]AI Agent CLI[/]", subtitle="v6.3b"))
 
-    prev_level = logger.getEffectiveLevel()
-    logger.setLevel(logging.WARNING)
+    # 1. Загружаем конфиг
+    temp_cfg = AgentConfig()
+    
+    # 2. НАСТРОЙКА ЛОГИРОВАНИЯ
+    # Это влияет ТОЛЬКО на внутренние сообщения (Router, Init, Summary)
+    if temp_cfg.debug:
+        # В режиме DEBUG показываем всё нутро
+        logger.setLevel(logging.DEBUG)
+        console.print("[yellow]🐛 Debug mode enabled (Internal Logs Visible)[/]")
+    else:
+        # В обычном режиме скрываем технические логи
+        # Но UI (StreamProcessor) продолжит работать и показывать инструменты!
+        logger.setLevel(logging.WARNING) 
+        
+        # Гасим шумы от библиотек
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     try:
+        # Спиннер инициализации
         with console.status("[bold green]Initializing system...[/]", spinner="dots"):
             workflow = AgentWorkflow()
             await workflow.initialize_resources()
@@ -262,17 +285,19 @@ async def main():
 
     except Exception as e:
         console.print(f"[bold red]Init Error:[/] {e}")
+        if temp_cfg.debug:
+            import traceback
+            traceback.print_exc()
         return
-    finally:
-        logger.setLevel(prev_level)
-        
+
+    # 3. Вывод информации о модели
     cfg = workflow.config
     console.print(
         f"[dim]Model:[/] [bold cyan]{cfg.gemini_model if cfg.provider == 'gemini' else cfg.openai_model}[/] "
         f"[dim]Temp:[/] [bold cyan]{cfg.temperature}[/] "
         f"[dim]Tools:[/] [bold cyan]{len(workflow.tools)}[/] "
     )
-    console.print("[bold blue]Enter[/] [bold green]↵[/] — send  |  [bold blue]Alt+Enter[/] [bold yellow]⎇ ↵[/] — new line\n")
+    console.print("[bold blue]Enter[/] [bold green]↵[/] — send  |  [bold blue]Alt+Enter[/] [bold yellow]⎇ ↵[/] — new line | [green]/tools[/] | [green]/help\n")
 
     session = PromptSession(
         history=FileHistory(".history"),
@@ -285,7 +310,8 @@ async def main():
 
     while True:
         try:
-            user_input = await session.prompt_async("You > ")
+            cwd_name = Path.cwd().name
+            user_input = await session.prompt_async(f"User (./{cwd_name}) > ")
             user_input = user_input.strip()
             
             if not user_input: continue
@@ -294,7 +320,39 @@ async def main():
                 thread_id = f"session_{int(time.time())}"
                 console.print("[yellow]♻ New session started[/]")
                 continue
+            
+            if user_input.lower() in ["/help", "/tools"]:
+                # ... (код отрисовки таблицы Help, как был) ...
+                table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+                table.add_column("Tool", style="green")
+                table.add_column("Description")
+                for t in workflow.tools:
+                    desc = t.description.split("\n")[0] if t.description else "No description"
+                    if len(desc) > 60: desc = desc[:57] + "..."
+                    table.add_row(t.name, desc)
 
+                if user_input.lower() == "/tools":
+                    console.print(Panel(table, title="[bold blue]Available Tools[/]", border_style="blue"))
+                else:
+                    console.print(Panel(
+                        Group(
+                            Markdown("### 🎮 Commands"),
+                            Markdown("- `/help` - Show this menu"),
+                            Markdown("- `/tools` - Show available tools"),
+                            Markdown("- `exit` / `quit` - Close application"),
+                            Markdown("- `clear` / `reset` - Start new session"),
+                            Markdown("- `Alt+Enter` - Multi-line input"),
+                            Markdown("---"),
+                            Markdown("### 🛠 Available Tools"),
+                            table
+                        ),
+                        title="[bold blue]Help Menu[/]",
+                        border_style="blue"
+                    ))
+                continue
+
+            # Запуск процессора
+            # Он будет печатать Call/Result, так как это часть UI
             processor = StreamProcessor()
             await processor.run(agent_app, user_input, thread_id, cfg.max_loops)
             console.print()
@@ -304,8 +362,22 @@ async def main():
             continue
         except Exception as e:
             console.print(f"[bold red]Error:[/] {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            if cfg.debug:
+                import traceback
+                logger.debug(traceback.format_exc())
+        finally:
+            if 'workflow' in locals() and workflow:
+                # Гарантируем закрытие соединений MCP и NetworkClient
+                if workflow.tool_registry:
+                    await workflow.tool_registry.cleanup()
+                
+                # Закрываем NetworkClient если он был инициализирован
+                try:
+                    from tools.system_tools import _net_client
+                    if _net_client:
+                        await _net_client.close()
+                except ImportError:
+                    pass
 
 if __name__ == "__main__":
     try:

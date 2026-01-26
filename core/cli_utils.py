@@ -41,14 +41,62 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
     """Форматирует результат инструмента для компактного вывода."""
     content = str(content).strip()
     if is_error: 
-        return f"[red]{content[:120]}...[/]" if len(content) > 120 else f"[red]{content}[/]"
+        # Smart Hints for common errors
+        hint = ""
+        lower_content = content.lower()
+        if "401" in lower_content or "unauthorized" in lower_content:
+            hint = " (Hint: Check your API keys in .env)"
+        elif "not found" in lower_content and ("file" in lower_content or "dir" in lower_content):
+            hint = " (Hint: Check path relative to workspace)"
+        elif "disabled" in lower_content:
+            hint = " (Hint: Check .env configuration)"
+        elif "connection" in lower_content or "timeout" in lower_content:
+            hint = " (Hint: Network issue, try again)"
+            
+        summary = f"{content[:120]}..." if len(content) > 120 else content
+        return f"[red]{summary}[/][yellow italic]{hint}[/]"
     
-    if "web_search" in name: return f"Found {content.count('http')} results"
-    elif "fetch" in name or "read" in name: return f"Loaded {len(content)} chars"
-    elif "write" in name or "save" in name: return "File saved successfully"
-    elif "list" in name: return f"Listed {len(content.splitlines())} items"
+    # Специальные форматтеры для разных типов инструментов
+    if "web_search" in name: 
+        count = content.count('http')
+        return f"Found {count} results" if count > 0 else "No results found"
+        
+    elif "crawl_site" in name:
+        # Extract page count and depth if available
+        # Format: [Crawl completed. X pages processed. max_depth: Y]
+        import re
+        pages_match = re.search(r"(\d+) pages processed", content)
+        depth_match = re.search(r"max_depth: (\d+)", content)
+        
+        pages = pages_match.group(1) if pages_match else "?"
+        depth = depth_match.group(1) if depth_match else "?"
+        
+        if pages != "?" or depth != "?":
+             return f"Crawled {pages} pages (depth: {depth})"
+        return "Crawl completed"
+
+    elif "list" in name and "directory" in name:
+        lines = content.splitlines()
+        count = len(lines)
+        preview = ", ".join([l.strip() for l in lines[:3]])
+        if count > 3:
+            return f"Listed {count} items: {preview}, ..."
+        return f"Listed {count} items: {preview}"
+
+    elif "read" in name:
+        size = len(content)
+        lines = len(content.splitlines())
+        return f"Read {lines} lines ({size} chars)"
+        
+    elif "write" in name or "save" in name: 
+        return "File saved successfully"
     
-    return (content[:80] + "...") if len(content) > 80 else content
+    elif "delete" in name:
+        return "Deleted successfully"
+
+    # Default fallback
+    clean_content = content.replace("\n", " ")
+    return (clean_content[:80] + "...") if len(clean_content) > 80 else clean_content
 
 def get_key_bindings():
     """Настройка Alt+Enter для переноса строки."""

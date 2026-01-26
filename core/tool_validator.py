@@ -28,7 +28,7 @@ def validate_tool_execution(
     is_missing_resource = any(m in lower_content for m in MISSING_RESOURCE_MARKERS)
 
     # 1. Проверка нативного статуса LangChain (исключения)
-    if tool_msg.status == "error":
+    if getattr(tool_msg, "status", "") == "error":
         # [FIX] Даже если инструмент упал, проверяем, не является ли это ошибкой "Файл не найден"
         if is_missing_resource:
              return {

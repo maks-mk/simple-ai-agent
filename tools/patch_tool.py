@@ -7,17 +7,22 @@ logger = logging.getLogger(__name__)
 @tool("smart_replace")
 def smart_replace(path: str, target_text: str, replacement_text: str) -> str:
     """
-    Smartly replaces a specific text snippet in a file with new text.
-    Use this tool for editing code or text files when you need to change specific blocks.
-    It is more robust than standard 'edit_file' as it handles line-ending differences automatically.
+    Precise search-and-replace for files. Best for surgical code edits or config updates.
+    Handles line-ending differences (LF/CRLF) automatically to prevent errors.
     
     Args:
         path: Relative path to the file.
-        target_text: The exact text block you want to replace (copy it from the file).
-        replacement_text: The new text to insert in place of target_text.
+        target_text: Unique text block to find.
+        replacement_text: New text to insert.
     """
+        
     try:
         file_path = Path(path).resolve()
+        
+        # --- Security Check (Path Traversal) ---
+        if not file_path.is_relative_to(Path.cwd()):
+            return f"ACCESS DENIED: Path '{path}' is outside working directory."
+        # ---------------------------------------
         
         if not file_path.exists(): return f"Error: File '{path}' not found."
         if not file_path.is_file(): return f"Error: '{path}' is not a file."
@@ -46,4 +51,4 @@ def smart_replace(path: str, target_text: str, replacement_text: str) -> str:
         return f"Error: Could not find target text starting with: '{snippet}...'"
 
     except Exception as e:
-        return f"System Error during edit: {e}"
+        return f"Error: System Error during edit: {e}"

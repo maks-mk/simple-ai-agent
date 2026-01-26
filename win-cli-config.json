@@ -10,7 +10,6 @@
       "restart",
       "reg",
       "regedit",
-      "net",
       "netsh",
       "takeown",
       "icacls"
@@ -30,9 +29,8 @@
   "shells": {
     "powershell": {
       "enabled": true,
-      "command": "powershell.exe",
+      "command": "pwsh.exe",
       "args": [
-        "-NoProfile",
         "-NonInteractive",
         "-Command"
       ],

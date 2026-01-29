@@ -1,5 +1,5 @@
 # ===========================
-# .env example (v6.1b)
+# .env example (v6.5b)
 # ===========================
 #
 # ВНИМАНИЕ:
@@ -17,9 +17,12 @@ MODEL_SUPPORTS_TOOLS=true
 # Включение/отключение подсистем
 ENABLE_SEARCH_TOOLS=true
 ENABLE_SYSTEM_TOOLS=false
+ENABLE_MEDIA_TOOLS=false
 LONG_TERM_MEMORY=false
 SAFETY_GUARD_ENABLED=false
 ENABLE_TOOL_FILTERING=true
+TOKEN_BUDGET=20000
+ENABLE_MEDIA_TOOLS=false
 
 # Логи/отладка
 DEBUG=false

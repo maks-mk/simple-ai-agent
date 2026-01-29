@@ -6,6 +6,18 @@ class ValidationResult(TypedDict):
     error_message: Optional[str]
     retry_needed: bool
 
+# Список фраз, означающих отсутствие ресурса (нет смысла повторять)
+MISSING_RESOURCE_MARKERS = [
+    "no such file", 
+    "not found", 
+    "enoent",       # Node.js Error No Entry
+    "does not exist"
+]
+
+def _is_missing_resource_error(content: str) -> bool:
+    content_lower = content.lower()
+    return any(m in content_lower for m in MISSING_RESOURCE_MARKERS)
+
 def validate_tool_execution(
     tool_msg: ToolMessage,
     tool_args: dict,
@@ -13,39 +25,27 @@ def validate_tool_execution(
 ) -> ValidationResult:
     """
     Универсальная валидация результата выполнения инструмента.
+    Определяет, нужно ли агенту повторить попытку или остановиться.
     """
     content = str(tool_msg.content)
-    lower_content = content.lower()
-    
-    # Список фраз, означающих отсутствие ресурса (нет смысла повторять)
-    MISSING_RESOURCE_MARKERS = [
-        "no such file", 
-        "not found", 
-        "enoent",       # Node.js Error No Entry
-        "does not exist"
-    ]
-    
-    is_missing_resource = any(m in lower_content for m in MISSING_RESOURCE_MARKERS)
+    is_missing = _is_missing_resource_error(content)
 
-    # 1. Проверка нативного статуса LangChain (исключения)
+    # 1. Проверка нативного статуса LangChain
     if getattr(tool_msg, "status", "") == "error":
-        # [FIX] Даже если инструмент упал, проверяем, не является ли это ошибкой "Файл не найден"
-        if is_missing_resource:
-             return {
+        if is_missing:
+            return {
                 "is_valid": False,
                 "error_message": f"Resource missing (System Error): {content}",
-                "retry_needed": False  # <--- ВАЖНО: Не повторять, файла нет
+                "retry_needed": False 
             }
-            
         return {
             "is_valid": False,
             "error_message": f"Tool '{tool_name}' crashed: {content}",
             "retry_needed": True
         }
 
-    artifact = tool_msg.artifact if hasattr(tool_msg, "artifact") else None
-
-    # 2. Проверка структурированной ошибки (через Artifacts)
+    # 2. Проверка структурированной ошибки (Artifacts)
+    artifact = getattr(tool_msg, "artifact", None)
     if isinstance(artifact, dict) and artifact.get("is_error"):
         return {
             "is_valid": False,
@@ -53,16 +53,14 @@ def validate_tool_execution(
             "retry_needed": True
         }
 
-    # 3. Проверка текстовых ошибок (MCP и другие)
+    # 3. Проверка текстовых ошибок (MCP и CLI)
     if content.strip().startswith(("Error:", "Ошибка:", "MCP error")):
-        # [FIX] Проверяем текст ошибки на отсутствие файла
-        if is_missing_resource:
+        if is_missing:
             return {
                 "is_valid": False,
                 "error_message": f"Resource missing: {content}",
-                "retry_needed": False # <--- ВАЖНО: Не повторять
+                "retry_needed": False 
             }
-            
         return {
             "is_valid": False,
             "error_message": f"Tool execution returned error text: {content}",
@@ -77,15 +75,15 @@ def validate_tool_execution(
                 "error_message": f"Configuration error in '{tool_name}'. Do not retry without changing args.",
                 "retry_needed": False
             }
-        if "ACCESS DENIED" in content or "access denied" in lower_content:
+        if "ACCESS DENIED" in content or "access denied" in content.lower():
             return {
                 "is_valid": False,
                 "error_message": f"Permission denied for '{tool_name}'. Do not retry.",
                 "retry_needed": False
             }
-            
-        # Повторная проверка на всякий случай (для простого текста)
-        if is_missing_resource:
+        
+        # Повторная проверка на missing resource для plain text
+        if is_missing:
              return {
                 "is_valid": False,
                 "error_message": f"Resource missing: {content}",

@@ -75,10 +75,13 @@ class ToolRegistry:
         if self.config.use_system_tools:
             self._load_system_tools()
             
+        if self.config.enable_media_tools:
+            self._load_media_tools()
+
         if self.config.mcp_config_path.exists():
             await self._load_mcp_tools()
 
-        # logger.info(f"✅ Tools loaded: {[t.name for t in self.tools]}")
+        # logger.info(f"✔ Tools loaded: {[t.name for t in self.tools]}")
 
     def _load_local_tools(self):
         """Загрузка локальных файловых утилит."""
@@ -177,7 +180,7 @@ class ToolRegistry:
                 new_tools = await asyncio.wait_for(self.mcp_client.get_tools(), timeout=120)
                 
                 self.tools.extend(new_tools)
-                logger.info(f"🔌 MCP Adapter connected. Loaded {len(new_tools)} tools.")
+                logger.debug(f"🔌 MCP Adapter connected. Loaded {len(new_tools)} tools.")
                 
         except Exception as e:
             logger.error(f"MCP Load Error: {e}")
@@ -197,6 +200,16 @@ class ToolRegistry:
             self.tools.extend(system_tools)
         except ImportError as e:
             logger.error(f"Failed to load system tools: {e}")
+
+    def _load_media_tools(self):
+        """Загрузка медиа инструментов (yt-dlp)."""
+        try:
+            from tools.media_tools import download_media
+            # Скачивание файла - это операция записи
+            self._set_capability([download_media], "write") 
+            self.tools.append(download_media)
+        except ImportError as e:
+            logger.error(f"Failed to load media tools: {e}")
 
     async def cleanup(self):
         """Закрывает MCP соединения при выходе."""

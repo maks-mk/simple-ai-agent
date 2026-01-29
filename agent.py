@@ -4,8 +4,10 @@ import logging
 import re
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Literal
-from pydantic import BaseModel, Field 
+from typing import List, Optional, Literal, Dict, Any, Union
+
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 # --- LANGCHAIN & LANGGRAPH ---
 from langchain_core.language_models import BaseChatModel
@@ -17,39 +19,26 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 # --- CORE MODULES ---
+from core.constants import BASE_DIR
 from core.config import AgentConfig
 from core.state import AgentState
 from core.utils import AgentUtils
+from core.tool_validator import validate_tool_execution
+from core.tool_sanitizer import ToolSanitizer
+from core.safety_guard import SafetyGuard
+from core.logging_config import setup_logging
+
 from tools.tool_registry import ToolRegistry
-from core.tool_validator import validate_tool_execution 
 
-# --- OPTIONAL CORE MODULES ---
-from dotenv import load_dotenv
-
+# Setup logging
 try:
-    from core.tool_sanitizer import ToolSanitizer
-except ImportError:
-    class ToolSanitizer:
-        @staticmethod
-        def sanitize_tool_calls(tc): pass
-        
-try:
-    from core.safety_guard import SafetyGuard
-except ImportError:
-    class SafetyGuard:
-        ENABLED = False
-        @classmethod
-        def is_unsafe_write(cls, *args): return False
-
-try:
-    from core.logging_config import setup_logging
-    logger = setup_logging() 
-except ImportError:
+    logger = setup_logging()
+except Exception:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("agent")
 
 # ==========================================
-# ГРАФ АГЕНТА (WORKFLOW)
+# MODELS
 # ==========================================
 
 class IntentClassification(BaseModel):
@@ -58,9 +47,13 @@ class IntentClassification(BaseModel):
     )
     reasoning: str = Field(description="Short explanation of why this intent was chosen.")
 
+# ==========================================
+# WORKFLOW
+# ==========================================
+
 class AgentWorkflow:
     def __init__(self):
-        load_dotenv()
+        load_dotenv(BASE_DIR / '.env')
         self.config = AgentConfig()
         self.utils = AgentUtils()
         self.tool_registry = ToolRegistry(self.config)
@@ -68,19 +61,21 @@ class AgentWorkflow:
         self.llm: Optional[BaseChatModel] = None
         self.llm_with_tools: Optional[BaseChatModel] = None
         
-        # Кэш классифицированных инструментов
-        self.tool_buckets = {}
+        # Caches
+        self.tool_buckets = {"safe": [], "write": []}
 
     async def initialize_resources(self):
+        """Initializes LLM and Tools."""
         logger.info(f"Initializing agent: [bold cyan]{self.config.provider}[/]", extra={"markup": True})
         
         self.llm = self.config.get_llm()
         await self.tool_registry.load_all()
         
-        # 1. Классифицируем инструменты (Safe vs Write)
+        # 1. Classify tools
         self.tool_buckets = self._classify_tools()
         logger.info(f"🧠 Tool Capabilities: {len(self.tool_buckets['safe'])} safe, {len(self.tool_buckets['write'])} write.")
         
+        # 2. Bind tools if supported
         can_use_tools = self.config.check_tool_support()
         
         if self.tool_registry.tools and can_use_tools:
@@ -95,32 +90,23 @@ class AgentWorkflow:
                 logger.debug("⚠️ Tools disabled: Model does not support tool calling.")
             self.llm_with_tools = self.llm
 
-    def _classify_tools(self):
-        """
-        Детерминированное разделение инструментов.
-        Использует ToolRegistry для определения возможностей.
-        """
-        buckets = {
-            "safe": [],
-            "write": []
-        }
-        
+    def _classify_tools(self) -> Dict[str, List[str]]:
+        """Separates tools into safe (read-only) and write (action) buckets."""
+        buckets = {"safe": [], "write": []}
         for t in self.tools:
             capability = self.tool_registry.get_tool_capability(t)
-            
             if capability == "write":
                 buckets["write"].append(t.name)
             else:
                 buckets["safe"].append(t.name)
-                
         return buckets
 
     @property
     def tools(self) -> List[BaseTool]:
         return self.tool_registry.tools
 
-    # --- NODES ---
-
+    # --- NODE: SUMMARIZE ---
+    
     async def _summarize_node(self, state: AgentState):
         messages = state["messages"]
         summary = state.get("summary", "")
@@ -128,33 +114,23 @@ class AgentWorkflow:
         if len(messages) <= self.config.summary_threshold:
             return {}
 
+        # Determine cut-off point
         idx = len(messages) - self.config.summary_keep_last
         if idx < 0: idx = 0
 
-        # Попытка найти HumanMessage в хвосте, чтобы сделать красивый разрез
+        # Try to find a clean break at a HumanMessage
         scan_idx = idx
-        found_human = False
         while scan_idx < len(messages):
             if isinstance(messages[scan_idx], HumanMessage):
                 idx = scan_idx
-                found_human = True
                 break
             scan_idx += 1
-        
-        # Если HumanMessage не найден в хвосте, используем жесткий idx (keep_last)
         
         to_summarize = messages[:idx]
         if not to_summarize: return {}
 
-        # Формируем текст истории с ограничением длины контента для экономии токенов
-        history_parts = []
-        for m in to_summarize:
-            content = str(m.content)
-            if len(content) > 500:
-                content = content[:500] + "... [truncated]"
-            history_parts.append(f"{m.type}: {content}")
-        
-        history_text = "\n".join(history_parts)
+        # Format history for LLM
+        history_text = self._format_history_for_summary(to_summarize)
         
         prompt = (
             f"Current memory context:\n<previous_context>\n{summary}\n</previous_context>\n\n"
@@ -172,99 +148,130 @@ class AgentWorkflow:
             logger.error(f"Summarization Error: {e}")
             return {}
 
+    def _format_history_for_summary(self, messages: List[BaseMessage]) -> str:
+        parts = []
+        for m in messages:
+            content = str(m.content)
+            if len(content) > 500:
+                content = content[:500] + "... [truncated]"
+            parts.append(f"{m.type}: {content}")
+        return "\n".join(parts)
+
+    # --- NODE: TOOL FILTER ---
+
     async def _tool_filter_node(self, state: AgentState):
         """
-        Smart Tool Filtering (v6.2).
-        Combines deterministic checks (Recovery, Active Tool) with LLM-based Intent Classification.
+        Determines which tools are allowed for the next step.
+        Implements: Token Budget Check, Recovery Mode, Action Phase, and Intent Classification.
         """
-        # 0. Global Bypass via Config
+        last_msg = state["messages"][-1]
+
+        # 1. Token Budget Check
+        if self._is_budget_exhausted(last_msg):
+            return self._apply_budget_filter(state)
+
+        # 2. Global Bypass
         if not self.config.enable_tool_filtering:
-            logger.debug("🔓 Filter: DISABLED by config (All tools allowed)")
             return {"allowed_tools": None}
 
+        # 3. Determine Phase
+        phase = await self._determine_phase(state)
+        
+        # 4. Tool Gating
+        if phase in ["action", "intent_action"]:
+            logger.debug(f"🔓 Filter: {phase.upper()} (All tools allowed)")
+            return {"allowed_tools": None}
+        else:
+            logger.debug(f"🔒 Filter: {phase.upper()} ({len(self.tool_buckets['safe'])} safe tools allowed)")
+            return {"allowed_tools": self.tool_buckets["safe"]}
+
+    def _is_budget_exhausted(self, last_msg: BaseMessage) -> bool:
+        return isinstance(last_msg, SystemMessage) and "TOKEN BUDGET ALERT" in str(last_msg.content)
+
+    def _apply_budget_filter(self, state: AgentState) -> dict:
+        blocked = {"web_search", "fetch_content", "deep_search", "batch_web_search", "crawl_site"}
+        current_allowed = state.get("allowed_tools")
+        
+        if current_allowed is None:
+            all_tools = self.tool_buckets["safe"] + self.tool_buckets["write"]
+            allowed = [t for t in all_tools if t not in blocked]
+        else:
+            allowed = [t for t in current_allowed if t not in blocked]
+            
+        logger.debug("🛡 Filter: Budget Alert -> Blocking retrieval tools")
+        return {"allowed_tools": allowed}
+
+    async def _determine_phase(self, state: AgentState) -> str:
         messages = state["messages"]
-        phase = "exploration"
         last_msg = messages[-1] if messages else None
 
-        # 1. RECOVERY PHASE (Priority #1)
+        # A. Recovery
         if isinstance(last_msg, SystemMessage):
             text = str(last_msg.content).upper()
             if "SYSTEM ALERT" in text or "DO NOT RETRY" in text:
-                phase = "recovery"
-                logger.debug("🛡 Filter: RECOVERY phase (System alert detected)")
-                return {"allowed_tools": self.tool_buckets["safe"]}
+                return "recovery"
 
-        # 2. ACTION PHASE (Priority #2)
-        # Если мы уже в цикле использования инструментов (предыдущее сообщение - ToolMessage),
-        # продолжаем разрешать доступ, чтобы агент мог завершить начатое.
-        if phase != "recovery":
-            for m in reversed(messages):
-                if isinstance(m, ToolMessage):
-                    content = str(m.content)
-                    if content and not content.startswith("Error"):
-                        phase = "action"
-                        break
-                if isinstance(m, HumanMessage):
-                    break # Stop looking back at previous turn
+        # B. Ongoing Action
+        for m in reversed(messages):
+            if isinstance(m, ToolMessage):
+                content = str(m.content)
+                if content and not content.startswith("Error"):
+                    return "action"
+            if isinstance(m, HumanMessage):
+                break 
 
-        # 3. LLM INTENT CLASSIFICATION (Priority #3)
-        # Если фаза все еще "exploration" и последнее сообщение от человека,
-        # используем LLM для определения намерения.
-        if phase == "exploration" and isinstance(last_msg, HumanMessage):
-            # Fast Path: Check for direct tool mentions first (optimization)
-            text = last_msg.content.lower()
-            write_tool_names = [name.lower() for name in self.tool_buckets["write"]]
-            
-            if any(t_name in text for t_name in write_tool_names):
-                phase = "intent_action"
-                logger.debug("⚡ Filter: Fast Path (Tool mentioned) -> Write Allowed")
-            else:
-                # LLM Path
-                try:
-                    classifier = self.llm.with_structured_output(IntentClassification)
-                    
-                    # SYSTEM PROMPT для классификатора
-                    system_prompt = SystemMessage(content=(
-                        "Analyze the conversation and determine the user's intent. "
-                        "Return a JSON object with 'intent' and 'reasoning'. "
-                        "If the user wants to create, edit, save, delete, or modify files/system -> 'write_action'. "
-                        "If the user just wants to search, read, or ask questions -> 'read_only'."
-                    ))
-                    
-                    # Берем последние 3 сообщения для контекста
-                    context_msgs = [system_prompt] + messages[-3:]
-                    
-                    classification = await classifier.ainvoke(context_msgs)
-                    
-                    if classification.intent == "write_action":
-                        phase = "intent_action"
-                        logger.info(f"🧠 Intent: WRITE detected. Reason: {classification.reasoning}")
-                    else:
-                        logger.info(f"🧠 Intent: READ detected. Reason: {classification.reasoning}")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ Intent Classifier Failed: {e}. Falling back to keyword search.")
-                    # Fallback to keywords (Safety Net)
-                    intent_hints = (
-                        "создай", "создать", "запиши", "записать", "сохрани",
-                        "сделай", "сделать", "напиши", "написать", "измени",
-                        "добавь", "добавить", "обнови", "обновить", "исправь", "почини",
-                        "create", "write", "save", "generate", "edit", "update", "delete",
-                        "add", "insert", "modify", "fix", "replace", "patch"
-                    )
-                    if any(hint in text for hint in intent_hints):
-                        phase = "intent_action"
-
-        # 4. TOOL GATING
-        if phase in ["action", "intent_action"]:
-            allowed = None # All tools allowed
-            logger.debug(f"🔓 Filter: {phase.upper()} (All tools allowed)")
-        else:
-            allowed = self.tool_buckets["safe"]
-            logger.debug(f"🔒 Filter: {phase.upper()} ({len(allowed)} safe tools allowed)")
-
-        return {"allowed_tools": allowed}
+        # C. Intent Classification (LLM)
+        if isinstance(last_msg, HumanMessage):
+            return await self._classify_intent(last_msg, messages)
         
+        return "exploration"
+
+    async def _classify_intent(self, last_msg: HumanMessage, messages: List[BaseMessage]) -> str:
+        text = last_msg.content.lower()
+        
+        # Fast Path: Check for explicit tool names
+        write_tool_names = [name.lower() for name in self.tool_buckets["write"]]
+        if any(t_name in text for t_name in write_tool_names):
+            logger.debug("⚡ Filter: Fast Path (Tool mentioned) -> Write Allowed")
+            return "intent_action"
+
+        # LLM Classification
+        try:
+            classifier = self.llm.with_structured_output(IntentClassification)
+            system_prompt = SystemMessage(content=(
+                "Analyze the conversation and determine the user's intent. "
+                "Return a JSON object with 'intent' and 'reasoning'. "
+                "If the user wants to create, edit, save, delete, or modify files/system -> 'write_action'. "
+                "If the user just wants to search, read, or ask questions -> 'read_only'."
+            ))
+            context_msgs = [system_prompt] + messages[-3:]
+            classification = await classifier.ainvoke(context_msgs)
+            
+            if classification.intent == "write_action":
+                logger.info(f"🧠 Intent: WRITE detected. Reason: {classification.reasoning}")
+                return "intent_action"
+            else:
+                logger.info(f"🧠 Intent: READ detected. Reason: {classification.reasoning}")
+                return "exploration"
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Intent Classifier Failed: {e}. Falling back to keywords.")
+            return self._keyword_fallback(text)
+
+    def _keyword_fallback(self, text: str) -> str:
+        intent_hints = (
+            "создай", "создать", "запиши", "записать", "сохрани",
+            "сделай", "сделать", "напиши", "написать", "измени",
+            "добавь", "добавить", "обнови", "обновить", "исправь", "почини",
+            "create", "write", "save", "generate", "edit", "update", "delete",
+            "add", "insert", "modify", "fix", "replace", "patch"
+        )
+        if any(hint in text for hint in intent_hints):
+            return "intent_action"
+        return "exploration"
+
+    # --- NODE: TOOLS & VALIDATE ---
+
     async def _tools_and_validate_node(self, state: AgentState):
         messages = state["messages"]
         last_msg = messages[-1]
@@ -282,102 +289,137 @@ class AgentWorkflow:
             t_args = tool_call["args"]
             t_id = tool_call["id"]
             
-            # 1. Выполнение инструмента
-            tool = next((t for t in self.tools if t.name == t_name), None)
-            content = ""
-            
-            if not tool:
-                content = f"Error: Tool '{t_name}' not found."
-            else:
-                try:
-                    raw_result = await tool.ainvoke(t_args)
-                    content = str(raw_result)
-                except Exception as e:
-                    content = f"Error: {str(e)}"
-
-            if not content.strip():
-                content = "Error: Tool returned empty response."
-
-            # Создаем сообщение (пока предварительно)
+            # Execute
+            content = await self._execute_tool(t_name, t_args)
             tool_msg = ToolMessage(content=content, tool_call_id=t_id, name=t_name)
 
-            # 2. Валидация
+            # Validate
             result = validate_tool_execution(tool_msg, t_args, t_name)
             
             if not result["is_valid"]:
                 logger.debug(f"Tool Error ({t_name}): {result['error_message']}")
                 
-                # --- [FIX START] Умная обработка ретраев ---
                 retry_count = tool_retries.get(t_name, 0)
-                
                 if result["retry_needed"]:
                     if retry_count < 3:
-                        # Разрешаем повтор (мягкая ошибка)
                         tool_retries[t_name] = retry_count + 1
                         should_force_retry = True
                         validation_errors.append(f"- Tool '{t_name}' failed (Attempt {retry_count+1}/3): {result['error_message']}")
                     else:
-                        # Лимит исчерпан! ЖЕСТКИЙ БЛОК.
-                        # Мы подменяем контент сообщения, чтобы LLM увидела тупик.
-                        error_text = f"SYSTEM BLOCK: Too many consecutive errors for '{t_name}'. The tool is failing repeatedly with: {content[:200]}..."
-                        tool_msg.content = error_text 
+                        tool_msg.content = f"SYSTEM BLOCK: Too many consecutive errors. Output truncated."
                         validation_errors.append(f"- STOP: {t_name} blocked due to repeated failures.")
-                        # Сбрасываем счетчик, так как мы уже наказали агента
                         if t_name in tool_retries: del tool_retries[t_name]
                 else:
-                    # Если retry_needed=False (например, файла нет), просто сообщаем
                     validation_errors.append(f"- Tool '{t_name}' returned: {result['error_message']}")
-                
             else:
-                # Успех - сбрасываем счетчик ошибок для этого инструмента
                 if t_name in tool_retries: del tool_retries[t_name]
 
             final_messages.append(tool_msg)
 
-        # 3. Формирование системного совета
         if validation_errors:
-            if should_force_retry:
-                advice = "INSTRUCTION: Arguments invalid or tool failed. Review the error and TRY AGAIN with corrected parameters."
-            else:
-                # Если мы здесь, значит либо ретраи кончились, либо ошибка фатальна
-                advice = (
-                    "INSTRUCTION: Action failed repeatedly or is impossible. "
-                    "DO NOT RETRY the same tool with the same arguments. "
-                    "Stop and analyze the error. Try a different approach (e.g., check file existence first)."
-                )
-            
-            err_text = "\n".join(validation_errors)
-            final_messages.append(SystemMessage(content=f"SYSTEM ALERT:\n{err_text}\n{advice}"))
+            sys_msg = self._create_error_system_message(validation_errors, should_force_retry)
+            final_messages.append(sys_msg)
 
         return {
             "messages": final_messages,
             "tool_retries": tool_retries
         }
+
+    async def _execute_tool(self, name: str, args: dict) -> str:
+        tool = next((t for t in self.tools if t.name == name), None)
+        if not tool:
+            return f"Error: Tool '{name}' not found."
+        try:
+            raw_result = await tool.ainvoke(args)
+            content = str(raw_result)
+            if not content.strip():
+                return "Error: Tool returned empty response."
+            return content
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    def _create_error_system_message(self, errors: List[str], retry: bool) -> SystemMessage:
+        advice = (
+            "INSTRUCTION: Arguments invalid or tool failed. Review the error and TRY AGAIN with corrected parameters."
+            if retry else
+            "INSTRUCTION: Action failed repeatedly or is impossible. DO NOT RETRY the same tool with the same arguments. Try a different approach."
+        )
+        err_text = "\n".join(errors)
+        return SystemMessage(content=f"SYSTEM ALERT:\n{err_text}\n{advice}")
+
+    # --- NODE: REFLECTION ---
+
+    async def _reflection_node(self, state: AgentState):
+        messages = state["messages"]
+        last_msg = messages[-1] if messages else None
+
+        if not isinstance(last_msg, SystemMessage):
+            return {}
+
+        if "SYSTEM ALERT" not in str(last_msg.content):
+            return {}
+
+        reflection = (
+            "REFLECTION:\n"
+            "- The previous action failed.\n"
+            "- Identify WHY it failed (invalid args, missing data, wrong tool).\n"
+            "- DO NOT repeat the same tool with the same arguments.\n"
+            "- Change strategy (e.g. use a different tool or gather data first).\n"
+            "Reply with a brief plan, then act."
+        )
+        return {"messages": [SystemMessage(content=reflection)]}
         
+    # --- NODE: TOKEN BUDGET ---
+
+    async def _token_budget_guard_node(self, state: AgentState):
+        used = state.get("token_used", 0)
+        budget = state.get("token_budget", 0) or self.config.token_budget
+
+        if budget and used >= budget:
+            return {
+                "messages": [SystemMessage(
+                    content=(
+                        "TOKEN BUDGET ALERT:\n"
+                        "- Context budget is exhausted.\n"
+                        "- Stop gathering new information.\n"
+                        "- Use existing data to finish the task.\n"
+                        "- DO NOT call search or fetch tools."
+                    )
+                )],
+                "token_budget": budget 
+            }
+        
+        if not state.get("token_budget"):
+             return {"token_budget": budget}
+             
+        return {}
+        
+    # --- NODE: AGENT ---
+
     async def _agent_node(self, state: AgentState):
+        self._log_token_usage(state)
+        
         messages = state["messages"]
         
-        # --- DYNAMIC BINDING (Фильтрация инструментов) ---
+        # Dynamic Binding
         allowed = state.get("allowed_tools")
         if allowed is not None:
-            # Фильтруем список
             selected_tools = [t for t in self.tools if t.name in allowed]
             current_llm = self.llm.bind_tools(selected_tools)
         else:
-            # Полный доступ
             current_llm = self.llm_with_tools
-        # -------------------------------------------------
 
         tools_available = (current_llm != self.llm)
         
         sys_msg = self._build_system_message(state.get("summary", ""), tools_available)
         full_context = [sys_msg] + messages
         
+        # Invoke LLM
         response = await self._invoke_llm_with_retry(current_llm, full_context)
         
         last_tool_call = None
         
-        # SafetyGuard (дополнительный слой)
+        # Safety Check
         if SafetyGuard.is_unsafe_write(response, full_context):
             response = SystemMessage(
                 content="STOP. You are trying to write a file without valid data from search/fetch. "
@@ -388,41 +430,65 @@ class AgentWorkflow:
             ToolSanitizer.sanitize_tool_calls(response.tool_calls)
             last_tool_call = response.tool_calls[0]
             
+            # Filename check
             for tc in response.tool_calls:
                 if tc['name'] in ['write_file', 'save_file']:
-                    raw_path = str(tc['args'].get('path', '')).strip()
-                    if len(raw_path) < 2 or re.match(r'^[\.,\-_:;\'" ]+$', raw_path):
-                        logger.debug(f"🛡️ Quality Gate: Rejecting garbage filename '{raw_path}'")
-                        response = SystemMessage(
-                            content=f"SYSTEM ERROR: The filename '{raw_path}' is invalid. "
-                                    "Please RETRY with a meaningful filename."
-                        )
+                    if not self._validate_filename(tc['args']):
+                        logger.debug("🛡️ Quality Gate: Rejecting garbage filename")
+                        response = SystemMessage(content="SYSTEM ERROR: Invalid filename. Please RETRY.")
                         last_tool_call = None
                         break 
-                        
+        
+        # Token Updates
+        token_used_update = {}
         if isinstance(response, AIMessage):
             self._patch_token_usage(response, full_context)
-        
+            if response.usage_metadata:
+                current_used = state.get("token_used", 0)
+                added = response.usage_metadata.get("input_tokens", 0)
+                token_used_update = {"token_used": current_used + added}
+
+        # Loop Guard for repeated writes
         if isinstance(response, AIMessage) and response.tool_calls:
-            last_msg = messages[-1] if messages else None
-            if isinstance(last_msg, ToolMessage):
-                current_tool = response.tool_calls[0]['name']
-                last_tool = last_msg.name
-                if current_tool == "write_file" and last_tool == "write_file":
-                    logger.warning("🛑 Loop Guard: Blocked repetitive write_file.")
-                    response = AIMessage(
-                        content="System: File already written. Stop overwriting."
-                    )
+            if self._is_repeated_write(messages, response):
+                response = AIMessage(content="System: File already written. Stop overwriting.")
 
         return {
             "messages": [response],
-            "last_tool_call": last_tool_call
+            "last_tool_call": last_tool_call,
+            **token_used_update
         }
-        
+
+    def _log_token_usage(self, state: AgentState):
+        used = state.get("token_used", 0)
+        budget = state.get("token_budget", 0) or self.config.token_budget
+        if budget > 0:
+            percent = (used / budget) * 100
+            logger.debug(
+                f"💰 Token Usage: [bold cyan]{used}[/] / [bold cyan]{budget}[/] ({percent:.1f}%)", 
+                extra={"markup": True}
+            )
+
+    def _validate_filename(self, args: dict) -> bool:
+        raw_path = str(args.get('path', '')).strip()
+        if len(raw_path) < 2 or re.match(r'^[\.,\-_:;\'" ]+$', raw_path):
+            return False
+        return True
+
+    def _is_repeated_write(self, messages: List[BaseMessage], response: AIMessage) -> bool:
+        last_msg = messages[-1] if messages else None
+        if isinstance(last_msg, ToolMessage):
+            current_tool = response.tool_calls[0]['name']
+            last_tool = last_msg.name
+            if current_tool == "write_file" and last_tool == "write_file":
+                logger.warning("🛑 Loop Guard: Blocked repetitive write_file.")
+                return True
+        return False
+
     async def _loop_guard_node(self, state: AgentState):
         return {"messages": [AIMessage(content="🛑 **Auto-Stop**: Max steps limit reached.")]}
 
-    # --- HELPERS ---
+    # --- HELPERS (LLM & PROMPT) ---
 
     def _build_system_message(self, summary: str, tools_available: bool = True) -> SystemMessage:
         if self.config.prompt_path.exists():
@@ -475,8 +541,12 @@ class AgentWorkflow:
         return AIMessage(content=f"**System Failure**: Multiple API crashes.")
       
     def _patch_token_usage(self, response: AIMessage, context: List[BaseMessage]):
+        """Ensures usage_metadata is present in the response."""
         usage = response.usage_metadata or {}
+        # logger.info(f"DEBUG PATCH: Initial usage: {usage}")
+        
         if (isinstance(usage, dict) and usage.get("input_tokens", 0) > 0):
+            # logger.info("DEBUG PATCH: Existing valid usage found. Skipping.")
             return
 
         meta = response.response_metadata or {}
@@ -495,6 +565,8 @@ class AgentWorkflow:
             if isinstance(c, dict) and ("prompt_tokens" in c or "completion_tokens" in c):
                 raw_usage = c
                 break
+        
+        # logger.info(f"DEBUG PATCH: Raw usage found: {raw_usage}")
 
         if raw_usage:
             input_tokens = raw_usage.get("prompt_tokens", 0)
@@ -502,6 +574,7 @@ class AgentWorkflow:
             total_tokens = raw_usage.get("total_tokens", input_tokens + output_tokens)
 
             if input_tokens > 0 or output_tokens > 0:
+                # logger.info(f"DEBUG PATCH: Using Provider usage. In: {input_tokens}")
                 response.usage_metadata = {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -511,6 +584,8 @@ class AgentWorkflow:
                 return
 
         input_tokens = self.utils.estimate_payload_tokens(context, self.tools)
+        # logger.info(f"DEBUG PATCH: Manual calculation. In: {input_tokens}")
+        
         output_content = response.content
         if isinstance(output_content, list):
             output_content = " ".join(str(x) for x in output_content)
@@ -532,22 +607,21 @@ class AgentWorkflow:
         workflow = StateGraph(AgentState)
 
         workflow.add_node("summarize", self._summarize_node)
-        
-        # Добавляем наш детерминированный фильтр
         workflow.add_node("tool_filter", self._tool_filter_node)
-        
         workflow.add_node("agent", self._agent_node)
         workflow.add_node("loop_guard", self._loop_guard_node)
         workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
         workflow.add_node("tools", self._tools_and_validate_node)
-        
+        workflow.add_node("reflection", self._reflection_node)
+        workflow.add_node("token_budget_guard", self._token_budget_guard_node)
+
         tools_enabled = bool(self.tools) and self.config.check_tool_support()
 
         workflow.add_edge(START, "summarize")
         workflow.add_edge("summarize", "update_step")
         
-        # Жесткий маршрут: update -> filter -> agent
-        workflow.add_edge("update_step", "tool_filter")
+        workflow.add_edge("update_step", "token_budget_guard")
+        workflow.add_edge("token_budget_guard", "tool_filter")
         workflow.add_edge("tool_filter", "agent")
 
         def should_continue(state: AgentState):
@@ -561,7 +635,13 @@ class AgentWorkflow:
             if not messages: return "agent"
             last_msg = messages[-1]
 
-            if isinstance(last_msg, SystemMessage): return "agent"
+            # Redirect system alerts back to agent
+            if isinstance(last_msg, SystemMessage):
+                content = str(last_msg.content)
+                if any(tag in content for tag in ("SYSTEM ALERT", "REFLECTION", "TOKEN BUDGET ALERT")):
+                    return "agent"
+                return END
+
             if tools_enabled and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
                 return "tools"
             if isinstance(last_msg, ToolMessage): return "agent"
@@ -571,9 +651,8 @@ class AgentWorkflow:
         workflow.add_conditional_edges("agent", should_continue, destinations)
 
         if tools_enabled:
-            # После инструментов возвращаемся в фильтр, 
-            # чтобы он увидел успешный ToolMessage и открыл доступ к write
-            workflow.add_edge("tools", "tool_filter")
+            workflow.add_edge("tools", "reflection")
+            workflow.add_edge("reflection", "tool_filter")
 
         workflow.add_edge("loop_guard", END)
 
@@ -583,6 +662,6 @@ if __name__ == "__main__":
     async def main():
         wf = AgentWorkflow()
         await wf.initialize_resources()
-        print(f"✅ Agent Ready. Tools: {len(wf.tools)}")
+        print(f"✔ Agent Ready. Tools: {len(wf.tools)}")
 
     asyncio.run(main())

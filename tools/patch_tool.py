@@ -1,21 +1,11 @@
 import logging
+import asyncio
 from pathlib import Path
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
-@tool("smart_replace")
-def smart_replace(path: str, target_text: str, replacement_text: str) -> str:
-    """
-    Precise search-and-replace for files. Best for surgical code edits or config updates.
-    Handles line-ending differences (LF/CRLF) automatically to prevent errors.
-    
-    Args:
-        path: Relative path to the file.
-        target_text: Unique text block to find.
-        replacement_text: New text to insert.
-    """
-        
+def _smart_replace_sync(path: str, target_text: str, replacement_text: str) -> str:
     try:
         file_path = Path(path).resolve()
         
@@ -52,3 +42,16 @@ def smart_replace(path: str, target_text: str, replacement_text: str) -> str:
 
     except Exception as e:
         return f"Error: System Error during edit: {e}"
+
+@tool("smart_replace")
+async def smart_replace(path: str, target_text: str, replacement_text: str) -> str:
+    """
+    Precise search-and-replace for files. Best for surgical code edits or config updates.
+    Handles line-ending differences (LF/CRLF) automatically to prevent errors.
+    
+    Args:
+        path: Relative path to the file.
+        target_text: Unique text block to find.
+        replacement_text: New text to insert.
+    """
+    return await asyncio.to_thread(_smart_replace_sync, path, target_text, replacement_text)

@@ -1,20 +1,21 @@
 import sys
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Any
+
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from core.constants import BASE_DIR
-
-# --- LANGCHAIN PROVIDERS ---
-# Импортируем провайдеров здесь, чтобы не засорять основной файл
 from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
+from core.constants import BASE_DIR
+
 class AgentConfig(BaseSettings):
-    # Указываем полные пути к конфигам, опираясь на BASE_DIR
+    """
+    Конфигурация агента, загружаемая из переменных окружения и .env файла.
+    """
     model_config = SettingsConfigDict(
-        env_file= BASE_DIR / '.env',
+        env_file=BASE_DIR / '.env',
         env_file_encoding='utf-8', 
         extra='ignore'
     )
@@ -24,33 +25,38 @@ class AgentConfig(BaseSettings):
     mcp_config_path: Path = BASE_DIR / "mcp.json"
     memory_db_path: str = str(BASE_DIR / "memory_db")
     
+    # Provider Settings
     provider: Literal["gemini", "openai"] = "gemini"
     
-    # API Keys & Models
+    # Gemini
     gemini_api_key: Optional[SecretStr] = None
     gemini_model: str = "gemini-1.5-flash"
     
+    # OpenAI / Compatible
     openai_api_key: Optional[SecretStr] = None
     openai_model: str = "gpt-4o"
     openai_base_url: Optional[str] = None
 
+    # Common Logic
     temperature: float = 0.2
+    max_loops: int = Field(default=15, description="Limit steps per request")
+    token_budget: int = Field(default=30000, alias="TOKEN_BUDGET")
     
-    # Logic Settings
+    # Features Toggle
     enable_deep_search: bool = Field(default=False, alias="DEEP_SEARCH")
     enable_search_tools: bool = Field(default=True, alias="ENABLE_SEARCH_TOOLS")
     model_supports_tools: bool = Field(default=True, alias="MODEL_SUPPORTS_TOOLS")
     use_long_term_memory: bool = Field(default=False, alias="LONG_TERM_MEMORY")
     use_system_tools: bool = Field(default=True, alias="ENABLE_SYSTEM_TOOLS")
-    max_loops: int = Field(default=15, description="Limit steps per request")
-    
-    # Summarization Settings
-    summary_threshold: int = Field(default=20, alias="SESSION_SIZE")
-    summary_keep_last: int = Field(default=4, alias="SUMMARY_KEEP_LAST")
+    enable_media_tools: bool = Field(default=False, alias="ENABLE_MEDIA_TOOLS")
     safety_guard_enabled: bool = Field(default=True, alias="SAFETY_GUARD_ENABLED")
     enable_tool_filtering: bool = Field(default=True, alias="ENABLE_TOOL_FILTERING")
     
-    # Advanced Settings
+    # Summarization
+    summary_threshold: int = Field(default=20, alias="SESSION_SIZE")
+    summary_keep_last: int = Field(default=4, alias="SUMMARY_KEEP_LAST")
+    
+    # Network / Retry
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
     retry_delay: int = Field(default=2, alias="RETRY_DELAY")
     debug: bool = Field(default=False, alias="DEBUG")
@@ -70,8 +76,8 @@ class AgentConfig(BaseSettings):
         if not self.model_supports_tools:
             return False
             
-        # Эвристика для OpenRouter и других провайдеров
         if self.provider == "openai":
+            # Эвристика для моделей, которые часто не поддерживают тулы
             model_name = self.openai_model.lower()
             no_tool_prefixes = (
                 "tngtech/", "huggingface/", "grey-wing/", "sao10k/" 
@@ -81,6 +87,9 @@ class AgentConfig(BaseSettings):
         return True
 
     def get_llm(self) -> BaseChatModel:
+        """
+        Инициализирует и возвращает экземпляр LLM на основе настроек.
+        """
         if self.provider == "gemini":
             return ChatGoogleGenerativeAI(
                 model=self.gemini_model,

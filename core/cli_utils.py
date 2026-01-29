@@ -125,7 +125,7 @@ class TokenTracker:
 
     def update_from_message(self, msg: Any):
         if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-            self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
+            self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None), msg)
         
         if isinstance(msg, (AIMessage, AIMessageChunk)):
             content = msg.content
@@ -144,13 +144,21 @@ class TokenTracker:
         if not isinstance(messages, list): messages = [messages]
         for msg in messages:
             if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None))
+                self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None), msg)
 
-    def _apply_metadata(self, usage: Dict, msg_id: str = None):
+    def _apply_metadata(self, usage: Dict, msg_id: str = None, msg: Any = None):
+        # DEBUG: Print incoming usage
+        #print(f"DEBUG: Token Update | ID: {msg_id} | Usage: {usage}")
+        
         is_new = True
         if msg_id and msg_id in self._seen_ids: is_new = False
         
-        if usage.get("token_source") == "Manual":
+        # Check source in usage_metadata OR additional_kwargs
+        source = usage.get("token_source")
+        if not source and msg and hasattr(msg, "additional_kwargs"):
+            source = msg.additional_kwargs.get("token_source")
+
+        if source == "Manual":
             self.source_label = "Manual"
         
         in_t = usage.get("input_tokens", 0)

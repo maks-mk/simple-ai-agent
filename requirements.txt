@@ -28,6 +28,7 @@ sentence-transformers
 python-dotenv
 # Подсчет токенов (используется в agent.py для логики сжатия)
 tiktoken
+yt-dlp
 
 # --- UI / CLI ---
 rich

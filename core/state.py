@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated, Optional, List
+from typing import TypedDict, Annotated, Optional, List, Dict, Any
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
@@ -17,11 +17,15 @@ class AgentState(TypedDict):
     
     # --- validation support ---
     # Последний вызов инструмента для валидации
-    last_tool_call: Optional[dict]
+    last_tool_call: Optional[Dict[str, Any]]
     
     # Счетчик попыток исправления ошибок для каждого инструмента
-    tool_retries: dict
+    tool_retries: Dict[str, int]
     
     # Список имен инструментов, разрешенных на этом шаге
     # Если None — разрешены все.
     allowed_tools: Optional[List[str]]
+
+    # --- token budget ---
+    token_used: int
+    token_budget: int

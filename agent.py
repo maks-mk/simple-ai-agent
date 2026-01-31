@@ -491,9 +491,18 @@ class AgentWorkflow:
     # --- HELPERS (LLM & PROMPT) ---
 
     def _build_system_message(self, summary: str, tools_available: bool = True) -> SystemMessage:
+        # 1. Try configured path
         if self.config.prompt_path.exists():
-            raw_prompt = self.config.prompt_path.read_text("utf-8")
-            logger.info(f"✅ System prompt loaded from: {self.config.prompt_path} ({len(raw_prompt)} chars)")
+            prompt_file = self.config.prompt_path
+        # 2. Try BASE_DIR fallback (if config path is wrong/relative)
+        elif (BASE_DIR / "prompt.txt").exists():
+            prompt_file = BASE_DIR / "prompt.txt"
+        else:
+            prompt_file = None
+
+        if prompt_file:
+            raw_prompt = prompt_file.read_text("utf-8")
+            logger.info(f"✅ System prompt loaded from: {prompt_file} ({len(raw_prompt)} chars)")
         else:
             logger.warning(f"⚠️ System prompt not found at: {self.config.prompt_path}. Using fallback.")
             raw_prompt = (
@@ -571,9 +580,19 @@ class AgentWorkflow:
         if raw_usage:
             input_tokens = raw_usage.get("prompt_tokens", 0)
             output_tokens = raw_usage.get("completion_tokens", 0)
+            
+            # OpenAI sometimes returns None for these fields in streaming mode chunks
+            if input_tokens is None: input_tokens = 0
+            if output_tokens is None: output_tokens = 0
+            
             total_tokens = raw_usage.get("total_tokens", input_tokens + output_tokens)
 
-            if input_tokens > 0 or output_tokens > 0:
+            # Sanity check for huge values (e.g. bytes instead of tokens)
+            if input_tokens > 150_000:
+                logger.warning(f"⚠️ Suspiciously high token count ({input_tokens}). Possible parsing error or garbage from provider. Raw: {raw_usage}")
+                # Fallback to manual counting if provider returns garbage
+                pass 
+            elif input_tokens > 0 or output_tokens > 0:
                 # logger.info(f"DEBUG PATCH: Using Provider usage. In: {input_tokens}")
                 response.usage_metadata = {
                     "input_tokens": input_tokens,
@@ -657,6 +676,14 @@ class AgentWorkflow:
         workflow.add_edge("loop_guard", END)
 
         return workflow.compile(checkpointer=MemorySaver())
+
+if __name__ == "__main__":
+    async def main():
+        wf = AgentWorkflow()
+        await wf.initialize_resources()
+        print(f"✔ Agent Ready. Tools: {len(wf.tools)}")
+
+    asyncio.run(main())
 
 if __name__ == "__main__":
     async def main():

@@ -46,12 +46,7 @@ def _smart_replace_sync(path: str, target_text: str, replacement_text: str) -> s
 @tool("smart_replace")
 async def smart_replace(path: str, target_text: str, replacement_text: str) -> str:
     """
-    Precise search-and-replace for files. Best for surgical code edits or config updates.
-    Handles line-ending differences (LF/CRLF) automatically to prevent errors.
-    
-    Args:
-        path: Relative path to the file.
-        target_text: Unique text block to find.
-        replacement_text: New text to insert.
+    Replaces exact text in a file. Handles LF/CRLF differences.
+    Args: path (relative), target_text (exact match), replacement_text.
     """
     return await asyncio.to_thread(_smart_replace_sync, path, target_text, replacement_text)

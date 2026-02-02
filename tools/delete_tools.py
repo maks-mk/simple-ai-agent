@@ -29,9 +29,8 @@ def _validate_path(relative_path: str) -> tuple[bool, str | None, Path | None]:
 @tool("safe_delete_file")
 async def safe_delete_file(file_path: str) -> str:
     """
-    Safely deletes a file within the working directory.
-    Args:
-        file_path: Relative path to the file to delete.
+    Deletes a file in the working directory.
+    Args: file_path (relative).
     """
     is_valid, error, target = _validate_path(file_path)
     if not is_valid: 
@@ -54,10 +53,8 @@ async def safe_delete_file(file_path: str) -> str:
 @tool("safe_delete_directory")
 async def safe_delete_directory(dir_path: str, recursive: bool = False) -> str:
     """
-    Safely deletes a directory. 
-    Args:
-        dir_path: Relative path to the directory.
-        recursive: Set True to delete non-empty directories.
+    Deletes a directory in the working directory.
+    Args: dir_path (relative), recursive (bool).
     """
     is_valid, error, target = _validate_path(dir_path)
     if not is_valid: 

@@ -14,7 +14,7 @@ except ImportError:
 # TEXT PROCESSING
 # ======================================================
 
-_THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.DOTALL)
+_THOUGHT_RE = re.compile(r"<(thought|think)>(.*?)</\1>", re.DOTALL)
 
 def clean_markdown_text(text: str) -> str:
     """Убирает лишние отступы и двойные переносы строк."""
@@ -26,14 +26,18 @@ def clean_markdown_text(text: str) -> str:
     return text
 
 def parse_thought(text: str) -> Tuple[str, str, bool]:
-    """Отделяет скрытые мысли <thought> от основного текста."""
+    """Отделяет скрытые мысли <thought>/<think> от основного текста."""
     match = _THOUGHT_RE.search(text)
     if match: 
-        return match.group(1).strip(), _THOUGHT_RE.sub('', text).strip(), True
+        return match.group(2).strip(), _THOUGHT_RE.sub('', text).strip(), True
     
-    if "<thought>" in text and "</thought>" not in text:
-        start = text.find("<thought>") + len("<thought>")
-        return text[start:].strip(), text[:text.find("<thought>")], False
+    # Fallback for unclosed tags (streaming)
+    for tag in ["<thought>", "<think>"]:
+        if tag in text:
+            close_tag = tag.replace("<", "</")
+            if close_tag not in text:
+                start = text.find(tag) + len(tag)
+                return text[start:].strip(), text[:text.find(tag)], False
         
     return "", text, False
 

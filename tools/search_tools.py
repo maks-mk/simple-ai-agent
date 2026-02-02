@@ -9,6 +9,8 @@ from typing import Optional, List, Any, Union, Dict
 
 from langchain_core.tools import tool
 
+from core.config import AgentConfig
+
 logger = logging.getLogger(__name__)
 
 # --- Инициализация Tavily ---
@@ -102,7 +104,14 @@ def _format_error(error_type: str, details: str = "") -> str:
 def get_tavily_client() -> Optional[Any]:
     global _client
     
-    if os.getenv("ENABLE_SEARCH_TOOLS", "True").lower() == "false":
+    # Load config once or per call (lightweight)
+    try:
+        config = AgentConfig()
+    except Exception as e:
+        logger.error(f"Config load failed: {e}")
+        return None
+
+    if not config.enable_search_tools:
         return None 
 
     if _client is not None:
@@ -111,13 +120,12 @@ def get_tavily_client() -> Optional[Any]:
     if AsyncTavilyClient is None:
         return None
 
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
+    if not config.tavily_api_key:
         logger.error("TAVILY_API_KEY is not set.")
         return None
 
     try:
-        _client = AsyncTavilyClient(api_key=api_key)
+        _client = AsyncTavilyClient(api_key=config.tavily_api_key.get_secret_value())
         return _client
     except Exception as e:
         logger.error(f"Failed to initialize Tavily client: {e}")
@@ -125,8 +133,14 @@ def get_tavily_client() -> Optional[Any]:
 
 async def _execute_with_retry(coroutine_func, *args, **kwargs):
     """Выполняет запрос с ретраями и семафором."""
-    max_retries = int(os.getenv("MAX_RETRIES", "3"))
-    retry_delay = int(os.getenv("RETRY_DELAY", "2"))
+    try:
+        config = AgentConfig()
+        max_retries = config.max_retries
+        retry_delay = config.retry_delay
+    except Exception:
+        max_retries = 3
+        retry_delay = 2
+
     last_error = None
 
     async with _search_semaphore:
@@ -148,8 +162,7 @@ async def _execute_with_retry(coroutine_func, *args, **kwargs):
 @with_cache(ttl=600)
 async def web_search(query: str, max_results: int = 5) -> str:
     """
-    Search internet for information. Returns snippets from multiple sources + AI summary.
-    Use for: quick facts, news, comparing sources. Don't use for full article text.
+    Search internet for snippets and AI summary. Best for facts, news, comparisons.
     """
     if not get_tavily_client():
         return _format_error("missing_config")
@@ -262,7 +275,8 @@ async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> 
 @with_cache(ttl=600)
 async def batch_web_search(queries: List[str]) -> str:
     """
-    Perform multiple web searches in parallel. 
+    Runs multiple queries in parallel. Much faster/cheaper than calling web_search N times.
+    Use for: multi-aspect research, verifying facts from different angles.
     """
     client = get_tavily_client()
     if not client:

@@ -101,8 +101,7 @@ def _format_result(result: Result) -> str:
 @tool("get_public_ip")
 async def get_public_ip() -> str:
     """
-    Returns the agent's current public IP address.
-    Uses reliable providers with fallback logic.
+    Gets public IP address with provider fallback.
     """
     client = get_net_client()
     result = await client.my_ip()
@@ -111,7 +110,7 @@ async def get_public_ip() -> str:
 @tool("lookup_ip_info")
 async def lookup_ip_info(ip: str) -> str:
     """
-    Retrieves geolocation info for a specific IP address (Country, ISP, etc).
+    Gets geolocation/ISP info for an IP.
     """
     client = get_net_client()
     result = await client.get_ip_info(ip)
@@ -160,7 +159,7 @@ def _get_system_info_sync() -> str:
 @tool("get_system_info")
 async def get_system_info() -> str:
     """
-    Returns detailed system information: OS, CPU, RAM, Disk usage.
+    Gets OS, CPU, RAM, and Disk usage stats.
     """
     return await asyncio.to_thread(_get_system_info_sync)
 
@@ -194,6 +193,6 @@ def _get_local_network_sync() -> str:
 @tool("get_local_network_info")
 async def get_local_network_info() -> str:
     """
-    Returns local network interfaces, local IPs, and traffic stats.
+    Gets local IPs, interfaces, and traffic stats.
     """
     return await asyncio.to_thread(_get_local_network_sync)

@@ -94,17 +94,8 @@ async def download_media(
     resolution: str = "best"
 ) -> str:
     """
-    Downloads video or audio from supported platforms (YouTube, Twitch, etc.) using yt-dlp.
-    Saves files to the current working directory.
-    
-    Args:
-        url: The URL to download from.
-        media_type: 'video' (default) or 'audio'.
-        resolution: Target height for video (e.g., '1080', '720', '480', 'best'). 
-                    Ignored if media_type='audio'.
-    
-    Returns:
-        A string indicating success (with filename) or failure.
+    Downloads video/audio via yt-dlp to CWD.
+    Args: url, media_type ('video'/'audio'), resolution ('1080', 'best').
     """
     if not yt_dlp:
         return "Error: 'yt-dlp' library is not installed. Please install it via pip."

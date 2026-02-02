@@ -28,6 +28,9 @@ class AgentConfig(BaseSettings):
     # Provider Settings
     provider: Literal["gemini", "openai"] = "gemini"
     
+    # Tavily Search
+    tavily_api_key: Optional[SecretStr] = Field(default=None, alias="TAVILY_API_KEY")
+
     # Gemini
     gemini_api_key: Optional[SecretStr] = None
     gemini_model: str = "gemini-1.5-flash"

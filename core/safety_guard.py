@@ -2,6 +2,7 @@ import logging
 import os
 from typing import List, Set, Optional
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
+from core import constants
 
 logger = logging.getLogger("safety_guard")
 
@@ -12,33 +13,17 @@ class SafetyGuard:
     """
     
     # Ключевые слова для определения типа действий
-    DESTRUCTIVE_ROOTS: Set[str] = {'delete', 'remove', 'unlink', 'rmdir', 'format'}
-    WRITE_ROOTS: Set[str] = {'write', 'save', 'append', 'edit', 'store', 'update', 'replace', 'move', 'create', 'mkdir', 'put', 'post', 'send', 'upload'} | DESTRUCTIVE_ROOTS
+    DESTRUCTIVE_ROOTS: Set[str] = constants.DESTRUCTIVE_ROOTS
+    WRITE_ROOTS: Set[str] = constants.WRITE_ROOTS
     
     # Слова, указывающие на творческую задачу (разрешают генерацию без поиска)
-    CREATIVE_TRIGGERS: Set[str] = {
-        "script", "story", "poem", "essay", "joke", 
-        "guide", "tutorial", "instruction", "example",
-        "draft", "template", "boilerplate",
-        "write a python script", "create a bash script",
-        # Русские триггеры
-        "скрипт", "код", "программу", "стих", "истори", "сказк", 
-        "пример", "инструкци", "гайд", "черновик", "шаблон",
-        "напиши", "создай", "сгенерируй"
-    }
+    CREATIVE_TRIGGERS: Set[str] = constants.CREATIVE_TRIGGERS
 
     # Инструменты, которые считаются источниками знаний
-    RETRIEVAL_WHITELIST: Set[str] = {
-        'search', 'read', 'fetch', 'get', 'query', 
-        'load', 'list', 'retrieve', 'browse', 'ask', 'lookup',
-        'deep_search'
-    }
+    RETRIEVAL_WHITELIST: Set[str] = constants.RETRIEVAL_WHITELIST
 
     # Инструменты, которые мы игнорируем при поиске знаний
-    MODIFICATION_BLACKLIST: Set[str] = {
-        'write', 'save', 'edit', 'append', 'delete', 
-        'remove', 'update', 'put', 'post', 'send', 'upload'
-    }
+    MODIFICATION_BLACKLIST: Set[str] = constants.MODIFICATION_BLACKLIST
 
     @classmethod
     def is_unsafe_write(cls, response: AIMessage, history: List[BaseMessage]) -> bool:

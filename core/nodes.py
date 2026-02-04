@@ -283,14 +283,7 @@ class AgentNodes:
         if "SYSTEM ALERT" not in str(last_msg.content):
             return {}
 
-        reflection = (
-            "REFLECTION:\n"
-            "- The previous action failed.\n"
-            "- Identify WHY it failed (invalid args, missing data, wrong tool).\n"
-            "- DO NOT repeat the same tool with the same arguments.\n"
-            "- Change strategy (e.g. use a different tool or gather data first).\n"
-            "Reply with a brief plan, then act."
-        )
+        reflection = constants.REFLECTION_PROMPT
         return {"messages": [SystemMessage(content=reflection)]}
         
     # --- NODE: TOKEN BUDGET ---

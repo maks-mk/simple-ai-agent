@@ -61,3 +61,25 @@ MODIFICATION_BLACKLIST = {
 }
 
 FATAL_ERRORS = ["401", "unauthorized", "quota", "billing", "context_length_exceeded"]
+
+# --- SYSTEM & ERROR HANDLING ---
+
+MISSING_RESOURCE_MARKERS = [
+    "no such file", 
+    "not found", 
+    "enoent",       # Node.js Error No Entry
+    "does not exist",
+    "cannot find the path", # Windows specific
+    "directory not found",
+    "unable to open"
+]
+
+REFLECTION_PROMPT = (
+    "REFLECTION:\n"
+    "- The previous action failed.\n"
+    "- Identify WHY it failed (invalid args, missing data, wrong tool).\n"
+    "- DO NOT repeat the same tool with the same arguments.\n"
+    "- Change strategy (e.g. use a different tool or gather data first).\n"
+    "Reply with a brief plan, then act."
+)
+

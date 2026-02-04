@@ -1,18 +1,11 @@
 from typing import Optional, TypedDict, Any
 from langchain_core.messages import ToolMessage
+from core.constants import MISSING_RESOURCE_MARKERS
 
 class ValidationResult(TypedDict):
     is_valid: bool
     error_message: Optional[str]
     retry_needed: bool
-
-# Список фраз, означающих отсутствие ресурса (нет смысла повторять)
-MISSING_RESOURCE_MARKERS = [
-    "no such file", 
-    "not found", 
-    "enoent",       # Node.js Error No Entry
-    "does not exist"
-]
 
 def _is_missing_resource_error(content: str) -> bool:
     content_lower = content.lower()

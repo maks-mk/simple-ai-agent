@@ -188,15 +188,31 @@ class ToolRegistry:
     def _load_system_tools(self):
         """Загрузка системных утилит (сеть, ОС)."""
         try:
-            from tools.system_tools import get_public_ip, lookup_ip_info, get_system_info, get_local_network_info
+            from tools.system_tools import (
+                get_public_ip, 
+                lookup_ip_info, 
+                get_system_info, 
+                get_local_network_info,
+                run_background_process,
+                stop_background_process
+            )
 
             system_tools = [
                 get_public_ip,
                 lookup_ip_info,
                 get_system_info,
                 get_local_network_info,
+                run_background_process,
+                stop_background_process
             ]
-            self._set_capability(system_tools, "safe")
+            # Mark run_background_process as safe or write? 
+            # It changes system state (starts process), so 'write' might be safer, 
+            # but usually we want to allow it in exploration if it's just a local server.
+            # However, safety first: 'write' bucket.
+            
+            self._set_capability([t for t in system_tools if t.name not in ["run_background_process", "stop_background_process"]], "safe")
+            self._set_capability([run_background_process, stop_background_process], "write")
+            
             self.tools.extend(system_tools)
         except ImportError as e:
             logger.error(f"Failed to load system tools: {e}")

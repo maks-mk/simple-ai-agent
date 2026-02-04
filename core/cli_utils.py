@@ -177,8 +177,14 @@ class TokenTracker:
 
     def render(self, duration: float) -> str:
         display_out = self.total_output
-        if self._streaming_text:
-            est = len(_ENCODER.encode(self._streaming_text)) if _ENCODER else len(self._streaming_text) // 3
-            display_out += est
+        
+        # Fallback estimation for providers that don't return usage stats
+        if self.total_output == 0 and self._streaming_text:
+            self.source_label = "Manual/Est"
+            if _ENCODER:
+                est = len(_ENCODER.encode(self._streaming_text))
+            else:
+                est = len(self._streaming_text) // 3
+            display_out = est
             
         return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out} [dim]({self.source_label})[/]"

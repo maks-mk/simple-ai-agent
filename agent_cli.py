@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 # --- PROJECT IMPORTS ---
 from core.constants import BASE_DIR
+from core.ui_theme import AGENT_THEME
 
 # Ensure project modules take precedence
 if str(BASE_DIR) not in sys.path:
@@ -61,10 +62,11 @@ from core.cli_utils import (
     get_key_bindings
 )
 from core.config import AgentConfig
+from core.logging_config import setup_logging
 
 # --- CONFIG ---
 warnings.filterwarnings("ignore")
-console = Console()
+console = Console(theme=AGENT_THEME)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class MergeCompleter(Completer):
@@ -203,8 +205,8 @@ class StreamProcessor:
         if t_id not in self.printed_tool_ids:
             arg_str = self._format_tool_args(tc["args"])
             target = live.console if live else self.console
-            suffix = f" [dim]· {arg_str}[/]" if arg_str else ""
-            target.print(Padding(f"🔧 [cyan]{tc['name']}[/]{suffix}", (0, 0, 0, 2)))
+            suffix = f" [tool.args]· {arg_str}[/]" if arg_str else ""
+            target.print(Padding(f"🔧 [tool.name]{tc['name']}[/]{suffix}", (0, 0, 0, 2)))
             self.printed_tool_ids.add(t_id)
             self.status_text = f"Running {tc['name']}..."
 
@@ -218,25 +220,34 @@ class StreamProcessor:
         if t_id in self.tool_buffer and t_id not in self.printed_tool_ids:
             info = self.tool_buffer[t_id]
             arg_str = self._format_tool_args(info["args"])
-            target.print(Padding(f"🔧 [cyan]{info['name']}[/] [dim]· {arg_str}[/]", (0, 0, 0, 2)))
+            target.print(Padding(f"🔧 [tool.name]{info['name']}[/] [tool.args]· {arg_str}[/]", (0, 0, 0, 2)))
             self.printed_tool_ids.add(t_id)
             
         summary = format_tool_output(msg.name, content_str, is_error)
-        icon = "[red]❌[/]" if is_error else "[cyan]└─[/]"
+        icon = "[tool.error]❌[/]" if is_error else "[tool.result]└─[/]"
         target.print(Padding(f"{icon} {summary}", (0, 0, 0, 4)))
         self.status_text = "Analyzing..."
 
     def _update_live_display(self, live: Live):
         thought_content, clean_full, has_thought = parse_thought(self.full_text)
         if has_thought and thought_content:
-            self.status_text = "[yellow italic]Thinking...[/]"
+            self.status_text = "[agent.thought]Thinking...[/]"
         
         pending = clean_full[self.printed_len:]
-        renderable = Spinner("dots", text=self.status_text, style="cyan")
+        
+        # Create a structured grid layout for the dashboard
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(justify="left", ratio=1)
+        
+        # 1. Status Row
+        spinner = Spinner("dots", text=self.status_text, style="status.spinner")
+        grid.add_row(spinner)
+        
+        # 2. Content Row (Thought process)
         if pending.strip():
-             # Ensure code_theme matches our Syntax theme for consistency
-             renderable = Group(Padding(Markdown(clean_markdown_text(pending), code_theme="ansi_dark"), (0, 0, 0, 2)), renderable)
-        live.update(renderable)
+             grid.add_row(Padding(Markdown(clean_markdown_text(pending), code_theme="ansi_dark"), (0, 0, 0, 2)))
+             
+        live.update(grid)
 
     def _format_tool_args(self, args: Any) -> str:
         if isinstance(args, dict):
@@ -289,11 +300,38 @@ def render_chat_history(console: Console, messages: List[Any]):
     if not messages: return
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            console.print(Padding(Panel(Markdown(str(msg.content)), title="[bold green]You[/]", border_style="green"), (1, 0, 1, 4)))
+            console.print(Padding(Panel(Markdown(str(msg.content).strip()), title="[user.say]You[/]", title_align="right", border_style="green", padding=(0, 1), subtitle_align="right"), (1, 0, 1, 4)))
+            
         elif isinstance(msg, AIMessage):
-            _, content, _ = parse_thought(str(msg.content))
+            # Parse thought to hide it or show it differently
+            thought, content, _ = parse_thought(str(msg.content))
+            
+
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    name = tc.get("name", "tool")
+                    console.print(Padding(f"🔧 [tool.name]{name}[/] [dim]...[/]", (0, 0, 0, 8)))
+
+            # 2. Content
             if content.strip():
-                console.print(Padding(Panel(Markdown(content), title="[bold blue]Agent[/]", border_style="blue"), (0, 4, 1, 0)))
+                console.print(Padding(Panel(
+                    Markdown(content.strip()),
+                    title="[agent.say]Agent[/]",
+                    title_align="left",
+                    border_style="blue",
+                    padding=(0, 1)
+                ), (0, 4, 1, 0)))
+                
+        elif isinstance(msg, ToolMessage):
+            # Show tool result compactly
+            name = msg.name or "tool"
+            content = str(msg.content)
+            is_error = getattr(msg, "status", "") == "error" or content.startswith(("Error", "Ошибка"))
+            summary = format_tool_output(name, content, is_error)
+            
+            style = "tool.error" if is_error else "tool.result"
+            icon = "❌" if is_error else "└─"
+            console.print(Padding(f"[{style}]{icon} {summary}[/]", (0, 0, 0, 8)))
 
 def get_prompt_message():
     cwd = Path.cwd()
@@ -331,10 +369,13 @@ async def main():
     # 1. Load Config
     try:
         temp_cfg = AgentConfig()
-        if temp_cfg.debug:
-            logger.setLevel(logging.DEBUG)
-        else:
-            logger.setLevel(logging.WARNING)
+        
+        # Re-initialize logging with config values
+        # If debug is False, show only WARNING+ in console to keep UI clean.
+        # File logs will still capture everything down to DEBUG because file_handler is configured independently.
+        log_level = logging.DEBUG if temp_cfg.debug else logging.WARNING
+        setup_logging(level=log_level)
+        
     except Exception as e:
         console.print(f"[bold red]Config Error:[/] {e}")
         return
@@ -354,7 +395,7 @@ async def main():
     
     model_name = temp_cfg.gemini_model if temp_cfg.provider == "gemini" else temp_cfg.openai_model
     header_info = f"[bold blue]AI Agent CLI[/]\n[dim]Model: {model_name} | Tools: {len(workflow.tools)}[/]"
-    console.print(Panel(header_info, subtitle="v7.1b"))
+    console.print(Panel(header_info, subtitle="v7.2b"))
 
     if temp_cfg.debug:
         console.print("[yellow]🐛 Debug mode enabled[/]")

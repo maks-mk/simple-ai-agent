@@ -98,7 +98,11 @@ class AgentNodes:
         last_msg = state["messages"][-1]
 
         # 1. Token Budget Check
-        if self._is_budget_exhausted(last_msg):
+        token_used = state.get("token_used", 0)
+        token_budget = state.get("token_budget", 0)
+        
+        # Check explicit alert or threshold crossing
+        if self._is_budget_exhausted(last_msg) or (token_budget > 0 and token_used > token_budget):
             return self._apply_budget_filter(state)
 
         # 2. Global Bypass
@@ -209,6 +213,10 @@ class AgentNodes:
         tool_retries = state.get("tool_retries", {}).copy()
 
         for tool_call in last_msg.tool_calls:
+            # --- SANITIZATION STEP ---
+            # Очищаем аргументы перед использованием (in-place)
+            ToolSanitizer.sanitize_tool_calls([tool_call])
+            
             t_name = tool_call["name"]
             t_args = tool_call["args"]
             t_id = tool_call["id"]
@@ -318,15 +326,29 @@ class AgentNodes:
         
         messages = state["messages"]
         
-        # Dynamic Binding
-        allowed = state.get("allowed_tools")
-        if allowed is not None:
-            selected_tools = [t for t in self.tools if t.name in allowed]
-            current_llm = self.llm.bind_tools(selected_tools)
+        # --- DYNAMIC BINDING (Simplified) ---
+        # Instead of 'allowed_tools' list, we just check if filtering is active
+        # and bind the appropriate subset.
+        
+        allowed_tools = state.get("allowed_tools")
+        
+        # If allowed_tools is explicitly None -> All tools allowed (or global bypass)
+        # If allowed_tools is a list -> Only those tools allowed
+        
+        if allowed_tools is not None:
+            # Filter tools from registry based on allowed names
+            selected_tools = [t for t in self.tools if t.name in allowed_tools]
+            if not selected_tools:
+                 # Fallback if list is empty (should not happen in 'safe' mode usually)
+                 current_llm = self.llm
+            else:
+                 current_llm = self.llm.bind_tools(selected_tools)
         else:
+            # All tools allowed
             current_llm = self.llm_with_tools
 
-        tools_available = (current_llm != self.llm)
+        # Check if tools are actually bound to prompt the model correctly
+        tools_available = (allowed_tools is None) or (len(allowed_tools) > 0)
         
         sys_msg = self._build_system_message(state.get("summary", ""), tools_available)
         full_context = [sys_msg] + messages
@@ -362,7 +384,10 @@ class AgentNodes:
             self._patch_token_usage(response, full_context)
             if response.usage_metadata:
                 current_used = state.get("token_used", 0)
-                added = response.usage_metadata.get("input_tokens", 0)
+                # Use total_tokens (input + output) for more accurate budget tracking
+                added = response.usage_metadata.get("total_tokens", 
+                    response.usage_metadata.get("input_tokens", 0) + response.usage_metadata.get("output_tokens", 0)
+                )
                 token_used_update = {"token_used": current_used + added}
 
         # Loop Guard for repeated writes

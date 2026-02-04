@@ -25,6 +25,8 @@ class NoisyLogFilter(logging.Filter):
         msg = record.getMessage()
         return not any(phrase in msg for phrase in self.BLOCKED_PHRASES)
 
+from core.constants import BASE_DIR
+
 def setup_logging(
     level: Optional[int] = None,
     log_file: Optional[str] = None
@@ -37,7 +39,9 @@ def setup_logging(
         level = getattr(logging, env_level, logging.INFO)
 
     if log_file is None:
-        log_file = os.getenv("LOG_FILE", "logs/agent.log")
+        # Используем абсолютный путь через BASE_DIR
+        rel_path = os.getenv("LOG_FILE", "logs/agent.log")
+        log_file = str(BASE_DIR / rel_path)
 
     handlers: List[logging.Handler] = []
 
@@ -86,7 +90,11 @@ def setup_logging(
     # 5. Suppress Noisy Libraries
     _suppress_library_logs(level)
 
-    return logging.getLogger("agent")
+    # 6. Ensure 'agent' logger captures everything (handlers will filter)
+    agent_logger = logging.getLogger("agent")
+    agent_logger.setLevel(logging.DEBUG)
+
+    return agent_logger
 
 def _suppress_library_logs(root_level: int):
     """

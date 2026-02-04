@@ -194,7 +194,8 @@ class ToolRegistry:
                 get_system_info, 
                 get_local_network_info,
                 run_background_process,
-                stop_background_process
+                stop_background_process,
+                find_process_by_port
             )
 
             system_tools = [
@@ -203,15 +204,25 @@ class ToolRegistry:
                 get_system_info,
                 get_local_network_info,
                 run_background_process,
-                stop_background_process
+                stop_background_process,
+                find_process_by_port
             ]
             # Mark run_background_process as safe or write? 
             # It changes system state (starts process), so 'write' might be safer, 
             # but usually we want to allow it in exploration if it's just a local server.
             # However, safety first: 'write' bucket.
             
-            self._set_capability([t for t in system_tools if t.name not in ["run_background_process", "stop_background_process"]], "safe")
-            self._set_capability([run_background_process, stop_background_process], "write")
+            # Read-only system tools
+            read_tools = [
+                get_public_ip, lookup_ip_info, get_system_info, 
+                get_local_network_info, find_process_by_port
+            ]
+            
+            # Write/Action system tools
+            write_tools = [run_background_process, stop_background_process]
+            
+            self._set_capability(read_tools, "safe")
+            self._set_capability(write_tools, "write")
             
             self.tools.extend(system_tools)
         except ImportError as e:

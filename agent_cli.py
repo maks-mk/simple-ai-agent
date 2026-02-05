@@ -384,7 +384,7 @@ async def main():
     
     model_name = temp_cfg.gemini_model if temp_cfg.provider == "gemini" else temp_cfg.openai_model
     header_info = f"[bold blue]AI Agent CLI[/]\n[dim]Model: {model_name} | Tools: {len(workflow.tools)}[/]"
-    console.print(Panel(header_info, subtitle="v7.3b"))
+    console.print(Panel(header_info, subtitle="v7.31b"))
 
     if temp_cfg.debug:
         console.print("[yellow]🐛 Debug mode enabled[/]")

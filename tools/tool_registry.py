@@ -69,9 +69,6 @@ class ToolRegistry:
         self._load_local_tools()
         self._load_search_tools()
         
-        if self.config.use_long_term_memory:
-            self._load_memory_tools()
-            
         if self.config.use_system_tools:
             self._load_system_tools()
             
@@ -129,16 +126,6 @@ class ToolRegistry:
         except ImportError:
             logger.warning("Search tools dependencies missing.")
 
-    def _load_memory_tools(self):
-        try:
-            from tools.memory_manager import MemoryManager, remember_fact, recall_facts, forget_fact
-            # Инициализируем менеджер
-            MemoryManager(db_path=self.config.memory_db_path)
-            self._set_capability([remember_fact, recall_facts, forget_fact], "safe")
-            self.tools.extend([remember_fact, recall_facts, forget_fact])
-        except ImportError:
-            logger.warning("MemoryManager not available (check dependencies).")
-            
     async def _load_mcp_tools(self):
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient

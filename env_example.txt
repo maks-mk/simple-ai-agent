@@ -1,5 +1,5 @@
 # ===========================
-# .env example (v6.5b)
+# .env example (v7.31b)
 # ===========================
 #
 # ВНИМАНИЕ:
@@ -18,9 +18,7 @@ MODEL_SUPPORTS_TOOLS=true
 ENABLE_SEARCH_TOOLS=true
 ENABLE_SYSTEM_TOOLS=true
 ENABLE_MEDIA_TOOLS=false
-LONG_TERM_MEMORY=false
-SAFETY_GUARD_ENABLED=true
-ENABLE_TOOL_FILTERING=true
+SAFETY_GUARD_ENABLED=false
 
 # Логи/отладка
 DEBUG=false

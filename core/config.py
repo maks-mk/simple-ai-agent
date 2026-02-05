@@ -23,7 +23,6 @@ class AgentConfig(BaseSettings):
     # Paths
     prompt_path: Path = Field(default=BASE_DIR / "prompt.txt", alias="PROMPT_PATH")
     mcp_config_path: Path = BASE_DIR / "mcp.json"
-    memory_db_path: str = str(BASE_DIR / "memory_db")
     
     # Provider Settings
     provider: Literal["gemini", "openai"] = "gemini"
@@ -48,7 +47,6 @@ class AgentConfig(BaseSettings):
     enable_deep_search: bool = Field(default=False, alias="DEEP_SEARCH")
     enable_search_tools: bool = Field(default=True, alias="ENABLE_SEARCH_TOOLS")
     model_supports_tools: bool = Field(default=True, alias="MODEL_SUPPORTS_TOOLS")
-    use_long_term_memory: bool = Field(default=False, alias="LONG_TERM_MEMORY")
     use_system_tools: bool = Field(default=True, alias="ENABLE_SYSTEM_TOOLS")
     enable_media_tools: bool = Field(default=False, alias="ENABLE_MEDIA_TOOLS")
     safety_guard_enabled: bool = Field(default=True, alias="SAFETY_GUARD_ENABLED")

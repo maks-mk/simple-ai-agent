@@ -18,17 +18,13 @@ httpx
 langchain-mcp-adapters
 mcp
 
-# --- MEMORY (RAG) ---
-# Векторная база данных и эмбеддинги для памяти
-chromadb
-sentence-transformers
 
 # --- UTILS ---
 # Загрузка .env
 python-dotenv
 # Подсчет токенов (используется в agent.py для логики сжатия)
 tiktoken
-yt-dlp
+#yt-dlp
 
 # --- UI / CLI ---
 rich

@@ -16,6 +16,7 @@ pyinstaller --name "ai_agent" --onefile --clean ^
  --hidden-import=pydantic.deprecated.decorator ^
  --hidden-import=langchain_community.vectorstores ^
  --hidden-import=langchain_community.embeddings ^
+ --icon=icon.ico ^
  agent_cli.py
 
 pause

@@ -1,6 +1,5 @@
 import sys
 import os
-import shutil
 import asyncio
 import warnings
 import time
@@ -31,14 +30,12 @@ from rich.syntax import Syntax
 
 # --- PROMPT IMPORTS ---
 from prompt_toolkit import PromptSession
-from prompt_toolkit.styles import Style
 from prompt_toolkit.lexers import PygmentsLexer
 from pygments.lexers.markup import MarkdownLexer
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.completion import WordCompleter, PathCompleter, Completer
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.shortcuts import CompleteStyle
 
 # --- LANGCHAIN IMPORTS ---
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, AIMessageChunk, SystemMessage
@@ -91,12 +88,11 @@ class StreamProcessor:
         self.status_text = "Thinking..."
         self.start_time = time.time()
 
-    async def run(self, agent_app, user_input: str, thread_id: str, max_loops: int, token_budget: int = 0):
+    async def run(self, agent_app, user_input: str, thread_id: str, max_loops: int):
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": max_loops * 4}
         initial_state = {
             "messages": [HumanMessage(content=user_input)], 
             "steps": 0,
-            "token_budget": token_budget, 
             "token_used": 0 
         }
         
@@ -148,49 +144,60 @@ class StreamProcessor:
         msg, metadata = payload
         node = metadata.get("langgraph_node")
         self.tracker.update_from_message(msg)
-        
-        if isinstance(msg, SystemMessage):
-            self._handle_system_message(msg, node, live)
             
         if node == "agent" and isinstance(msg, (AIMessage, AIMessageChunk)):
             if msg.tool_calls:
                 self._commit_printed_text(live)
-                # Removed eager printing to prevent empty/partial tool calls
             
             if msg.content:
                 chunk = self._extract_text_content(msg.content)
                 self.full_text += chunk
-                # Removed eager commit on newline to allow code blocks to complete
+                self._try_commit(live)
 
         elif node == "tools" and isinstance(msg, ToolMessage):
             self._handle_tool_result(msg, live)
 
-    def _handle_system_message(self, msg: SystemMessage, node: str, live: Live):
-        content = str(msg.content)
-        target = live.console if live else self.console
-        
-        if "SYSTEM ALERT" in content:
-            # Extract the error part for cleaner display
-            clean_err = content.replace("SYSTEM ALERT:", "").strip().split("\n")[0]
-            target.print(Padding(f"[bold red]⚠ System Alert:[/][red] {clean_err}[/]", (0, 0, 0, 4)))
-            self.status_text = "Self-correcting..."
-            
-        elif "REFLECTION" in content:
-            target.print(Padding(f"[bold yellow]↺ Reflection:[/][yellow italic] Adjusting strategy...[/]", (0, 0, 0, 4)))
-            self.status_text = "Reflecting..."
-
-    def _commit_printed_text(self, live: Optional[Live]):
+    def _commit_printed_text(self, live: Optional[Live], end_index: int = None):
         """Переносит текст из динамического Live в статический лог консоли."""
         _, clean_full, _ = parse_thought(self.full_text)
-        if len(clean_full) > self.printed_len:
-            new_text = clean_full[self.printed_len:]
-            # Do not strip to preserve markdown structure
-            cleaned_chunk = clean_markdown_text(new_text)
-            formatted_content = self._extract_and_format_code(cleaned_chunk)
+        
+        limit = end_index if end_index is not None else len(clean_full)
+        if limit > self.printed_len:
+            new_text = clean_full[self.printed_len:limit]
+            # Do not strip/clean to preserve code block structure exactly as generated
+            formatted_content = self._extract_and_format_code(new_text)
             
             target = live.console if live else self.console
             target.print(Padding(formatted_content, (0, 0, 0, 2)))
-            self.printed_len = len(clean_full)
+            self.printed_len = limit
+
+    def _try_commit(self, live: Live):
+        """Пытается зафиксировать текст, если это безопасно (построчно и не внутри кода)."""
+        _, clean_full, _ = parse_thought(self.full_text)
+        if len(clean_full) <= self.printed_len: return
+        
+        # 1. Do not commit if we are inside a code block (wait for it to close)
+        if self._is_open_code_block(clean_full): return
+        
+        # 2. Only commit complete lines to avoid breaking Markdown paragraphs or words
+        pending = clean_full[self.printed_len:]
+        last_newline = pending.rfind('\n')
+        
+        if last_newline != -1:
+            # Commit up to the last newline (inclusive)
+            commit_len = last_newline + 1
+            candidate_text = pending[:commit_len]
+            
+            # 3. Verify the candidate slice doesn't split a code block
+            # If the slice has an odd number of backticks, it means we are splitting inside a block
+            if self._is_open_code_block(candidate_text):
+                return
+                
+            self._commit_printed_text(live, end_index=self.printed_len + commit_len)
+
+    def _is_open_code_block(self, text: str) -> bool:
+        """Проверяет, находится ли текст внутри открытого блока кода (нечетное число ```)."""
+        return text.count("```") % 2 != 0
 
     def _extract_text_content(self, content: Any) -> str:
         if isinstance(content, str): return content
@@ -256,20 +263,41 @@ class StreamProcessor:
         return (arg_str[:47] + "...") if len(arg_str) > 50 else arg_str
 
     def _extract_and_format_code(self, text: str) -> Group:
-        # Improved regex to handle optional spaces, various newlines, and loose language identifiers
-        pattern = r'```[ \t]*(\w*)?[ \t]*(?:\r?\n|\r)(.*?)```'
+        # Simplified regex to capture everything between backticks
+        # We parse the language manually from the content
+        pattern = r'```(.*?)```'
         parts = []
         last_end = 0
         
         for match in re.finditer(pattern, text, re.DOTALL):
             if match.start() > last_end:
                 pre_text = text[last_end:match.start()]
-                if pre_text.strip(): parts.append(Markdown(pre_text, code_theme="ansi_dark"))
+                if pre_text.strip(): parts.append(Markdown(pre_text, code_theme="dracula"))
             
-            lang = match.group(1) or "text"
-            code = match.group(2)
+            content = match.group(1)
+            lang = "text"
+            code = content
             
-            # Simple heuristic to detect language if not specified
+            # Try to extract language from the first line or word
+            # Handle cases like "python\n", "python code", or just "\n"
+            if content:
+                # Split only on the first newline/space to separate lang tag
+                # We need to be careful: "python\ncode" vs "code"
+                # Heuristic: if starts with newline, no lang.
+                # If starts with word chars then space/newline, that's lang.
+                
+                first_match = re.match(r'^[ \t]*(\w+)(?:\s|$)(.*)', content, re.DOTALL)
+                if first_match:
+                    possible_lang = first_match.group(1)
+                    rest = first_match.group(2)
+                    
+                    # Verify it's a valid-looking lang (not just code)
+                    # Common langs or short identifiers
+                    if len(possible_lang) < 15: 
+                        lang = possible_lang
+                        code = rest
+            
+            # Auto-detection fallback if lang is still text
             if lang == "text" and code.strip():
                 first_line = code.strip().split('\n')[0]
                 if any(kw in first_line for kw in ['def ', 'class ', 'import ', 'print(', 'if __name__']): lang = "python"
@@ -280,58 +308,23 @@ class StreamProcessor:
                 elif '<' in first_line and '>' in first_line: lang = "html"
                 elif '{' in first_line and '}' in first_line: lang = "json"
             
-            # Add padding to code blocks for better readability
-            # Use 'ansi_dark' which usually looks better on dark terminals than monokai
-            syntax = Syntax(code, lang, theme="ansi_dark", line_numbers=True, word_wrap=True, padding=(1, 2))
+            # Strip leading newline from code if present (common after lang tag)
+            if code.startswith('\n'): code = code[1:]
+            elif code.startswith('\r\n'): code = code[2:]
+            
+            syntax = Syntax(code, lang, theme="dracula", line_numbers=True, word_wrap=True, padding=(1, 2))
             parts.append(syntax)
             last_end = match.end()
             
         if last_end < len(text):
             remaining = text[last_end:]
-            if remaining.strip(): parts.append(Markdown(remaining, code_theme="ansi_dark"))
+            if remaining.strip(): parts.append(Markdown(remaining, code_theme="dracula"))
             
-        return Group(*parts) if parts else Group(Markdown(text, code_theme="ansi_dark"))
+        return Group(*parts) if parts else Group(Markdown(text, code_theme="dracula"))
 
 # ======================================================
-# UI HELPERS (RESTORED)
+# UI HELPERS
 # ======================================================
-
-def render_chat_history(console: Console, messages: List[Any]):
-    if not messages: return
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            console.print(Padding(Panel(Markdown(str(msg.content).strip()), title="[user.say]You[/]", title_align="right", border_style="green", padding=(0, 1), subtitle_align="right"), (1, 0, 1, 4)))
-            
-        elif isinstance(msg, AIMessage):
-            # Parse thought to hide it or show it differently
-            thought, content, _ = parse_thought(str(msg.content))
-            
-
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    name = tc.get("name", "tool")
-                    console.print(Padding(f"🔧 [tool.name]{name}[/] [dim]...[/]", (0, 0, 0, 8)))
-
-            # 2. Content
-            if content.strip():
-                console.print(Padding(Panel(
-                    Markdown(content.strip()),
-                    title="[agent.say]Agent[/]",
-                    title_align="left",
-                    border_style="blue",
-                    padding=(0, 1)
-                ), (0, 4, 1, 0)))
-                
-        elif isinstance(msg, ToolMessage):
-            # Show tool result compactly
-            name = msg.name or "tool"
-            content = str(msg.content)
-            is_error = getattr(msg, "status", "") == "error" or content.startswith(("Error", "Ошибка"))
-            summary = format_tool_output(name, content, is_error)
-            
-            style = "tool.error" if is_error else "tool.result"
-            icon = "❌" if is_error else "└─"
-            console.print(Padding(f"[{style}]{icon} {summary}[/]", (0, 0, 0, 8)))
 
 def get_prompt_message():
     cwd = Path.cwd()
@@ -359,7 +352,7 @@ def show_help(workflow: AgentWorkflow):
     console.print(Panel(table, title="[bold blue]Available Tools[/]"))
 
 # ======================================================
-# MAIN (RESTORED LOGIC)
+# MAIN
 # ======================================================
 
 async def main():
@@ -369,10 +362,6 @@ async def main():
     # 1. Load Config
     try:
         temp_cfg = AgentConfig()
-        
-        # Re-initialize logging with config values
-        # If debug is False, show only WARNING+ in console to keep UI clean.
-        # File logs will still capture everything down to DEBUG because file_handler is configured independently.
         log_level = logging.DEBUG if temp_cfg.debug else logging.WARNING
         setup_logging(level=log_level)
         
@@ -395,7 +384,7 @@ async def main():
     
     model_name = temp_cfg.gemini_model if temp_cfg.provider == "gemini" else temp_cfg.openai_model
     header_info = f"[bold blue]AI Agent CLI[/]\n[dim]Model: {model_name} | Tools: {len(workflow.tools)}[/]"
-    console.print(Panel(header_info, subtitle="v7.2b"))
+    console.print(Panel(header_info, subtitle="v7.2b (Refactored)"))
 
     if temp_cfg.debug:
         console.print("[yellow]🐛 Debug mode enabled[/]")
@@ -435,32 +424,53 @@ async def main():
             # Auto-fix for interrupted tool calls
             try:
                 config = {"configurable": {"thread_id": thread_id}}
-                # get_state returns StateSnapshot which is not awaitable in some versions or context
-                # But here it seems to be an async method in the compiled graph? 
-                # Actually, compiled graph .get_state() is async.
-                current_state = await agent_app.get_state(config)
+                current_state = agent_app.get_state(config)
                 
-                # StateSnapshot object behaves like a named tuple/object
-                if current_state and hasattr(current_state, "values") and current_state.values:
+                if current_state and current_state.values:
                     messages = current_state.values.get("messages", [])
                     if messages:
-                        last_msg = messages[-1]
-                        if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
-                            console.print("[yellow]⚠ Detected interrupted tool execution. Auto-fixing history...[/]")
-                            tool_msgs = []
-                            for tc in last_msg.tool_calls:
-                                tool_msgs.append(ToolMessage(
-                                    tool_call_id=tc["id"],
-                                    content="Error: Execution interrupted by user.",
-                                    name=tc["name"]
-                                ))
-                            await agent_app.update_state(config, {"messages": tool_msgs}, as_node="tools")
+                        # Find the last AIMessage with tool calls
+                        last_ai_msg = None
+                        last_ai_idx = -1
+                        for i in range(len(messages) - 1, -1, -1):
+                            m = messages[i]
+                            if isinstance(m, (AIMessage, AIMessageChunk)) and m.tool_calls:
+                                last_ai_msg = m
+                                last_ai_idx = i
+                                break
+                        
+                        if last_ai_msg:
+                            # Gather existing ToolMessages after this AIMessage
+                            existing_tool_outputs = set()
+                            for j in range(last_ai_idx + 1, len(messages)):
+                                m = messages[j]
+                                if isinstance(m, ToolMessage):
+                                    existing_tool_outputs.add(m.tool_call_id)
+                            
+                            # Identify missing responses
+                            missing_tool_calls = []
+                            for tc in last_ai_msg.tool_calls:
+                                if tc["id"] not in existing_tool_outputs:
+                                    missing_tool_calls.append(tc)
+                            
+                            if missing_tool_calls:
+                                console.print(f"[dim]⚠ Detected {len(missing_tool_calls)} interrupted tool execution(s). Filling gaps...[/]")
+                                tool_msgs = []
+                                for tc in missing_tool_calls:
+                                    tool_msgs.append(ToolMessage(
+                                        tool_call_id=tc["id"],
+                                        content="Error: Execution interrupted by user.",
+                                        name=tc["name"]
+                                    ))
+                                # update_state returns a dict, not awaitable in some versions
+                                agent_app.update_state(config, {"messages": tool_msgs}, as_node="tools")
+                                console.print("[dim]✔ History repaired (filled gaps). Ready for new input.[/]")
             except Exception as e:
-                # logger.warning(f"State repair failed: {e}")
+                # Silently fail or log debug if state repair fails, to not block the user
                 pass
 
             processor = StreamProcessor(console)
-            last_stats = await processor.run(agent_app, user_input, thread_id, temp_cfg.max_loops, token_budget=temp_cfg.token_budget)
+            last_stats = await processor.run(agent_app, user_input, thread_id, temp_cfg.max_loops)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             continue

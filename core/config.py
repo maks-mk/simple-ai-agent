@@ -43,7 +43,6 @@ class AgentConfig(BaseSettings):
     # Common Logic
     temperature: float = 0.2
     max_loops: int = Field(default=15, description="Limit steps per request")
-    token_budget: int = Field(default=30000, alias="TOKEN_BUDGET")
     
     # Features Toggle
     enable_deep_search: bool = Field(default=False, alias="DEEP_SEARCH")
@@ -105,10 +104,6 @@ class AgentConfig(BaseSettings):
                 model=self.openai_model,
                 temperature=self.temperature,
                 api_key=self.openai_api_key.get_secret_value(),
-                base_url=self.openai_base_url,
-                stream_usage=True,
-                model_kwargs={
-                    "stream_options": {"include_usage": True}
-                }  
+                base_url=self.openai_base_url
             )
         raise ValueError(f"Unknown provider: {self.provider}")

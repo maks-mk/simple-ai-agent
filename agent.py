@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import List, Optional, Dict
+from typing import List, Optional
 from dotenv import load_dotenv
 
 from langchain_core.language_models import BaseChatModel
@@ -36,8 +36,6 @@ class AgentWorkflow:
         self.llm: Optional[BaseChatModel] = None
         self.llm_with_tools: Optional[BaseChatModel] = None
         
-        # Caches
-        self.tool_buckets = {"safe": [], "write": []}
         self.nodes: Optional[AgentNodes] = None
 
     async def initialize_resources(self):
@@ -47,11 +45,7 @@ class AgentWorkflow:
         self.llm = self.config.get_llm()
         await self.tool_registry.load_all()
         
-        # 1. Classify tools
-        self.tool_buckets = self._classify_tools()
-        logger.info(f"🧠 Tool Capabilities: {len(self.tool_buckets['safe'])} safe, {len(self.tool_buckets['write'])} write.")
-        
-        # 2. Bind tools if supported
+        # Bind tools if supported
         can_use_tools = self.config.check_tool_support()
         
         if self.tool_registry.tools and can_use_tools:
@@ -66,25 +60,13 @@ class AgentWorkflow:
                 logger.debug("⚠️ Tools disabled: Model does not support tool calling.")
             self.llm_with_tools = self.llm
 
-        # 3. Initialize Nodes
+        # Initialize Nodes
         self.nodes = AgentNodes(
             config=self.config,
             llm=self.llm,
             tools=self.tools,
-            tool_buckets=self.tool_buckets,
             llm_with_tools=self.llm_with_tools
         )
-
-    def _classify_tools(self) -> Dict[str, List[str]]:
-        """Separates tools into safe (read-only) and write (action) buckets."""
-        buckets = {"safe": [], "write": []}
-        for t in self.tools:
-            capability = self.tool_registry.get_tool_capability(t)
-            if capability == "write":
-                buckets["write"].append(t.name)
-            else:
-                buckets["safe"].append(t.name)
-        return buckets
 
     @property
     def tools(self) -> List[BaseTool]:
@@ -97,22 +79,16 @@ class AgentWorkflow:
         workflow = StateGraph(AgentState)
 
         workflow.add_node("summarize", self.nodes.summarize_node)
-        workflow.add_node("tool_filter", self.nodes.tool_filter_node)
         workflow.add_node("agent", self.nodes.agent_node)
-        workflow.add_node("loop_guard", self.nodes.loop_guard_node)
         workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
-        workflow.add_node("tools", self.nodes.tools_and_validate_node)
-        workflow.add_node("reflection", self.nodes.reflection_node)
-        workflow.add_node("token_budget_guard", self.nodes.token_budget_guard_node)
+        workflow.add_node("tools", self.nodes.tools_node)
 
         tools_enabled = bool(self.tools) and self.config.check_tool_support()
 
+        # Simple Linear Flow: Start -> Summarize -> Update Step -> Agent -> [Tools -> Agent] or End
         workflow.add_edge(START, "summarize")
         workflow.add_edge("summarize", "update_step")
-        
-        workflow.add_edge("update_step", "token_budget_guard")
-        workflow.add_edge("token_budget_guard", "tool_filter")
-        workflow.add_edge("tool_filter", "agent")
+        workflow.add_edge("update_step", "agent")
 
         def should_continue(state: AgentState):
             steps = state.get("steps", 0)
@@ -120,31 +96,21 @@ class AgentWorkflow:
 
             if steps >= self.config.max_loops:
                 logger.debug(f"🛑 Loop Guard: {steps} steps.")
-                return "loop_guard"
+                return END
 
             if not messages: return "agent"
             last_msg = messages[-1]
 
-            # Redirect system alerts back to agent
-            if isinstance(last_msg, SystemMessage):
-                content = str(last_msg.content)
-                if any(tag in content for tag in ("SYSTEM ALERT", "REFLECTION", "TOKEN BUDGET ALERT")):
-                    return "agent"
-                return END
-
             if tools_enabled and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
                 return "tools"
-            if isinstance(last_msg, ToolMessage): return "agent"
+            
+            # If agent returns content without tool calls, we stop (or wait for user input in CLI loop)
             return END
 
-        destinations = ["tools", "loop_guard", "agent", END] if tools_enabled else ["loop_guard", END]
-        workflow.add_conditional_edges("agent", should_continue, destinations)
-
+        workflow.add_conditional_edges("agent", should_continue, ["tools", END])
+        
         if tools_enabled:
-            workflow.add_edge("tools", "reflection")
-            workflow.add_edge("reflection", "tool_filter")
-
-        workflow.add_edge("loop_guard", END)
+            workflow.add_edge("tools", "agent")
 
         return workflow.compile(checkpointer=MemorySaver())
 

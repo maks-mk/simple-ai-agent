@@ -122,15 +122,22 @@ def get_key_bindings():
 class TokenTracker:
     def __init__(self):
         self.max_input = 0
-        self.total_output = 0
-        self._seen_ids = set()
+        self._usage_map: Dict[str, int] = {}  # msg_id -> output_tokens
         self._streaming_text = "" 
-        self.source_label = "Provider" 
+        self.source_label = "Est" 
 
     def update_from_message(self, msg: Any):
+        """
+        Обновляет счетчики на основе сообщения (чанка или полного).
+        Использует гибридный подход: 
+        1. Метаданные (если есть) - сохраняем по ID сообщения.
+        2. Текст (streaming) - накапливаем для оценки.
+        """
+        # 1. Update Metadata
         if hasattr(msg, "usage_metadata") and msg.usage_metadata:
             self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None), msg)
         
+        # 2. Accumulate Text for Estimation
         if isinstance(msg, (AIMessage, AIMessageChunk)):
             content = msg.content
             chunk = ""
@@ -138,10 +145,13 @@ class TokenTracker:
             elif isinstance(content, list):
                 chunk = "".join(x.get("text", "") for x in content if isinstance(x, dict))
             
-            if isinstance(msg, AIMessageChunk): self._streaming_text += chunk
-            elif not msg.usage_metadata: self._streaming_text = chunk
+            # Всегда накапливаем текст для независимой оценки
+            self._streaming_text += chunk
 
     def update_from_node_update(self, update: Dict):
+        """
+        Обновляет счетчики из обновления состояния (обычно содержит полные сообщения с метаданными).
+        """
         agent_data = update.get("agent")
         if not agent_data: return
         messages = agent_data.get("messages", [])
@@ -151,13 +161,7 @@ class TokenTracker:
                 self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None), msg)
 
     def _apply_metadata(self, usage: Dict, msg_id: str = None, msg: Any = None):
-        # DEBUG: Print incoming usage
-        #print(f"DEBUG: Token Update | ID: {msg_id} | Usage: {usage}")
-        
-        is_new = True
-        if msg_id and msg_id in self._seen_ids: is_new = False
-        
-        # Check source in usage_metadata OR additional_kwargs
+        # Check source
         source = usage.get("token_source")
         if not source and msg and hasattr(msg, "additional_kwargs"):
             source = msg.additional_kwargs.get("token_source")
@@ -170,21 +174,47 @@ class TokenTracker:
         
         out_t = usage.get("output_tokens", 0)
         if out_t > 0:
-            if is_new:
-                self.total_output += out_t
-                if msg_id: self._seen_ids.add(msg_id)
-                self._streaming_text = ""
+            if msg_id:
+                # Store usage per message ID.
+                # Assuming cumulative updates from provider (standard for LangChain usage_metadata).
+                # Even if delta, max() is safer than sum() for unknown behavior, 
+                # but typically usage_metadata IS the total for that message.
+                current = self._usage_map.get(msg_id, 0)
+                if out_t > current:
+                    self._usage_map[msg_id] = out_t
+                    self.source_label = "Provider"
+            else:
+                # No ID (rare) - ignore to avoid double counting or implementation complexity
+                pass
 
     def render(self, duration: float) -> str:
-        display_out = self.total_output
-        
-        # Fallback estimation for providers that don't return usage stats
-        if self.total_output == 0 and self._streaming_text:
-            self.source_label = "Manual/Est"
+        # 1. Calculate Estimate
+        est = 0
+        if self._streaming_text:
             if _ENCODER:
                 est = len(_ENCODER.encode(self._streaming_text))
             else:
                 est = len(self._streaming_text) // 3
+        
+        # 2. Calculate Total Metadata Output
+        total_output_metadata = sum(self._usage_map.values())
+        
+        # 3. Hybrid Decision Logic
+        display_out = 0
+        label = self.source_label
+
+        if total_output_metadata > 0:
+            # Если метаданные есть, но они подозрительно малы по сравнению с эстимейтом (например < 20%)
+            # Это признак того, что провайдер вернул токены только за последний чанк/сообщение, а не за все.
+            # (как в случае с Out: 4 при большом тексте)
+            if est > 100 and total_output_metadata < (est * 0.2):
+                 display_out = est
+                 label = "Hybrid/Est"
+            else:
+                 display_out = total_output_metadata
+                 label = "Provider"
+        else:
             display_out = est
-            
-        return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out} [dim]({self.source_label})[/]"
+            label = "Est"
+
+        return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out} [dim]({label})[/]"

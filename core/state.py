@@ -1,31 +1,19 @@
-from typing import TypedDict, Annotated, Optional, List, Dict, Any
+from typing import TypedDict, Annotated, List
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 class AgentState(TypedDict):
     """
-    Состояние графа агента.
+    Simplified Agent State.
     """
-    # История сообщений (автоматически склеивается через add_messages)
+    # Message history
     messages: Annotated[List[BaseMessage], add_messages]
     
-    # Сжатая память (саммари)
+    # Compressed memory
     summary: str
     
-    # Счетчик шагов (для защиты от бесконечных циклов)
+    # Step counter
     steps: int
     
-    # --- validation support ---
-    # Последний вызов инструмента для валидации
-    last_tool_call: Optional[Dict[str, Any]]
-    
-    # Счетчик попыток исправления ошибок для каждого инструмента
-    tool_retries: Dict[str, int]
-    
-    # Список имен инструментов, разрешенных на этом шаге
-    # Если None — разрешены все.
-    allowed_tools: Optional[List[str]]
-
-    # --- token budget ---
+    # Token usage tracking
     token_used: int
-    token_budget: int

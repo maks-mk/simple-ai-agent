@@ -34,31 +34,8 @@ INTENT_HINTS = (
     "add", "insert", "modify", "fix", "replace", "patch"
 )
 
-# Safety Guard Lists
-DESTRUCTIVE_ROOTS = {'delete', 'remove', 'unlink', 'rmdir', 'format'}
-WRITE_ROOTS = {'write', 'save', 'append', 'edit', 'store', 'update', 'replace', 'move', 'create', 'mkdir', 'put', 'post', 'send', 'upload'} | DESTRUCTIVE_ROOTS
+# Safety Guard Lists - REMOVED (Dead Code)
 
-CREATIVE_TRIGGERS = {
-    "script", "story", "poem", "essay", "joke", 
-    "guide", "tutorial", "instruction", "example",
-    "draft", "template", "boilerplate",
-    "write a python script", "create a bash script",
-    # Русские триггеры
-    "скрипт", "код", "программу", "стих", "истори", "сказк", 
-    "пример", "инструкци", "гайд", "черновик", "шаблон",
-    "напиши", "создай", "сгенерируй"
-}
-
-RETRIEVAL_WHITELIST = {
-    'search', 'read', 'fetch', 'get', 'query', 
-    'load', 'list', 'retrieve', 'browse', 'ask', 'lookup',
-    'deep_search'
-}
-
-MODIFICATION_BLACKLIST = {
-    'write', 'save', 'edit', 'append', 'delete', 
-    'remove', 'update', 'put', 'post', 'send', 'upload'
-}
 
 FATAL_ERRORS = ["401", "unauthorized", "quota", "billing", "context_length_exceeded"]
 

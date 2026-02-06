@@ -49,8 +49,6 @@ class AgentConfig(BaseSettings):
     model_supports_tools: bool = Field(default=True, alias="MODEL_SUPPORTS_TOOLS")
     use_system_tools: bool = Field(default=True, alias="ENABLE_SYSTEM_TOOLS")
     enable_media_tools: bool = Field(default=False, alias="ENABLE_MEDIA_TOOLS")
-    safety_guard_enabled: bool = Field(default=True, alias="SAFETY_GUARD_ENABLED")
-    enable_tool_filtering: bool = Field(default=True, alias="ENABLE_TOOL_FILTERING")
     
     # Summarization
     summary_threshold: int = Field(default=20, alias="SESSION_SIZE")

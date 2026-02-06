@@ -21,8 +21,8 @@ def clean_markdown_text(text: str) -> str:
     if not text: return text
     # Схлопываем множественные переносы
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # Убираем пустую строку перед элементами списка
-    text = re.sub(r'\n\s*\n(\s*[•\-\*]|\d+\.)', r'\n\1', text)
+    # Убираем пустую строку перед элементами списка - REMOVED to fix list rendering
+    # text = re.sub(r'\n\s*\n(\s*[•\-\*]|\d+\.)', r'\n\1', text)
     return text
 
 def parse_thought(text: str) -> Tuple[str, str, bool]:

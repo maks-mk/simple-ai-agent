@@ -179,13 +179,15 @@ class StreamProcessor:
         # 1. Do not commit if we are inside a code block (wait for it to close)
         if self._is_open_code_block(clean_full): return
         
-        # 2. Only commit complete lines to avoid breaking Markdown paragraphs or words
+        # 2. Only commit complete blocks (paragraphs) to ensure correct Markdown rendering
+        # We wait for double newline (\n\n) to preserve block formatting (tables, lists, etc.)
         pending = clean_full[self.printed_len:]
-        last_newline = pending.rfind('\n')
+        last_newline = pending.rfind('\n\n')
         
         if last_newline != -1:
-            # Commit up to the last newline (inclusive)
-            commit_len = last_newline + 1
+            # Commit up to the newline (inclusive of the first \n, but keep spacing clean)
+            commit_len = last_newline + 2 # Include both \n\n
+
             candidate_text = pending[:commit_len]
             
             # 3. Verify the candidate slice doesn't split a code block

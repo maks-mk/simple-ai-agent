@@ -4,7 +4,6 @@ chcp 65001 > nul
 pyinstaller --name "ai_agent" --onefile --clean ^
  --collect-all tiktoken ^
  --collect-all langchain ^
- --collect-all langchain_community ^
  --collect-all langchain_openai ^
  --collect-all langchain_google_genai ^
  --collect-all rich ^

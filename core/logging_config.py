@@ -106,7 +106,8 @@ def _suppress_library_logs(root_level: int):
         "langchain", "langchain_core", "langgraph", "langchain_mcp_adapters",
         "mcp", "pydantic", "jsonschema", "chromadb", 
         "hnswlib", "sentence_transformers", "filelock",
-        "grpc", "grpc._cython", "multipart"
+        "grpc", "grpc._cython", "multipart",
+        "markdown_it", "markdown_it.rules_block", "markdown_it.rules_inline"
     ]
     
     lib_level = logging.WARNING if root_level == logging.DEBUG else logging.ERROR

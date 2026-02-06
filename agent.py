@@ -41,6 +41,7 @@ class AgentWorkflow:
     async def initialize_resources(self):
         """Initializes LLM, Tools and Nodes."""
         logger.info(f"Initializing agent: [bold cyan]{self.config.provider}[/]", extra={"markup": True})
+        logger.debug(f"Prompt Path: {self.config.prompt_path.absolute()}")
         
         self.llm = self.config.get_llm()
         await self.tool_registry.load_all()

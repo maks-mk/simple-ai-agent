@@ -14,7 +14,6 @@ from langgraph.checkpoint.memory import MemorySaver
 from core.constants import BASE_DIR
 from core.config import AgentConfig
 from core.state import AgentState
-from core.utils import AgentUtils
 from core.logging_config import setup_logging
 from core.nodes import AgentNodes
 from tools.tool_registry import ToolRegistry
@@ -30,7 +29,6 @@ class AgentWorkflow:
     def __init__(self):
         load_dotenv(BASE_DIR / '.env')
         self.config = AgentConfig()
-        self.utils = AgentUtils()
         self.tool_registry = ToolRegistry(self.config)
         
         self.llm: Optional[BaseChatModel] = None
@@ -111,7 +109,9 @@ class AgentWorkflow:
         workflow.add_conditional_edges("agent", should_continue, ["tools", END])
         
         if tools_enabled:
-            workflow.add_edge("tools", "agent")
+            # Fix Loop Logic: tools -> update_step -> agent
+            # This ensures steps are incremented even inside the tool loop
+            workflow.add_edge("tools", "update_step")
 
         return workflow.compile(checkpointer=MemorySaver())
 

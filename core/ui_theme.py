@@ -29,8 +29,3 @@ AGENT_THEME = Theme({
     # Code
     "code.block": Style(color="white"),
 })
-
-# Helper function to get the console with theme
-def get_console():
-    from rich.console import Console
-    return Console(theme=AGENT_THEME)

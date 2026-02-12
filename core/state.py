@@ -15,5 +15,5 @@ class AgentState(TypedDict):
     # Step counter
     steps: int
     
-    # Token usage tracking
-    token_used: int
+    # Token usage tracking (Last step usage)
+    token_usage: dict

@@ -11,9 +11,6 @@ from langchain_core.tools import BaseTool
 
 from core.state import AgentState
 from core.config import AgentConfig
-from core.utils import AgentUtils
-from core.tool_validator import validate_tool_execution
-from core.tool_sanitizer import ToolSanitizer
 from core import constants
 
 logger = logging.getLogger("agent")
@@ -24,7 +21,6 @@ class AgentNodes:
         self.llm = llm
         self.tools = tools
         self.llm_with_tools = llm_with_tools or llm
-        self.utils = AgentUtils()
 
     # --- NODE: SUMMARIZE ---
     
@@ -98,20 +94,16 @@ class AgentNodes:
         self._ensure_usage_metadata(response, full_context)
 
         # Token Updates
-        token_used_update = {}
+        token_usage_update = {}
         if isinstance(response, AIMessage):
             # No need to call _update_token_usage separately if we rely on metadata now
             # But let's keep it consistent with existing state logic
             if response.usage_metadata:
-                 token_used_update = {"token_used": response.usage_metadata.get("total_tokens", 0)}
-
-        # Sanitize tool calls
-        if isinstance(response, AIMessage) and response.tool_calls:
-            ToolSanitizer.sanitize_tool_calls(response.tool_calls)
+                 token_usage_update = {"token_usage": response.usage_metadata}
 
         return {
             "messages": [response],
-            **token_used_update
+            **token_usage_update
         }
 
     # --- NODE: TOOLS ---
@@ -124,28 +116,34 @@ class AgentNodes:
             return {}
             
         final_messages = []
+        has_error = False
 
         for tool_call in last_msg.tool_calls:
-            # Sanitize (just in case)
-            ToolSanitizer.sanitize_tool_calls([tool_call])
-            
             t_name = tool_call["name"]
             t_args = tool_call["args"]
             t_id = tool_call["id"]
             
             # Execute
             content = await self._execute_tool(t_name, t_args)
-            tool_msg = ToolMessage(content=content, tool_call_id=t_id, name=t_name)
-
-            # Validate
-            result = validate_tool_execution(tool_msg, t_args, t_name)
             
-            if not result["is_valid"]:
-                logger.debug(f"Tool Error ({t_name}): {result['error_message']}")
-                # Append error info to content so LLM sees it
-                tool_msg.content = f"Error: {result['error_message']}\nSystem Hint: Please verify arguments and retry."
+            # Check for error signature
+            if content.startswith("Error:") or content.startswith("Ошибка:"):
+                has_error = True
+
+            # Truncate output to avoid context window explosion
+            # 4000 chars ~ 1000 tokens. This is a safe limit for tool outputs.
+            MAX_TOOL_OUTPUT = 4000
+            if len(content) > MAX_TOOL_OUTPUT:
+                content = content[:MAX_TOOL_OUTPUT] + f"\n... [Output truncated. Total length: {len(content)} chars]"
+
+            tool_msg = ToolMessage(content=content, tool_call_id=t_id, name=t_name)
             
             final_messages.append(tool_msg)
+
+        if has_error:
+            # Inject reflection prompt to guide the agent
+            reflection_msg = HumanMessage(content=constants.REFLECTION_PROMPT)
+            final_messages.append(reflection_msg)
 
         return {
             "messages": final_messages,

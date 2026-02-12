@@ -6,11 +6,17 @@
     "enabled": true
   },
   "win-cli": {
-    "command": "npx",
-    "args": ["@simonb97/server-win-cli", "--config", "./win-cli-config.json"],
+    "command": "server-win-cli",
+    "args": ["--config", "./win-cli-config.json"],
     "transport": "stdio",
-    "enabled": true
+    "enabled": false
   },
+  "mcp-cli-exec": {
+      "command": "mcp-cli-exec",
+      "args": [""],
+      "transport": "stdio",
+	  "enabled": true
+	},
   "context7": {
     "type": "remote",
     "url": "https://mcp.context7.com/mcp",
@@ -20,10 +26,13 @@
 	"transport": "streamable_http",
     "enabled": false
   },
-  "git": {
-      "command": "uvx",
-      "args": ["mcp-server-git"],
-    "transport": "stdio",
+  "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+	"transport": "stdio",
     "enabled": false
-	}
+    }
 }

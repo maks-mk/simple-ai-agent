@@ -16,65 +16,28 @@ class ToolRegistry:
         # Сохраняем ссылку на MCP клиент, чтобы соединения не разрывались GC
         self.mcp_client = None 
 
-    def _set_capability(self, tools: List[BaseTool], capability: str) -> None:
-        for t in tools:
-            try:
-                meta = getattr(t, "metadata", None)
-                if meta is None:
-                    t.metadata = {"capability": capability}
-                elif isinstance(meta, dict):
-                    meta["capability"] = capability
-                else:
-                    t.metadata = {"capability": capability}
-            except Exception as e:
-                logger.warning(f"Failed to set capability for tool {t.name}: {e}")
-
-    def get_tool_capability(self, tool: BaseTool) -> str:
-        """
-        Возвращает capability инструмента.
-        Если не задано, пытается определить эвристически.
-        """
-        meta = getattr(tool, "metadata", None)
-        if isinstance(meta, dict):
-            cap = meta.get("capability")
-            if cap: return cap
-
-        # Heuristic Logic
-        name = tool.name.lower()
-        
-        # 1. Явные маркеры записи (Write)
-        write_keywords = [
-            "write", "save", "edit", "delete", "move", "create", 
-            "mkdir", "update", "replace", "append", "remove", 
-            "upload", "post", "send", "patch", "put"
-        ]
-        if any(k in name for k in write_keywords):
-            return "write"
-            
-        # 2. Явные маркеры чтения (Safe)
-        safe_keywords = [
-            "get", "read", "search", "list", "fetch", "check", 
-            "status", "info", "lookup", "query", "load", "view",
-            "describe", "scan"
-        ]
-        if any(k in name for k in safe_keywords):
-            return "safe"
-            
-        # 3. Default Policy -> Write (Safety First)
-        # Если мы не можем понять, что делает инструмент, считаем его опасным
-        return "write"
-
     async def load_all(self):
-        """Загружает все инструменты."""
+        """Загружает все инструменты в зависимости от конфигурации."""
+        
+        # 1. Локальные файловые инструменты (всегда включены, если нужны агенту)
         self._load_local_tools()
+        
+        # 2. Поисковые инструменты
         self._load_search_tools()
         
+        # 3. Системные инструменты (информация: IP, RAM, CPU)
         if self.config.use_system_tools:
             self._load_system_tools()
             
+        # 4. OS инструменты (активные действия: процессы, скачивание)
+        if self.config.enable_os_tools:
+            self._load_os_tools()
+            
+        # 5. Медиа инструменты (yt-dlp)
         if self.config.enable_media_tools:
             self._load_media_tools()
 
+        # 6. MCP (Model Context Protocol) инструменты
         if self.config.mcp_config_path.exists():
             await self._load_mcp_tools()
 
@@ -94,7 +57,6 @@ class ToolRegistry:
                 safe_delete_directory,
                 smart_replace,
             ]
-            self._set_capability(local_tools, "write")
             self.tools.extend(local_tools)
             
         except ImportError as e:
@@ -116,15 +78,67 @@ class ToolRegistry:
 
             if web_search and fetch_content:
                 search_tools = [web_search, batch_web_search, fetch_content, crawl_site]
-                self._set_capability(search_tools, "safe")
                 self.tools.extend(search_tools)
 
             if self.config.enable_deep_search and deep_search:
-                self._set_capability([deep_search], "safe")
                 self.tools.append(deep_search)
 
         except ImportError:
             logger.warning("Search tools dependencies missing.")
+
+    def _load_system_tools(self):
+        """
+        Загрузка информационных утилит (чтение состояния системы).
+        Безопасны для использования.
+        """
+        try:
+            from tools.system_tools import (
+                get_public_ip, 
+                lookup_ip_info,
+                get_system_info, 
+                get_local_network_info
+            )
+            
+            system_tools = [
+                get_public_ip, 
+                lookup_ip_info,
+                get_system_info, 
+                get_local_network_info
+            ]
+            self.tools.extend(system_tools)
+        except ImportError as e:
+            logger.error(f"Failed to load system tools: {e}")
+
+    def _load_os_tools(self):
+        """
+        Загрузка активных системных утилит (управление процессами, скачивание).
+        Могут быть отключены через ENABLE_OS_TOOLS=false.
+        """
+        try:
+            from tools.os_tools import (
+                run_background_process,
+                stop_background_process,
+                find_process_by_port,
+                download_file
+            )
+            
+            os_tools = [
+                run_background_process,
+                stop_background_process,
+                find_process_by_port,
+                download_file
+            ]
+            self.tools.extend(os_tools)
+        except ImportError as e:
+            logger.error(f"Failed to load OS tools: {e}")
+
+    def _load_media_tools(self):
+        """Загрузка медиа инструментов (yt-dlp)."""
+        try:
+            from tools.media_tools import download_media
+            self.tools.append(download_media)
+        except ImportError as e:
+            logger.error(f"Failed to load media tools: {e}")
 
     async def _load_mcp_tools(self):
         try:
@@ -139,7 +153,6 @@ class ToolRegistry:
                     continue
                 
                 # Фильтрация аргументов для MultiServerMCPClient.
-                # Оставляем только те ключи, которые понимает конструктор сессии и транспорта.
                 valid_keys = {
                     "command", "args", "env", "cwd", "encoding", "encoding_error_handler", # stdio
                     "url", "headers", "timeout", "sse_read_timeout", "auth", # http/sse
@@ -149,11 +162,11 @@ class ToolRegistry:
                 
                 server_config = {k: v for k, v in cfg.items() if k in valid_keys}
                 
-                # Гарантируем наличие args для stdio (иначе падает)
+                # Гарантируем наличие args для stdio
                 if server_config.get("transport") == "stdio" and "args" not in server_config:
                     server_config["args"] = []
                 
-                # Алиас для удобства: "http" -> "streamable_http"
+                # Алиас для удобства
                 if server_config.get("transport") == "http":
                     server_config["transport"] = "streamable_http"
                     
@@ -172,70 +185,13 @@ class ToolRegistry:
         except Exception as e:
             logger.error(f"MCP Load Error: {e}")
 
-    def _load_system_tools(self):
-        """Загрузка системных утилит (сеть, ОС)."""
-        try:
-            from tools.system_tools import (
-                get_public_ip, 
-                lookup_ip_info, 
-                get_system_info, 
-                get_local_network_info,
-                run_background_process,
-                stop_background_process,
-                find_process_by_port
-            )
-
-            system_tools = [
-                get_public_ip,
-                lookup_ip_info,
-                get_system_info,
-                get_local_network_info,
-                run_background_process,
-                stop_background_process,
-                find_process_by_port
-            ]
-            # Mark run_background_process as safe or write? 
-            # It changes system state (starts process), so 'write' might be safer, 
-            # but usually we want to allow it in exploration if it's just a local server.
-            # However, safety first: 'write' bucket.
-            
-            # Read-only system tools
-            read_tools = [
-                get_public_ip, lookup_ip_info, get_system_info, 
-                get_local_network_info, find_process_by_port
-            ]
-            
-            # Write/Action system tools
-            write_tools = [run_background_process, stop_background_process]
-            
-            self._set_capability(read_tools, "safe")
-            self._set_capability(write_tools, "write")
-            
-            self.tools.extend(system_tools)
-        except ImportError as e:
-            logger.error(f"Failed to load system tools: {e}")
-
-    def _load_media_tools(self):
-        """Загрузка медиа инструментов (yt-dlp)."""
-        try:
-            from tools.media_tools import download_media
-            # Скачивание файла - это операция записи
-            self._set_capability([download_media], "write") 
-            self.tools.append(download_media)
-        except ImportError as e:
-            logger.error(f"Failed to load media tools: {e}")
-
     async def cleanup(self):
         """Закрывает MCP соединения при выходе."""
         if self.mcp_client:
             try:
-                # Пытаемся закрыть клиент, если библиотека предоставляет такой метод
-                # В langchain-mcp-adapters v0.0.1+ может быть метод close() или aclose()
                 if hasattr(self.mcp_client, "aclose"):
                     await self.mcp_client.aclose()
                 elif hasattr(self.mcp_client, "close"):
                     await self.mcp_client.close()
-                # Если метода нет, полагаемся на то, что Python закроет ресурсы при завершении процесса,
-                # так как мы держали ссылку в self.mcp_client
             except Exception as e:
                 logger.warning(f"Error closing MCP client: {e}")

@@ -11,13 +11,14 @@
 # 1) Общие настройки
 # ===========================
 TEMPERATURE=0.2
-MAX_LOOPS=15
+MAX_LOOPS=30
 MODEL_SUPPORTS_TOOLS=true
 
 # Включение/отключение подсистем
 ENABLE_SEARCH_TOOLS=true
-ENABLE_SYSTEM_TOOLS=true
+ENABLE_SYSTEM_TOOLS=false
 ENABLE_MEDIA_TOOLS=false
+ENABLE_OS_TOOLS=false
 
 # Логи/отладка
 DEBUG=false
@@ -28,7 +29,7 @@ RETRY_DELAY=2
 
 # Память/сжатие контекста
 SESSION_SIZE=20
-SUMMARY_KEEP_LAST=4
+SUMMARY_KEEP_LAST=8
 
 # Путь к системному промпту (относительно корня проекта)
 PROMPT_PATH=prompt.txt

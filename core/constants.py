@@ -17,46 +17,9 @@ SUMMARY_PROMPT_TEMPLATE = (
     "Remove chit-chat. Return only the updated context text."
 )
 
-INTENT_CLASSIFICATION_SYSTEM_PROMPT = (
-    "Analyze the conversation and determine the user's intent. "
-    "Return a JSON object with 'intent' and 'reasoning'. "
-    "If the user wants to create, edit, save, delete, or modify files/system -> 'write_action'. "
-    "If the user just wants to search, read, or ask questions -> 'read_only'."
-)
-
-# --- KEYWORDS & TRIGGERS ---
-
-INTENT_HINTS = (
-    "создай", "создать", "запиши", "записать", "сохрани",
-    "сделай", "сделать", "напиши", "написать", "измени",
-    "добавь", "добавить", "обнови", "обновить", "исправь", "почини",
-    "create", "write", "save", "generate", "edit", "update", "delete",
-    "add", "insert", "modify", "fix", "replace", "patch"
-)
-
-# Safety Guard Lists - REMOVED (Dead Code)
-
-
-FATAL_ERRORS = ["401", "unauthorized", "quota", "billing", "context_length_exceeded"]
-
-# --- SYSTEM & ERROR HANDLING ---
-
-MISSING_RESOURCE_MARKERS = [
-    "no such file", 
-    "not found", 
-    "enoent",       # Node.js Error No Entry
-    "does not exist",
-    "cannot find the path", # Windows specific
-    "directory not found",
-    "unable to open"
-]
-
 REFLECTION_PROMPT = (
-    "REFLECTION:\n"
-    "- The previous action failed.\n"
-    "- Identify WHY it failed (invalid args, missing data, wrong tool).\n"
-    "- DO NOT repeat the same tool with the same arguments.\n"
-    "- Change strategy (e.g. use a different tool or gather data first).\n"
-    "Reply with a brief plan, then act."
+    "SYSTEM HINT: The previous tool execution failed. "
+    "Review the error, correct your arguments, or use a different tool. "
+    "Act immediately."
 )
 

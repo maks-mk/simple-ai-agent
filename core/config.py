@@ -41,13 +41,14 @@ class AgentConfig(BaseSettings):
 
     # Common Logic
     temperature: float = 0.2
-    max_loops: int = Field(default=15, description="Limit steps per request")
+    max_loops: int = Field(default=50, description="Limit steps per request")
     
     # Features Toggle
     enable_deep_search: bool = Field(default=False, alias="DEEP_SEARCH")
     enable_search_tools: bool = Field(default=True, alias="ENABLE_SEARCH_TOOLS")
     model_supports_tools: bool = Field(default=True, alias="MODEL_SUPPORTS_TOOLS")
     use_system_tools: bool = Field(default=True, alias="ENABLE_SYSTEM_TOOLS")
+    enable_os_tools: bool = Field(default=True, alias="ENABLE_OS_TOOLS")
     enable_media_tools: bool = Field(default=False, alias="ENABLE_MEDIA_TOOLS")
     
     # Summarization

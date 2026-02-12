@@ -57,19 +57,25 @@ uv --version
     "command": "uvx",
     "args": ["duckduckgo-mcp-server"],
     "transport": "stdio",
-    "enabled": true
+    "enabled": false
   },
   "fetch": {
     "command": "uvx",
     "args": ["mcp-server-fetch"],
     "transport": "stdio",
-    "enabled": true
+    "enabled": false
   },
   "win-cli": {
     "command": "npx",
     "args": ["-y", "@simonb97/server-win-cli", "--config", "win-cli-config.json"],
     "transport": "stdio",
     "enabled": false
+  },
+  "mcp-cli-exec": {
+      "command": "npx",
+      "args": ["-y", "mcp-cli-exec"],
+      "transport": "stdio",
+	  "enabled": true
   }
 }
 ```
@@ -96,6 +102,7 @@ uv --version
 # === Node.js серверы ===
 npm install -g @modelcontextprotocol/server-filesystem
 npm install -g @simonb97/server-win-cli
+npm install -g mcp-cli-exec
 
 # === Python серверы (через UV) ===
 # uv tool install делает команду доступной глобально
@@ -132,7 +139,13 @@ uv tool install mcp-server-fetch
     "args": ["--config", "win-cli-config.json"],
     "transport": "stdio",
     "enabled": false
-  }
+  },
+  "mcp-cli-exec": {
+      "command": "mcp-cli-exec",
+      "args": [""],
+     "transport": "stdio",
+	  "enabled": true
+	}
 }
 ```
 
@@ -140,7 +153,8 @@ uv tool install mcp-server-fetch
 
 ---
 
-## 🛡️ Безопасность (Обязательно для win-cli)
+
+# 🛡️ Безопасность (Обязательно для win-cli)
 
 Если вы используете сервер **win-cli** (управление командной строкой), обязательно создайте файл конфигурации рядом с `mcp.json`, чтобы агент не удалил случайно важные файлы.
 

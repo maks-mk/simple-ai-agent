@@ -13,8 +13,8 @@ class ToolRegistry:
     def __init__(self, config: AgentConfig):
         self.config = config
         self.tools: List[BaseTool] = []
-        # Сохраняем ссылку на MCP клиент, чтобы соединения не разрывались GC
-        self.mcp_client = None 
+        # Сохраняем список клиентов, чтобы соединения не разрывались GC
+        self.mcp_clients = [] 
 
     async def load_all(self):
         """Загружает все инструменты в зависимости от конфигурации."""
@@ -37,7 +37,11 @@ class ToolRegistry:
         if self.config.enable_media_tools:
             self._load_media_tools()
 
-        # 6. MCP (Model Context Protocol) инструменты
+        # 6. Vision инструменты (анализ изображений)
+        if self.config.enable_vision_tools:
+            self._load_vision_tools()
+
+        # 7. MCP (Model Context Protocol) инструменты
         if self.config.mcp_config_path.exists():
             await self._load_mcp_tools()
 
@@ -140,13 +144,20 @@ class ToolRegistry:
         except ImportError as e:
             logger.error(f"Failed to load media tools: {e}")
 
+    def _load_vision_tools(self):
+        """Загрузка инструментов компьютерного зрения."""
+        try:
+            from tools.vision_tools import describe_image
+            self.tools.append(describe_image)
+        except ImportError as e:
+            logger.error(f"Failed to load vision tools: {e}")
+
     async def _load_mcp_tools(self):
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient
             
             # Чтение конфига
             raw_cfg = json.loads(self.config.mcp_config_path.read_text("utf-8"))
-            mcp_cfg = {}
             
             for name, cfg in raw_cfg.items():
                 if not cfg.get("enabled", True):
@@ -169,29 +180,40 @@ class ToolRegistry:
                 # Алиас для удобства
                 if server_config.get("transport") == "http":
                     server_config["transport"] = "streamable_http"
+                
+                # Создаем отдельный клиент для каждого сервера, чтобы ошибка одного не валила все
+                try:
+                    # MultiServerMCPClient ожидает словарь {name: config}
+                    single_server_cfg = {name: server_config}
+                    client = MultiServerMCPClient(single_server_cfg)
                     
-                mcp_cfg[name] = server_config
+                    # Получаем инструменты с таймаутом
+                    new_tools = await asyncio.wait_for(client.get_tools(), timeout=30)
+                    
+                    if new_tools:
+                        self.mcp_clients.append(client)
+                        self.tools.extend(new_tools)
+                        logger.debug(f"🔌 MCP Adapter connected to '{name}'. Loaded {len(new_tools)} tools.")
+                    else:
+                        logger.warning(f"⚠ MCP Server '{name}' returned no tools.")
+                        # Если инструментов нет, можно закрыть клиент, но лучше оставить на cleanup
+                        self.mcp_clients.append(client)
 
-            if mcp_cfg:
-                # ВАЖНО: Сохраняем клиент в self, чтобы GC не убил соединения
-                self.mcp_client = MultiServerMCPClient(mcp_cfg)
-                
-                # Получаем инструменты с таймаутом
-                new_tools = await asyncio.wait_for(self.mcp_client.get_tools(), timeout=120)
-                
-                self.tools.extend(new_tools)
-                logger.debug(f"🔌 MCP Adapter connected. Loaded {len(new_tools)} tools.")
-                
+                except Exception as e:
+                    logger.error(f"❌ MCP Load Error for '{name}': {e}")
+                    # Не прерываем цикл, пробуем следующий сервер
+
         except Exception as e:
-            logger.error(f"MCP Load Error: {e}")
+            logger.error(f"MCP Global Load Error: {e}")
 
     async def cleanup(self):
         """Закрывает MCP соединения при выходе."""
-        if self.mcp_client:
+        for client in self.mcp_clients:
             try:
-                if hasattr(self.mcp_client, "aclose"):
-                    await self.mcp_client.aclose()
-                elif hasattr(self.mcp_client, "close"):
-                    await self.mcp_client.close()
+                if hasattr(client, "aclose"):
+                    await client.aclose()
+                elif hasattr(client, "close"):
+                    await client.close()
             except Exception as e:
                 logger.warning(f"Error closing MCP client: {e}")
+        self.mcp_clients.clear()

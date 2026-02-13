@@ -50,6 +50,7 @@ class AgentConfig(BaseSettings):
     use_system_tools: bool = Field(default=True, alias="ENABLE_SYSTEM_TOOLS")
     enable_os_tools: bool = Field(default=True, alias="ENABLE_OS_TOOLS")
     enable_media_tools: bool = Field(default=False, alias="ENABLE_MEDIA_TOOLS")
+    enable_vision_tools: bool = Field(default=True, alias="ENABLE_VISION_TOOLS")
     
     # Summarization
     summary_threshold: int = Field(default=20, alias="SESSION_SIZE")

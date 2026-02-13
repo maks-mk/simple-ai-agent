@@ -42,7 +42,7 @@ except ImportError as e:
     except ImportError:
         raise ImportError(f"Could not import 'agent' module. sys.path: {sys.path}. Error: {e}")
 
-from core.cli_utils import get_key_bindings
+from core.cli_utils import get_key_bindings, format_exception_friendly
 from core.config import AgentConfig
 from core.logging_config import setup_logging
 from core.stream_processor import StreamProcessor
@@ -81,13 +81,33 @@ def get_prompt_message():
 def get_bottom_toolbar():
     return HTML(' <b>ALT+ENTER</b> Multiline | <b>/tools</b> List | <b>/help</b> Help | <b>exit</b> Quit ')
 
-def show_help(workflow: AgentWorkflow):
+def show_tools(workflow: AgentWorkflow):
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
     table.add_column("Tool")
     table.add_column("Description")
     for t in workflow.tools:
         table.add_row(t.name, (t.description[:60] + "...") if t.description else "No description")
     console.print(Panel(table, title="[bold blue]Available Tools[/]"))
+
+def show_help():
+    grid = Table.grid(expand=True, padding=(0, 2))
+    grid.add_column(justify="left", style="bold cyan")
+    grid.add_column(justify="left")
+    
+    grid.add_row("Command", "Description")
+    grid.add_row("-------", "-----------")
+    grid.add_row("/tools", "List all available tools")
+    grid.add_row("/help", "Show this help message")
+    grid.add_row("clear", "Clear screen and reset session")
+    grid.add_row("exit", "Exit the application")
+    
+    grid.add_row("", "")
+    grid.add_row("Keyboard Shortcuts", "")
+    grid.add_row("------------------", "")
+    grid.add_row("Alt+Enter", "Multiline input")
+    grid.add_row("Ctrl+C", "Cancel generation")
+    
+    console.print(Panel(grid, title="[bold blue]Help & Usage[/]", border_style="blue"))
 
 # ======================================================
 # MAIN
@@ -121,8 +141,19 @@ async def main():
     os.system("cls" if os.name == "nt" else "clear")
     
     model_name = temp_cfg.gemini_model if temp_cfg.provider == "gemini" else temp_cfg.openai_model
-    header_info = f"[bold blue]AI Agent CLI[/]\n[dim]Model: {model_name} | Tools: {len(workflow.tools)}[/]"
-    console.print(Panel(header_info, subtitle="v7.34b"))
+    
+    # Modern Header
+    from rich.table import Table
+    grid = Table.grid(expand=True)
+    grid.add_column(justify="left")
+    grid.add_column(justify="center")
+    grid.add_column(justify="right")
+    grid.add_row(
+        "[bold cyan]🤖 AI Agent[/] [gray]v7.34b[/]", 
+        f"[gray]Tools: {len(workflow.tools)}[/]",
+        f"[gray]{model_name}[/] [cyan]•[/]"
+    )
+    console.print(Panel(grid, style="panel.border", padding=(0, 1)))
 
     if temp_cfg.debug:
         console.print("[yellow]🐛 Debug mode enabled[/]")
@@ -155,8 +186,12 @@ async def main():
                 os.system("cls" if os.name == "nt" else "clear")
                 continue
             
-            if user_input.lower() in ["/help", "/tools"]:
-                show_help(workflow)
+            if user_input.lower() == "/tools":
+                show_tools(workflow)
+                continue
+
+            if user_input.lower() == "/help":
+                show_help()
                 continue
 
             # Auto-fix for interrupted tool calls
@@ -168,7 +203,7 @@ async def main():
         except (KeyboardInterrupt, asyncio.CancelledError):
             continue
         except Exception as e:
-            console.print(f"[bold red]Error:[/] {e}")
+            console.print(f"[bold red]{format_exception_friendly(e)}[/]")
 
     # Final Cleanup
     if hasattr(workflow, 'tool_registry') and workflow.tool_registry:

@@ -12,6 +12,7 @@ from langchain_core.tools import BaseTool
 from core.state import AgentState
 from core.config import AgentConfig
 from core import constants
+from core.cli_utils import format_exception_friendly
 
 logger = logging.getLogger("agent")
 
@@ -206,7 +207,8 @@ class AgentNodes:
             except Exception as e:
                 logger.warning(f"LLM Error (Attempt {attempt+1}): {e}")
                 if attempt == 2:
-                    return AIMessage(content=f"System Error: API request failed after 3 retries. ({e})")
+                    friendly_error = format_exception_friendly(e)
+                    return AIMessage(content=f"System Error: API request failed after 3 retries. \n{friendly_error}")
                 await asyncio.sleep(1)
         return AIMessage(content="System Error: Unknown failure.")
 

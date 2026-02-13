@@ -97,10 +97,39 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
     
     elif "delete" in name:
         return "Deleted successfully"
+        
+    elif "fetch" in name or "download" in name:
+        size = len(content)
+        return f"Fetched content ({size} chars)"
 
-    # Default fallback
-    clean_content = content.replace("\n", " ")
-    return (clean_content[:80] + "...") if len(clean_content) > 80 else clean_content
+    return content[:150] + "..." if len(content) > 150 else content
+
+def format_exception_friendly(e: Exception) -> str:
+    """Возвращает читаемое сообщение об ошибке вместо traceback."""
+    err_str = str(e)
+    err_type = type(e).__name__
+    
+    # 1. Rate Limits
+    if "429" in err_str or "RateLimit" in err_type or "QuotaExceeded" in err_type or "ResourceExhausted" in err_type:
+        return "⚠ Rate Limit Exceeded (429). Please wait a moment or check your API quota."
+    
+    # 2. Auth Errors
+    if "401" in err_str or "403" in err_str or "Authentication" in err_type:
+        return "⚠ Authentication Failed. Check your API KEY in .env."
+    
+    # 3. Context Length
+    if "context_length_exceeded" in err_str or "too many tokens" in err_str.lower():
+        return "⚠ Context Limit Reached. Use 'reset' to start fresh."
+    
+    # 4. Network
+    if "ConnectError" in err_type or "Timeout" in err_type or "ReadTimeout" in err_type:
+        return "⚠ Network Error. Connection failed or timed out."
+
+    # 5. Fallback: Shorten extremely long messages (often JSON dumps)
+    if len(err_str) > 300:
+        return f"⚠ Error ({err_type}): {err_str[:300]}... [truncated]"
+        
+    return f"⚠ Error ({err_type}): {err_str}"
 
 def get_key_bindings():
     """Настройка Alt+Enter для переноса строки."""
@@ -201,20 +230,15 @@ class TokenTracker:
         
         # 3. Hybrid Decision Logic
         display_out = 0
-        label = self.source_label
+        # label = self.source_label # Removed text label in favor of clean UI
 
         if total_output_metadata > 0:
-            # Если метаданные есть, но они подозрительно малы по сравнению с эстимейтом (например < 20%)
-            # Это признак того, что провайдер вернул токены только за последний чанк/сообщение, а не за все.
-            # (как в случае с Out: 4 при большом тексте)
             if est > 100 and total_output_metadata < (est * 0.2):
                  display_out = est
-                 label = "Hybrid/Est"
             else:
                  display_out = total_output_metadata
-                 label = "Provider"
         else:
             display_out = est
-            label = "Est"
 
-        return f"⏱ {duration:.1f}s | In: {self.max_input} Out: {display_out} [dim]({label})[/]"
+        # Minimalist stats line
+        return f"[dim]• {duration:.1f}s   In: {self.max_input}   Out: {display_out}[/]"

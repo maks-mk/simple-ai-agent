@@ -162,8 +162,13 @@ class StreamProcessor:
         if t_id not in self.printed_tool_ids:
             arg_str = self._format_tool_args(tc["args"])
             target = live.console if live else self.console
-            suffix = f" [tool.args]· {arg_str}[/]" if arg_str else ""
-            target.print(Padding(f"🔧 [tool.name]{tc['name']}[/]{suffix}", (0, 0, 0, 2)))
+            
+            # Use a cleaner, single-line format with clear iconography
+            name_styled = f"[tool.name]{tc['name']}[/]"
+            args_styled = f"[tool.args]{arg_str}[/]" if arg_str else ""
+            
+            target.print(Padding(f"›  {name_styled} {args_styled}", (0, 0, 0, 2)))
+            
             self.printed_tool_ids.add(t_id)
             self.status_text = f"Running {tc['name']}..."
 
@@ -174,15 +179,24 @@ class StreamProcessor:
         
         target = live.console if live else self.console
 
+        # If we missed the call (rare), print it now
         if t_id in self.tool_buffer and t_id not in self.printed_tool_ids:
             info = self.tool_buffer[t_id]
             arg_str = self._format_tool_args(info["args"])
-            target.print(Padding(f"🔧 [tool.name]{info['name']}[/] [tool.args]· {arg_str}[/]", (0, 0, 0, 2)))
+            target.print(Padding(f"›  [tool.name]{info['name']}[/] [tool.args]{arg_str}[/]", (0, 0, 0, 2)))
             self.printed_tool_ids.add(t_id)
             
         summary = format_tool_output(msg.name, content_str, is_error)
-        icon = "[tool.error]❌[/]" if is_error else "[tool.result]└─[/]"
-        target.print(Padding(f"{icon} {summary}", (0, 0, 0, 4)))
+        
+        # Modern arrow connector for result
+        if is_error:
+            icon = "[tool.error]✖ [/]" 
+            style = "tool.error"
+        else:
+            icon = "[tool.result]✔ [/]"
+            style = "tool.result"
+            
+        target.print(Padding(f"  {icon} [{style}]{summary}[/]", (0, 0, 0, 4)))
         self.status_text = "Thinking..."
 
     def _update_live_display(self, live: Live):

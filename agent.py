@@ -29,9 +29,12 @@ class AgentWorkflow:
     def __init__(self):
         load_dotenv(BASE_DIR / '.env')
         self.config = AgentConfig()
-        self.tool_registry = ToolRegistry(self.config)
         
-        self.llm: Optional[BaseChatModel] = None
+        # Initialize LLM early to pass to registry
+        self.llm = self.config.get_llm()
+        
+        self.tool_registry = ToolRegistry(self.config, self.llm)
+        
         self.llm_with_tools: Optional[BaseChatModel] = None
         
         self.nodes: Optional[AgentNodes] = None
@@ -41,7 +44,7 @@ class AgentWorkflow:
         logger.info(f"Initializing agent: [bold cyan]{self.config.provider}[/]", extra={"markup": True})
         logger.debug(f"Prompt Path: {self.config.prompt_path.absolute()}")
         
-        self.llm = self.config.get_llm()
+        # self.llm already initialized in __init__
         await self.tool_registry.load_all()
         
         # Bind tools if supported

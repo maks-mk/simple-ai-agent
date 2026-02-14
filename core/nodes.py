@@ -198,13 +198,27 @@ class AgentNodes:
         return SystemMessage(content=prompt)
 
     async def _invoke_llm_with_retry(self, llm, context: List[BaseMessage]) -> AIMessage:
+        current_llm = llm
+        
         for attempt in range(3):
             try:
-                response = await llm.ainvoke(context)
+                response = await current_llm.ainvoke(context)
                 if not response.content and not response.tool_calls:
                     raise ValueError("Empty response from LLM")
                 return response
             except Exception as e:
+                err_str = str(e)
+                # Handle specific tool choice errors from vLLM/OpenAI-compatible servers
+                if "auto" in err_str and "tool choice" in err_str and "requires" in err_str:
+                    logger.warning("⚠ Server does not support 'auto' tool choice. Falling back to chat-only mode.")
+                    # Fallback to base LLM (without tools) for this request
+                    current_llm = self.llm 
+                    # Add system note about disabled tools
+                    context = [m for m in context] # Copy
+                    if isinstance(context[0], SystemMessage):
+                        context[0] = SystemMessage(content=str(context[0].content) + "\n\nWARNING: Tools are disabled due to server configuration error.")
+                    continue
+
                 logger.warning(f"LLM Error (Attempt {attempt+1}): {e}")
                 if attempt == 2:
                     friendly_error = format_exception_friendly(e)

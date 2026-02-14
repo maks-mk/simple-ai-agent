@@ -149,7 +149,7 @@ async def main():
     grid.add_column(justify="center")
     grid.add_column(justify="right")
     grid.add_row(
-        "[bold cyan]🤖 AI Agent[/] [gray]v7.34b[/]", 
+        "[bold cyan]🤖 AI Agent[/] [gray]v7.35b[/]", 
         f"[gray]Tools: {len(workflow.tools)}[/]",
         f"[gray]{model_name}[/] [cyan]•[/]"
     )

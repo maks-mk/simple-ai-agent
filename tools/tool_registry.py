@@ -9,9 +9,12 @@ from core.config import AgentConfig
 
 logger = logging.getLogger(__name__)
 
+from langchain_core.language_models import BaseChatModel
+
 class ToolRegistry:
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: AgentConfig, llm: Optional[BaseChatModel] = None):
         self.config = config
+        self.llm = llm
         self.tools: List[BaseTool] = []
         # Сохраняем список клиентов, чтобы соединения не разрывались GC
         self.mcp_clients = [] 
@@ -33,15 +36,7 @@ class ToolRegistry:
         if self.config.enable_os_tools:
             self._load_os_tools()
             
-        # 5. Медиа инструменты (yt-dlp)
-        if self.config.enable_media_tools:
-            self._load_media_tools()
-
-        # 6. Vision инструменты (анализ изображений)
-        if self.config.enable_vision_tools:
-            self._load_vision_tools()
-
-        # 7. MCP (Model Context Protocol) инструменты
+        # 5. MCP (Model Context Protocol) инструменты
         if self.config.mcp_config_path.exists():
             await self._load_mcp_tools()
 
@@ -74,7 +69,6 @@ class ToolRegistry:
         try:
             from tools.search_tools import (
                 web_search,
-                deep_search,
                 fetch_content,
                 batch_web_search,
                 crawl_site,
@@ -83,9 +77,6 @@ class ToolRegistry:
             if web_search and fetch_content:
                 search_tools = [web_search, batch_web_search, fetch_content, crawl_site]
                 self.tools.extend(search_tools)
-
-            if self.config.enable_deep_search and deep_search:
-                self.tools.append(deep_search)
 
         except ImportError:
             logger.warning("Search tools dependencies missing.")
@@ -136,22 +127,6 @@ class ToolRegistry:
         except ImportError as e:
             logger.error(f"Failed to load OS tools: {e}")
 
-    def _load_media_tools(self):
-        """Загрузка медиа инструментов (yt-dlp)."""
-        try:
-            from tools.media_tools import download_media
-            self.tools.append(download_media)
-        except ImportError as e:
-            logger.error(f"Failed to load media tools: {e}")
-
-    def _load_vision_tools(self):
-        """Загрузка инструментов компьютерного зрения."""
-        try:
-            from tools.vision_tools import describe_image
-            self.tools.append(describe_image)
-        except ImportError as e:
-            logger.error(f"Failed to load vision tools: {e}")
-
     async def _load_mcp_tools(self):
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -160,29 +135,33 @@ class ToolRegistry:
             raw_cfg = json.loads(self.config.mcp_config_path.read_text("utf-8"))
             
             for name, cfg in raw_cfg.items():
-                if not cfg.get("enabled", True):
-                    continue
-                
-                # Фильтрация аргументов для MultiServerMCPClient.
-                valid_keys = {
-                    "command", "args", "env", "cwd", "encoding", "encoding_error_handler", # stdio
-                    "url", "headers", "timeout", "sse_read_timeout", "auth", # http/sse
-                    "terminate_on_close", "httpx_client_factory", # streamable specific
-                    "transport", "session_kwargs" # common
-                }
-                
-                server_config = {k: v for k, v in cfg.items() if k in valid_keys}
-                
-                # Гарантируем наличие args для stdio
-                if server_config.get("transport") == "stdio" and "args" not in server_config:
-                    server_config["args"] = []
-                
-                # Алиас для удобства
-                if server_config.get("transport") == "http":
-                    server_config["transport"] = "streamable_http"
-                
-                # Создаем отдельный клиент для каждого сервера, чтобы ошибка одного не валила все
                 try:
+                    if not isinstance(cfg, dict):
+                        logger.warning(f"⚠ Skipping invalid config entry '{name}': Expected dict, got {type(cfg).__name__}")
+                        continue
+
+                    if not cfg.get("enabled", True):
+                        continue
+                    
+                    # Фильтрация аргументов для MultiServerMCPClient.
+                    valid_keys = {
+                        "command", "args", "env", "cwd", "encoding", "encoding_error_handler", # stdio
+                        "url", "headers", "timeout", "sse_read_timeout", "auth", # http/sse
+                        "terminate_on_close", "httpx_client_factory", # streamable specific
+                        "transport", "session_kwargs" # common
+                    }
+                    
+                    server_config = {k: v for k, v in cfg.items() if k in valid_keys}
+                    
+                    # Гарантируем наличие args для stdio
+                    if server_config.get("transport") == "stdio" and "args" not in server_config:
+                        server_config["args"] = []
+                    
+                    # Алиас для удобства
+                    if server_config.get("transport") == "http":
+                        server_config["transport"] = "streamable_http"
+                    
+                    # Создаем отдельный клиент для каждого сервера, чтобы ошибка одного не валила все
                     # MultiServerMCPClient ожидает словарь {name: config}
                     single_server_cfg = {name: server_config}
                     client = MultiServerMCPClient(single_server_cfg)

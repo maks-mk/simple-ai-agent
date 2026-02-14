@@ -311,42 +311,6 @@ async def batch_web_search(queries: List[str]) -> str:
             
     return "\n".join(output)
 
-@tool("deep_search")
-@with_cache(ttl=3600)
-async def deep_search(query: str, max_results: int = 3) -> str:
-    """
-    Deep search with full page content. Returns complete text from top results.
-    WARNING: Uses many tokens!
-    """
-    client = get_tavily_client()
-    if not client: return "Error: Config missing."
-
-    try:
-        response = await _execute_with_retry(
-            client.search,
-            query=query,
-            max_results=max_results,
-            search_depth="advanced",
-            include_answer=True,
-            include_raw_content=True
-        )
-    except Exception as e:
-        return f"Deep search failed: {e}"
-
-    results = []
-    if response.get("answer"):
-        results.append(f"AI Overview:\n{response.get('answer')}\n{'='*40}")
-
-    for idx, item in enumerate(response.get("results", []), 1):
-        title = item.get("title") or "Untitled"
-        content = item.get("raw_content") or item.get("content") or ""
-        if not content: continue
-        
-        block = f"[Source {idx}] {title}\nURL: {item.get('url')}\n{'='*60}\n{content[:30000]}\n"
-        results.append(block)
-
-    return "\n".join(results) or "No results."
-
 @tool("crawl_site")
 @with_cache(ttl=3600)
 async def crawl_site(

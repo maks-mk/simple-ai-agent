@@ -141,12 +141,10 @@ ENABLE_SYSTEM_TOOLS=true
     "transport": "stdio",
     "enabled": false
   },
-  "remote-tool": {
+  "context7": {
+    "type": "remote",
+    "url": "https://mcp.context7.com/mcp",
     "transport": "http",
-    "url": "http://localhost:8000/sse",
-    "headers": {
-        "Authorization": "Bearer my-secret-token"
-    },
     "enabled": false
   }
 }

@@ -4,6 +4,7 @@ import shutil
 import errno
 from pathlib import Path
 from langchain_core.tools import tool
+from core.errors import format_error, ErrorType
 
 logger = logging.getLogger(__name__)
 
@@ -13,18 +14,20 @@ def _validate_path(relative_path: str) -> tuple[bool, str | None, Path | None]:
         root_dir = Path.cwd()
         # 1. Проверка на абсолютный путь
         if Path(relative_path).is_absolute():
-            return False, f"ACCESS DENIED: Absolute paths not allowed: '{relative_path}'", None
+            return False, format_error(ErrorType.ACCESS_DENIED, f"Absolute paths not allowed: '{relative_path}'"), None
 
         # 2. Разрешаем путь относительно root_dir
         target_path = (root_dir / relative_path).resolve()
         
         # 3. Проверка на выход за пределы (Path Traversal)
-        if not target_path.is_relative_to(root_dir):
-            return False, f"ACCESS DENIED: Path '{relative_path}' is outside working directory.", None
+        try:
+            target_path.relative_to(root_dir)
+        except ValueError:
+            return False, format_error(ErrorType.ACCESS_DENIED, f"Path '{relative_path}' is outside working directory."), None
 
         return True, None, target_path
     except Exception as e:
-        return False, f"Path Error: {e}", None
+        return False, format_error(ErrorType.VALIDATION, f"Path Error: {e}"), None
 
 @tool("safe_delete_file")
 async def safe_delete_file(file_path: str) -> str:
@@ -34,12 +37,12 @@ async def safe_delete_file(file_path: str) -> str:
     """
     is_valid, error, target = _validate_path(file_path)
     if not is_valid: 
-        return f"Error: {error}"
+        return error
 
     if not target.exists():
-        return f"Error: File not found: {file_path}"
+        return format_error(ErrorType.NOT_FOUND, f"File not found: {file_path}")
     if target.is_dir():
-        return f"Error: {file_path} is a directory. Use safe_delete_directory."
+        return format_error(ErrorType.VALIDATION, f"{file_path} is a directory. Use safe_delete_directory.")
 
     try:
         # Use asyncio.to_thread for blocking I/O operations
@@ -48,7 +51,7 @@ async def safe_delete_file(file_path: str) -> str:
         return f"Success: File {file_path} deleted."
     except Exception as e:
         logger.error(f"Delete File Error: {e}")
-        return f"Error: {str(e)}"
+        return format_error(ErrorType.EXECUTION, str(e))
 
 @tool("safe_delete_directory")
 async def safe_delete_directory(dir_path: str, recursive: bool = False) -> str:
@@ -58,12 +61,12 @@ async def safe_delete_directory(dir_path: str, recursive: bool = False) -> str:
     """
     is_valid, error, target = _validate_path(dir_path)
     if not is_valid: 
-        return f"Error: {error}"
+        return error
 
     if not target.exists():
-        return f"Error: Directory not found: {dir_path}"
+        return format_error(ErrorType.NOT_FOUND, f"Directory not found: {dir_path}")
     if not target.is_dir():
-        return f"Error: {dir_path} is a file."
+        return format_error(ErrorType.VALIDATION, f"{dir_path} is a file.")
 
     try:
         if recursive:
@@ -78,8 +81,8 @@ async def safe_delete_directory(dir_path: str, recursive: bool = False) -> str:
 
     except OSError as e:
         if e.errno == errno.ENOTEMPTY:
-            return "Error: Directory is not empty. Set recursive=True to delete it."
-        return f"Error: {str(e)}"
+            return format_error(ErrorType.VALIDATION, "Directory is not empty. Set recursive=True to delete it.")
+        return format_error(ErrorType.EXECUTION, str(e))
     except Exception as e:
         logger.error(f"Delete Dir Error: {e}")
-        return f"Error: {str(e)}"
+        return format_error(ErrorType.EXECUTION, str(e))

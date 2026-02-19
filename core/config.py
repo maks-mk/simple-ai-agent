@@ -4,9 +4,6 @@ from typing import Literal, Optional, Any
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from langchain_core.language_models import BaseChatModel
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
 
 from core.constants import BASE_DIR
 
@@ -47,7 +44,19 @@ class AgentConfig(BaseSettings):
     enable_search_tools: bool = Field(default=True, alias="ENABLE_SEARCH_TOOLS")
     model_supports_tools: bool = Field(default=True, alias="MODEL_SUPPORTS_TOOLS")
     use_system_tools: bool = Field(default=True, alias="ENABLE_SYSTEM_TOOLS")
-    enable_os_tools: bool = Field(default=True, alias="ENABLE_OS_TOOLS")
+    enable_filesystem_tools: bool = Field(default=True, alias="ENABLE_FILESYSTEM_TOOLS")
+    enable_process_tools: bool = Field(default=False, alias="ENABLE_PROCESS_TOOLS")
+    enable_shell_tool: bool = Field(default=False, alias="ENABLE_SHELL_TOOL")
+    
+    # Tools Limits
+    max_tool_output_length: int = Field(default=4000, alias="MAX_TOOL_OUTPUT")
+    max_file_size: int = Field(default=10 * 1024 * 1024, alias="MAX_FILE_SIZE")
+    max_background_processes: int = Field(default=5, alias="MAX_BACKGROUND_PROCESSES")
+    max_search_chars: int = Field(default=10000, alias="MAX_SEARCH_CHARS")
+    max_read_lines: int = Field(default=2000, alias="MAX_READ_LINES")
+    
+    # Deterministic Mode
+    strict_mode: bool = Field(default=False, alias="STRICT_MODE")
     
     # Summarization
     summary_threshold: int = Field(default=20, alias="SESSION_SIZE")
@@ -58,6 +67,18 @@ class AgentConfig(BaseSettings):
     retry_delay: int = Field(default=2, alias="RETRY_DELAY")
     debug: bool = Field(default=False, alias="DEBUG")
 
+    @property
+    def safety(self):
+        from core.safety_policy import SafetyPolicy
+        return SafetyPolicy(
+            max_tool_output=self.max_tool_output_length,
+            max_file_size=self.max_file_size,
+            max_background_processes=self.max_background_processes,
+            max_search_chars=self.max_search_chars,
+            max_read_lines=self.max_read_lines,
+            allow_shell=self.enable_shell_tool
+        )
+
     @model_validator(mode='after')
     def validate_provider_keys(self) -> 'AgentConfig':
         if self.provider == "gemini" and not self.gemini_api_key:
@@ -65,40 +86,3 @@ class AgentConfig(BaseSettings):
         if self.provider == "openai" and not self.openai_api_key:
             raise ValueError("OPENAI_API_KEY required for openai provider.")
         return self
-
-    def check_tool_support(self) -> bool:
-        """
-        Определяет, поддерживает ли текущая модель вызов инструментов.
-        """
-        if not self.model_supports_tools:
-            return False
-            
-        if self.provider == "openai":
-            # Эвристика для моделей, которые часто не поддерживают тулы
-            model_name = self.openai_model.lower()
-            no_tool_prefixes = (
-                "tngtech/", "huggingface/", "grey-wing/", "sao10k/" 
-            )
-            if model_name.startswith(no_tool_prefixes):
-                return False
-        return True
-
-    def get_llm(self) -> BaseChatModel:
-        """
-        Инициализирует и возвращает экземпляр LLM на основе настроек.
-        """
-        if self.provider == "gemini":
-            return ChatGoogleGenerativeAI(
-                model=self.gemini_model,
-                temperature=self.temperature,
-                google_api_key=self.gemini_api_key.get_secret_value(),
-                convert_system_message_to_human=True
-            )
-        elif self.provider == "openai":
-            return ChatOpenAI(
-                model=self.openai_model,
-                temperature=self.temperature,
-                api_key=self.openai_api_key.get_secret_value(),
-                base_url=self.openai_base_url
-            )
-        raise ValueError(f"Unknown provider: {self.provider}")

@@ -33,12 +33,12 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
 # --- LOCAL IMPORTS ---
 try:
-    from agent import AgentWorkflow, logger
+    from agent import build_agent_app, logger
 except ImportError as e:
     if str(Path.cwd()) != str(BASE_DIR):
         sys.path.append(".")
     try:
-        from agent import AgentWorkflow, logger
+        from agent import build_agent_app, logger
     except ImportError:
         raise ImportError(f"Could not import 'agent' module. sys.path: {sys.path}. Error: {e}")
 
@@ -47,6 +47,7 @@ from core.config import AgentConfig
 from core.logging_config import setup_logging
 from core.stream_processor import StreamProcessor
 from core.session_utils import repair_session_if_needed
+from core.fuzzy_completer import FuzzyPathCompleter
 
 # --- CONFIG ---
 warnings.filterwarnings("ignore")
@@ -81,11 +82,11 @@ def get_prompt_message():
 def get_bottom_toolbar():
     return HTML(' <b>ALT+ENTER</b> Multiline | <b>/tools</b> List | <b>/help</b> Help | <b>exit</b> Quit ')
 
-def show_tools(workflow: AgentWorkflow):
+def show_tools(tools):
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
     table.add_column("Tool")
     table.add_column("Description")
-    for t in workflow.tools:
+    for t in tools:
         table.add_row(t.name, (t.description[:60] + "...") if t.description else "No description")
     console.print(Panel(table, title="[bold blue]Available Tools[/]"))
 
@@ -119,6 +120,11 @@ async def main():
 
     # 1. Load Config
     try:
+        # Explicitly set CWD as working directory for relative paths
+        # This fixes issue where frozen exe uses its own dir as base for everything
+        if getattr(sys, 'frozen', False):
+             os.chdir(os.getcwd())
+             
         temp_cfg = AgentConfig()
         log_level = logging.DEBUG if temp_cfg.debug else logging.WARNING
         setup_logging(level=log_level)
@@ -128,11 +134,12 @@ async def main():
         return
 
     # 2. Initialize Workflow
+    tool_registry = None
+    tools = []
     try:
         with console.status("[bold green]Initializing system...[/]"):
-            workflow = AgentWorkflow()
-            await workflow.initialize_resources()
-            agent_app = workflow.build_graph()
+            agent_app, tool_registry = await build_agent_app()
+            tools = tool_registry.tools
     except Exception as e:
         console.print(f"[bold red]Init Error:[/] {e}")
         return
@@ -149,8 +156,8 @@ async def main():
     grid.add_column(justify="center")
     grid.add_column(justify="right")
     grid.add_row(
-        "[bold cyan]🤖 AI Agent[/] [gray]v7.35b[/]", 
-        f"[gray]Tools: {len(workflow.tools)}[/]",
+        "[bold cyan] > AI Agent[/] [gray]v7.4b[/]", 
+        f"[gray]Tools: {len(tools)}[/]",
         f"[gray]{model_name}[/] [cyan]•[/]"
     )
     console.print(Panel(grid, style="panel.border", padding=(0, 1)))
@@ -161,7 +168,10 @@ async def main():
     # 3. Session Setup
     session = PromptSession(
         history=FileHistory(".history"),
-        completer=MergeCompleter([WordCompleter(['/help', '/tools', 'exit', 'clear']), PathCompleter()]),
+        completer=MergeCompleter([
+            WordCompleter(['/help', '/tools', 'exit', 'clear']), 
+            FuzzyPathCompleter(root_dir=".")
+        ]),
         key_bindings=get_key_bindings(),
         lexer=PygmentsLexer(MarkdownLexer),
         auto_suggest=AutoSuggestFromHistory()
@@ -187,7 +197,7 @@ async def main():
                 continue
             
             if user_input.lower() == "/tools":
-                show_tools(workflow)
+                show_tools(tools)
                 continue
 
             if user_input.lower() == "/help":
@@ -197,8 +207,20 @@ async def main():
             # Auto-fix for interrupted tool calls
             repair_session_if_needed(agent_app, thread_id, console)
 
+            # Initialize State & Config
+            initial_state = {
+                "messages": [("user", user_input)], 
+                "steps": 0,
+                "token_used": 0 
+            }
+            config = {"configurable": {"thread_id": thread_id}, "recursion_limit": temp_cfg.max_loops * 4}
+            
+            # Start Stream
+            stream = agent_app.astream(initial_state, config=config, stream_mode=["messages", "updates"])
+            
+            # Process Stream
             processor = StreamProcessor(console)
-            last_stats = await processor.run(agent_app, user_input, thread_id, temp_cfg.max_loops)
+            last_stats = await processor.process_stream(stream)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             continue
@@ -206,8 +228,8 @@ async def main():
             console.print(f"[bold red]{format_exception_friendly(e)}[/]")
 
     # Final Cleanup
-    if hasattr(workflow, 'tool_registry') and workflow.tool_registry:
-        await workflow.tool_registry.cleanup()
+    if tool_registry:
+        await tool_registry.cleanup()
     try:
         from tools.system_tools import _net_client
         if _net_client: await _net_client.close()

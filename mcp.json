@@ -3,13 +3,13 @@
     "command": "mcp-server-filesystem",
     "args": ["."],
     "transport": "stdio",
-    "enabled": true
+    "enabled": false
   },
    "mcp-cli-exec": {
       "command": "mcp-cli-exec",
       "args": [""],
       "transport": "stdio",
-	  "enabled": true
+	  "enabled": false
 	},
   "context7": {
     "type": "remote",
@@ -25,5 +25,14 @@
       ],
 	"transport": "stdio",
     "enabled": false
-    }
+    },
+  "local-pdf-tools": {
+    "command": "uv",
+	"args": [
+      "run",
+      "D:/pdf_mcp/pdf_server.py"
+    ],
+	"transport": "stdio",
+    "enabled": true
+  }
 }

@@ -4,12 +4,15 @@ import asyncio
 import json
 import hashlib
 import time
-from functools import wraps
+from functools import wraps, lru_cache
 from typing import Optional, List, Any, Union, Dict
 
 from langchain_core.tools import tool
 
 from core.config import AgentConfig
+from core.safety_policy import SafetyPolicy
+from core.errors import format_error, ErrorType
+from core.utils import truncate_output
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,13 @@ except ImportError:
 _client: Optional[Any] = None
 # Семафор для ограничения параллельных запросов (Rate Limit)
 _search_semaphore = asyncio.Semaphore(5)
+
+# Global safety policy
+_SAFETY_POLICY: Optional[SafetyPolicy] = None
+
+def set_safety_policy(policy: SafetyPolicy):
+    global _SAFETY_POLICY
+    _SAFETY_POLICY = policy
 
 # ======================================================
 # CACHING SYSTEM (In-Memory TTL + Size Limit)
@@ -86,27 +96,16 @@ def with_cache(ttl: int = 600):
 # HELPERS
 # ======================================================
 
-def _format_error(error_type: str, details: str = "") -> str:
-    """Унифицированное форматирование ошибок."""
-    error_templates = {
-        "disabled": "Error: Search tools are disabled by configuration (ENABLE_SEARCH_TOOLS=False).",
-        "missing_config": "Error: Search is unavailable due to missing configuration (API Key or SDK).",
-        "empty_query": "Error: Empty query provided.",
-        "api_error": "Error: Search failed after 3 attempts. Details: {details}",
-        "auth_error": "Error: Invalid API credentials (401 Unauthorized).",
-        "no_results": "Error: No results found.",
-    }
-    msg = error_templates.get(error_type, f"Error: {details}")
-    if "{details}" in msg:
-        msg = msg.format(details=details)
-    return msg
+@lru_cache(maxsize=1)
+def _get_config() -> AgentConfig:
+    return AgentConfig()
 
 def get_tavily_client() -> Optional[Any]:
     global _client
     
     # Load config once or per call (lightweight)
     try:
-        config = AgentConfig()
+        config = _get_config()
     except Exception as e:
         logger.error(f"Config load failed: {e}")
         return None
@@ -134,7 +133,7 @@ def get_tavily_client() -> Optional[Any]:
 async def _execute_with_retry(coroutine_func, *args, **kwargs):
     """Выполняет запрос с ретраями и семафором."""
     try:
-        config = AgentConfig()
+        config = _get_config()
         max_retries = config.max_retries
         retry_delay = config.retry_delay
     except Exception:
@@ -165,11 +164,11 @@ async def web_search(query: str, max_results: int = 5) -> str:
     Search internet for snippets and AI summary. Best for facts, news, comparisons.
     """
     if not get_tavily_client():
-        return _format_error("missing_config")
+        return format_error(ErrorType.CONFIG, "Search is unavailable due to missing configuration (API Key or SDK).")
 
     query = (query or "").strip()
     if not query:
-        return _format_error("empty_query")
+        return format_error(ErrorType.VALIDATION, "Empty query provided.")
 
     client = get_tavily_client()
     try:
@@ -183,8 +182,8 @@ async def web_search(query: str, max_results: int = 5) -> str:
     except Exception as e:
         msg = str(e).lower()
         if "401" in msg or "unauthorized" in msg:
-            return _format_error("auth_error")
-        return _format_error("api_error", details=str(e))
+            return format_error(ErrorType.ACCESS_DENIED, "Invalid API credentials (401 Unauthorized).")
+        return format_error(ErrorType.NETWORK, f"Search failed. Details: {str(e)}")
 
     results = []
     
@@ -195,11 +194,11 @@ async def web_search(query: str, max_results: int = 5) -> str:
 
     items = response.get("results", [])
     if not items:
-        return "\n".join(results) if results else _format_error("no_results")
+        return "\n".join(results) if results else format_error(ErrorType.NOT_FOUND, "No results found.")
 
     # Format compact result
     total_chars = 0
-    max_chars = 11000 
+    max_chars = _SAFETY_POLICY.max_search_chars if _SAFETY_POLICY else 10000
     separator = "-" * 40
 
     for item in items:
@@ -229,38 +228,59 @@ async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> 
     """
     Extract text from one or multiple URLs. 
     Use this to read pages after searching. Supports batching (up to 20 links).
+    
+    Args:
+        urls: Single URL string or list of URL strings.
+        advanced: If True, uses deeper extraction (slower).
     """
     client = get_tavily_client()
     if not client:
-        return "Error: Fetch unavailable due to missing configuration."
+        return format_error(ErrorType.CONFIG, "Fetch unavailable due to missing configuration.")
 
+    # Robust handling for models that pass stringified lists
     if isinstance(urls, str):
-        urls = [urls]
+        urls = urls.strip()
+        # Check if it looks like a JSON list
+        if urls.startswith("[") and urls.endswith("]"):
+            try:
+                parsed = json.loads(urls)
+                if isinstance(parsed, list):
+                    urls = parsed
+                else:
+                    urls = [urls] # Fallback
+            except json.JSONDecodeError:
+                urls = [urls] # Treat as single URL if parse fails
+        else:
+            urls = [urls]
     
     clean_urls = []
     for u in urls:
-        if isinstance(u, str) and u.startswith("http"):
-             clean_urls.append(u.strip().strip('"\''))
+        if isinstance(u, str):
+             # Remove quotes and whitespace that models sometimes add
+             u_clean = u.strip().strip('"\'')
+             if u_clean.startswith("http"):
+                 clean_urls.append(u_clean)
     
     clean_urls = list(set(clean_urls))[:20]
     if not clean_urls:
-        return "Error: No valid URLs provided."
+        return format_error(ErrorType.VALIDATION, f"No valid URLs provided. Input was: {urls}")
 
     depth = "advanced" if advanced else "basic"
     try:
         response = await _execute_with_retry(client.extract, urls=clean_urls, extract_depth=depth)
     except Exception as e:
-        return f"Error: Fetch failed. Details: {e}"
+        return format_error(ErrorType.EXECUTION, f"Fetch failed. Details: {e}")
 
     output_parts = []
-    max_chars_per_url = 8000 if len(clean_urls) == 1 else 3000
+    # Dynamic limit per URL based on count
+    max_tool_output = _SAFETY_POLICY.max_tool_output if _SAFETY_POLICY else 4000
+    max_chars_per_url = max_tool_output if len(clean_urls) == 1 else int(max_tool_output / len(clean_urls)) + 500
     
     for item in response.get("results", []):
         url = item.get("url", "Unknown")
         content = item.get("raw_content") or item.get("content") or ""
         
-        if len(content) > max_chars_per_url:
-            content = content[:max_chars_per_url] + "\n... [Truncated]"
+        content = truncate_output(content, max_chars_per_url, source=url)
         
         output_parts.append(f"=== SOURCE: {url} ===\n{content or '[Empty]'}\n{'='*30}")
 
@@ -269,79 +289,22 @@ async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> 
         for f in failed:
             output_parts.append(f"❌ FAILED: {f.get('url')} - {f.get('error')}")
 
-    return "\n".join(output_parts) or "Error: No content extracted."
+    return "\n".join(output_parts) or format_error(ErrorType.EXECUTION, "No content extracted.")
 
 @tool("batch_web_search")
 @with_cache(ttl=600)
 async def batch_web_search(queries: List[str]) -> str:
     """
-    Runs multiple queries in parallel. Much faster/cheaper than calling web_search N times.
-    Use for: multi-aspect research, verifying facts from different angles.
+    Perform multiple searches in parallel.
+    Args:
+        queries: List of search queries
     """
-    client = get_tavily_client()
-    if not client:
-        return "Error: Search unavailable."
-
-    queries = queries[:5]
-    tasks = [
-        client.search(query=q, max_results=4, search_depth="basic", include_answer=True)
-        for q in queries
-    ]
-
-    try:
-        results_list = await asyncio.gather(*tasks, return_exceptions=True)
-    except Exception as e:
-        return f"Batch search error: {e}"
-
-    output = []
-    for q, res in zip(queries, results_list):
-        output.append(f"\n=== Search: {q} ===")
-        if isinstance(res, Exception):
-            output.append(f"Error: {res}")
-            continue
-            
-        if res.get("answer"):
-            output.append(f"AI Summary: {res.get('answer')}")
-            
-        for item in res.get("results", []):
-            title = item.get('title', 'No Title')
-            url = item.get('url', 'No URL')
-            content = item.get('content', '')[:200]
-            output.append(f"- {title} ({url}): {content}...")
-            
-    return "\n".join(output)
-
-@tool("crawl_site")
-@with_cache(ttl=3600)
-async def crawl_site(
-    start_url: str,
-    max_depth: int = 3,
-    limit: int = 50,
-    include_subdomains: bool = False,) -> str:
-    """
-    Crawl a website starting from start_url and collect relevant pages.
-    """
-    client = get_tavily_client()
-    if not client: return "Error: Config missing."
-
-    try:
-        response = await _execute_with_retry(
-            client.crawl,
-            url=start_url,
-            max_depth=max_depth,
-            limit=limit,
-            include_subdomains=include_subdomains
-        )
-    except Exception as e:
-        return f"Crawl failed: {e}"
-
-    pages = response.get("results", []) or response.get("pages", [])
-    if not pages: return "No pages crawled."
-
-    parts = []
-    for idx, page in enumerate(pages[:20], 1): # Limit output size
-        content = page.get("raw_content") or page.get("content") or ""
-        if content:
-            parts.append(f"[Page {idx}] {page.get('url')}\n{'='*40}\n{content[:2000]}\n")
-
-    return "\n".join(parts)
+    if not queries:
+        return format_error(ErrorType.VALIDATION, "No queries provided.")
+    
+    results = []
+    for q in queries[:5]: # Limit to 5 parallel searches
+        res = await web_search(q)
+        results.append(f"Query: {q}\n{res}\n{'='*50}")
+        
+    return "\n".join(results)

@@ -3,18 +3,94 @@ from typing import Tuple, Dict, Any
 from langchain_core.messages import AIMessage, AIMessageChunk
 from prompt_toolkit.key_binding import KeyBindings
 
-# --- OPTIONAL IMPORTS (Tiktoken) ---
-try:
-    import tiktoken
-    _ENCODER = tiktoken.get_encoding("cl100k_base")
-except ImportError:
-    _ENCODER = None
-
 # ======================================================
 # TEXT PROCESSING
 # ======================================================
 
 _THOUGHT_RE = re.compile(r"<(thought|think)>(.*?)</\1>", re.DOTALL)
+
+def truncate_value(value: str, max_length: int = 60) -> str:
+    """Truncate a string value if it exceeds max_length."""
+    if len(value) > max_length:
+        return value[:max_length] + "..."
+    return value
+
+def abbreviate_path(path_str: str, max_length: int = 60) -> str:
+    """Abbreviate a file path intelligently - show basename or relative path."""
+    from pathlib import Path
+    try:
+        path = Path(path_str)
+        # If it's just a filename (no directory parts), return as-is
+        if len(path.parts) == 1:
+            return path_str
+
+        # Try to get relative path from current working directory
+        try:
+            rel_path = path.relative_to(Path.cwd())
+            rel_str = str(rel_path)
+            # Use relative if it's shorter and not too long
+            if len(rel_str) < len(path_str) and len(rel_str) <= max_length:
+                return rel_str
+        except (ValueError, OSError):
+            pass
+
+        # If absolute path is reasonable length, use it
+        if len(path_str) <= max_length:
+            return path_str
+    except Exception:
+        pass
+    
+    # Fallback: just show basename (filename only) if path is too long
+    return truncate_value(path_str, max_length)
+
+def format_tool_display(tool_name: str, tool_args: Dict[str, Any]) -> str:
+    """
+    Format tool calls for display with tool-specific smart formatting.
+    Based on deepagents-cli UI.
+    """
+    # Tool-specific formatting - show the most important argument(s)
+    if tool_name in {"read_file", "write_file", "edit_file", "Read", "Write", "SearchReplace"}:
+        # File operations: show the primary file path argument
+        path_value = tool_args.get("file_path") or tool_args.get("path")
+        if path_value:
+            path = abbreviate_path(str(path_value))
+            return f"{tool_name}({path})"
+
+    elif tool_name in {"web_search", "WebSearch"}:
+        # Web search: show the query string
+        if "query" in tool_args:
+            query = truncate_value(str(tool_args["query"]), 80)
+            return f'{tool_name}("{query}")'
+
+    elif tool_name in {"grep", "Grep", "glob", "Glob"}:
+        # Search tools: show pattern
+        if "pattern" in tool_args:
+            pattern = truncate_value(str(tool_args["pattern"]), 70)
+            return f'{tool_name}("{pattern}")'
+
+    elif tool_name in {"execute", "RunCommand"}:
+        # Execute: show the command
+        if "command" in tool_args:
+            command = truncate_value(str(tool_args["command"]), 100)
+            return f'{tool_name}("{command}")'
+
+    elif tool_name in {"ls", "LS"}:
+        # ls: show directory, or empty if current directory
+        if tool_args.get("path"):
+            path = abbreviate_path(str(tool_args["path"]))
+            return f"{tool_name}({path})"
+        return f"{tool_name}()"
+
+    elif tool_name in {"fetch_url", "WebFetch"}:
+        if "url" in tool_args:
+            url = truncate_value(str(tool_args["url"]), 80)
+            return f'{tool_name}("{url}")'
+
+    # Fallback: generic formatting
+    args_str = ", ".join(
+        f"{k}={truncate_value(str(v), 50)}" for k, v in tool_args.items()
+    )
+    return f"{tool_name}({args_str})"
 
 def clean_markdown_text(text: str) -> str:
     """Убирает лишние отступы и двойные переносы строк."""
@@ -78,6 +154,27 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
         if pages != "?" or depth != "?":
              return f"Crawled {pages} pages (depth: {depth})"
         return "Crawl completed"
+        
+    elif "cli_exec" in name:
+        # Разбиваем вывод на строки и убираем пустые
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        
+        if not lines:
+            return "Command executed (no output)"
+        
+        # Берем первую значимую строку для превью
+        first_line = lines[0]
+        # Если в первой строке есть "[stderr]", убираем его для красоты
+        first_line = first_line.replace("[stderr]", "").strip()
+        
+        # Обрезаем, если длинная
+        preview = first_line[:60] + "..." if len(first_line) > 60 else first_line
+        
+        # Если строк много, добавляем счетчик
+        if len(lines) > 1:
+            return f"{preview} [dim](+{len(lines)-1} lines)[/]"
+        
+        return preview
 
     elif "list" in name and "directory" in name:
         lines = content.splitlines()
@@ -94,6 +191,9 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
         
     elif "write" in name or "save" in name: 
         return "File saved successfully"
+        
+    elif "edit_file" in name:
+        return "File edited successfully"
     
     elif "delete" in name:
         return "Deleted successfully"
@@ -151,35 +251,32 @@ def get_key_bindings():
 class TokenTracker:
     def __init__(self):
         self.max_input = 0
-        self._usage_map: Dict[str, int] = {}  # msg_id -> output_tokens
-        self._streaming_text = "" 
-        self.source_label = "Est" 
+        self.total_output = 0
+        self._streaming_len = 0 
 
     def update_from_message(self, msg: Any):
         """
-        Обновляет счетчики на основе сообщения (чанка или полного).
-        Использует гибридный подход: 
-        1. Метаданные (если есть) - сохраняем по ID сообщения.
-        2. Текст (streaming) - накапливаем для оценки.
+        Updates counters based on message content or metadata.
         """
-        # 1. Update Metadata
+        # 1. Prefer Metadata if available
         if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-            self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None), msg)
-        
-        # 2. Accumulate Text for Estimation
+            self._apply_metadata(msg.usage_metadata)
+            return
+
+        # 2. Fallback: Estimate from content length (for streaming)
         if isinstance(msg, (AIMessage, AIMessageChunk)):
             content = msg.content
-            chunk = ""
-            if isinstance(content, str): chunk = content
+            chunk_len = 0
+            if isinstance(content, str): 
+                chunk_len = len(content)
             elif isinstance(content, list):
-                chunk = "".join(x.get("text", "") for x in content if isinstance(x, dict))
+                chunk_len = sum(len(x.get("text", "")) for x in content if isinstance(x, dict))
             
-            # Всегда накапливаем текст для независимой оценки
-            self._streaming_text += chunk
+            self._streaming_len += chunk_len
 
     def update_from_node_update(self, update: Dict):
         """
-        Обновляет счетчики из обновления состояния (обычно содержит полные сообщения с метаданными).
+        Updates counters from state updates (final messages with metadata).
         """
         agent_data = update.get("agent")
         if not agent_data: return
@@ -187,58 +284,23 @@ class TokenTracker:
         if not isinstance(messages, list): messages = [messages]
         for msg in messages:
             if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                self._apply_metadata(msg.usage_metadata, getattr(msg, "id", None), msg)
+                self._apply_metadata(msg.usage_metadata)
 
-    def _apply_metadata(self, usage: Dict, msg_id: str = None, msg: Any = None):
-        # Check source
-        source = usage.get("token_source")
-        if not source and msg and hasattr(msg, "additional_kwargs"):
-            source = msg.additional_kwargs.get("token_source")
-
-        if source == "Manual":
-            self.source_label = "Manual"
-        
+    def _apply_metadata(self, usage: Dict):
         in_t = usage.get("input_tokens", 0)
         if in_t > self.max_input: self.max_input = in_t
         
+        # Assume output_tokens in metadata is the total for the response
         out_t = usage.get("output_tokens", 0)
-        if out_t > 0:
-            if msg_id:
-                # Store usage per message ID.
-                # Assuming cumulative updates from provider (standard for LangChain usage_metadata).
-                # Even if delta, max() is safer than sum() for unknown behavior, 
-                # but typically usage_metadata IS the total for that message.
-                current = self._usage_map.get(msg_id, 0)
-                if out_t > current:
-                    self._usage_map[msg_id] = out_t
-                    self.source_label = "Provider"
-            else:
-                # No ID (rare) - ignore to avoid double counting or implementation complexity
-                pass
+        if out_t > self.total_output:
+            self.total_output = out_t
 
     def render(self, duration: float) -> str:
-        # 1. Calculate Estimate
-        est = 0
-        if self._streaming_text:
-            if _ENCODER:
-                est = len(_ENCODER.encode(self._streaming_text))
-            else:
-                est = len(self._streaming_text) // 3
+        # Display: Prefer exact metadata, else estimate (chars / 3)
+        display_out = self.total_output
+        if display_out == 0 and self._streaming_len > 0:
+            display_out = self._streaming_len // 3
         
-        # 2. Calculate Total Metadata Output
-        total_output_metadata = sum(self._usage_map.values())
+        in_display = str(self.max_input) if self.max_input > 0 else "?"
         
-        # 3. Hybrid Decision Logic
-        display_out = 0
-        # label = self.source_label # Removed text label in favor of clean UI
-
-        if total_output_metadata > 0:
-            if est > 100 and total_output_metadata < (est * 0.2):
-                 display_out = est
-            else:
-                 display_out = total_output_metadata
-        else:
-            display_out = est
-
-        # Minimalist stats line
-        return f"[dim]• {duration:.1f}s   In: {self.max_input}   Out: {display_out}[/]"
+        return f"[dim]• {duration:.1f}s   In: {in_display}   Out: {display_out}[/]"

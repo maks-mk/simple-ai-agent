@@ -11,13 +11,15 @@
 # 1) Общие настройки
 # ===========================
 TEMPERATURE=0.2
-MAX_LOOPS=15
+MAX_LOOPS=50
 MODEL_SUPPORTS_TOOLS=true
 
 # Включение/отключение подсистем
 ENABLE_SEARCH_TOOLS=true
 ENABLE_SYSTEM_TOOLS=false
-ENABLE_OS_TOOLS=false
+ENABLE_FILESYSTEM_TOOLS=true
+ENABLE_SHELL_TOOL=true
+ENABLE_PROCESS_TOOLS=false
 
 # Логи/отладка
 DEBUG=false

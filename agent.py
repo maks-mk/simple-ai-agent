@@ -1,13 +1,11 @@
 import asyncio
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple, Any
 from dotenv import load_dotenv
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
-from langchain_core.messages import (
-    AIMessage, ToolMessage, SystemMessage
-)
+from langchain_core.messages import AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -18,6 +16,10 @@ from core.logging_config import setup_logging
 from core.nodes import AgentNodes
 from tools.tool_registry import ToolRegistry
 
+# LLM Imports (Moved from config.py)
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+
 # Setup logging
 try:
     logger = setup_logging()
@@ -25,103 +27,113 @@ except Exception:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("agent")
 
-class AgentWorkflow:
-    def __init__(self):
-        load_dotenv(BASE_DIR / '.env')
-        self.config = AgentConfig()
-        
-        # Initialize LLM early to pass to registry
-        self.llm = self.config.get_llm()
-        
-        self.tool_registry = ToolRegistry(self.config, self.llm)
-        
-        self.llm_with_tools: Optional[BaseChatModel] = None
-        
-        self.nodes: Optional[AgentNodes] = None
+# --- Factories ---
 
-    async def initialize_resources(self):
-        """Initializes LLM, Tools and Nodes."""
-        logger.info(f"Initializing agent: [bold cyan]{self.config.provider}[/]", extra={"markup": True})
-        logger.debug(f"Prompt Path: {self.config.prompt_path.absolute()}")
-        
-        # self.llm already initialized in __init__
-        await self.tool_registry.load_all()
-        
-        # Bind tools if supported
-        can_use_tools = self.config.check_tool_support()
-        
-        if self.tool_registry.tools and can_use_tools:
-            try:
-                self.llm_with_tools = self.llm.bind_tools(self.tool_registry.tools)
-                logger.info("🛠️ Tools bound to LLM successfully.")
-            except Exception as e:
-                logger.error(f"Failed to bind tools: {e}")
-                self.llm_with_tools = self.llm
-        else:
-            if not can_use_tools:
-                logger.debug("⚠️ Tools disabled: Model does not support tool calling.")
-            self.llm_with_tools = self.llm
-
-        # Initialize Nodes
-        self.nodes = AgentNodes(
-            config=self.config,
-            llm=self.llm,
-            tools=self.tools,
-            llm_with_tools=self.llm_with_tools
+def create_llm(config: AgentConfig) -> BaseChatModel:
+    """Initializes LLM based on configuration."""
+    if config.provider == "gemini":
+        return ChatGoogleGenerativeAI(
+            model=config.gemini_model,
+            temperature=config.temperature,
+            google_api_key=config.gemini_api_key.get_secret_value(),
+            convert_system_message_to_human=True
         )
+    elif config.provider == "openai":
+        return ChatOpenAI(
+            model=config.openai_model,
+            temperature=config.temperature,
+            api_key=config.openai_api_key.get_secret_value(),
+            base_url=config.openai_base_url,
+            stream_usage=True
+        )
+    raise ValueError(f"Unknown provider: {config.provider}")
 
-    @property
-    def tools(self) -> List[BaseTool]:
-        return self.tool_registry.tools
+def check_tool_support(config: AgentConfig) -> bool:
+    """Determines if the current model supports tool calling."""
+    # Полностью полагаемся на явную настройку в .env (MODEL_SUPPORTS_TOOLS)
+    return config.model_supports_tools
 
-    def build_graph(self):
-        if not self.nodes:
-            raise RuntimeError("Resources not initialized. Call initialize_resources() first.")
+# --- Builder ---
 
-        workflow = StateGraph(AgentState)
+async def build_agent_app() -> Tuple[Any, ToolRegistry]:
+    """
+    Builds the LangGraph application and returns it along with the tool registry.
+    """
+    load_dotenv(BASE_DIR / '.env')
+    config = AgentConfig()
+    
+    logger.info(f"Initializing agent: [bold cyan]{config.provider}[/]", extra={"markup": True})
+    logger.debug(f"Prompt Path: {config.prompt_path.absolute()}")
 
-        workflow.add_node("summarize", self.nodes.summarize_node)
-        workflow.add_node("agent", self.nodes.agent_node)
-        workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
-        workflow.add_node("tools", self.nodes.tools_node)
+    # 1. Initialize Resources
+    llm = create_llm(config)
+    tool_registry = ToolRegistry(config)
+    await tool_registry.load_all()
+    
+    # 2. Bind Tools
+    tools = tool_registry.tools
+    can_use_tools = check_tool_support(config)
+    
+    llm_with_tools = llm
+    if tools and can_use_tools:
+        try:
+            llm_with_tools = llm.bind_tools(tools)
+            logger.info("🛠️ Tools bound to LLM successfully.")
+        except Exception as e:
+            logger.error(f"Failed to bind tools: {e}")
+    else:
+        if not can_use_tools:
+            logger.debug("⚠️ Tools disabled: Model does not support tool calling.")
 
-        tools_enabled = bool(self.tools) and self.config.check_tool_support()
+    # 3. Create Nodes
+    nodes = AgentNodes(
+        config=config,
+        llm=llm,
+        tools=tools,
+        llm_with_tools=llm_with_tools
+    )
 
-        # Simple Linear Flow: Start -> Summarize -> Update Step -> Agent -> [Tools -> Agent] or End
-        workflow.add_edge(START, "summarize")
-        workflow.add_edge("summarize", "update_step")
-        workflow.add_edge("update_step", "agent")
+    # 4. Build Graph
+    workflow = StateGraph(AgentState)
 
-        def should_continue(state: AgentState):
-            steps = state.get("steps", 0)
-            messages = state.get("messages", [])
+    workflow.add_node("summarize", nodes.summarize_node)
+    workflow.add_node("agent", nodes.agent_node)
+    workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
+    workflow.add_node("tools", nodes.tools_node)
 
-            if steps >= self.config.max_loops:
-                logger.debug(f"🛑 Loop Guard: {steps} steps.")
-                return END
+    # Simple Linear Flow: Start -> Summarize -> Update Step -> Agent -> [Tools -> Agent] or End
+    workflow.add_edge(START, "summarize")
+    workflow.add_edge("summarize", "update_step")
+    workflow.add_edge("update_step", "agent")
 
-            if not messages: return "agent"
-            last_msg = messages[-1]
+    def should_continue(state: AgentState):
+        steps = state.get("steps", 0)
+        messages = state.get("messages", [])
 
-            if tools_enabled and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
-                return "tools"
-            
-            # If agent returns content without tool calls, we stop (or wait for user input in CLI loop)
+        if steps >= config.max_loops:
+            logger.debug(f"🛑 Loop Guard: {steps} steps.")
             return END
 
-        workflow.add_conditional_edges("agent", should_continue, ["tools", END])
-        
-        if tools_enabled:
-            # Fix Loop Logic: tools -> update_step -> agent
-            # This ensures steps are incremented even inside the tool loop
-            workflow.add_edge("tools", "update_step")
+        if not messages: return "agent"
+        last_msg = messages[-1]
 
-        return workflow.compile(checkpointer=MemorySaver())
+        # Only go to tools if tools are actually enabled/bound
+        if tools and can_use_tools and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+            return "tools"
+        
+        return END
+
+    workflow.add_conditional_edges("agent", should_continue, ["tools", END])
+    
+    if tools and can_use_tools:
+        workflow.add_edge("tools", "update_step")
+
+    return workflow.compile(checkpointer=MemorySaver()), tool_registry
 
 if __name__ == "__main__":
     async def main():
-        wf = AgentWorkflow()
-        await wf.initialize_resources()
-        print(f"✔ Agent Ready. Tools: {len(wf.tools)}")
+        app, registry = await build_agent_app()
+        print(f"✔ Agent Ready. Tools: {len(registry.tools)}")
+        await registry.cleanup()
 
     asyncio.run(main())

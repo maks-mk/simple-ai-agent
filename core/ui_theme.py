@@ -19,8 +19,6 @@ AGENT_THEME = Theme({
     
     # Agent interaction
     "agent.thought": Style(color="#565f89", italic=True), # Subtle thought color
-    "agent.say": Style(color="#7aa2f7", bold=True), # Blue
-    "user.say": Style(color="#9ece6a", bold=True), # Green
     
     # Panels and Layouts
     "panel.border": Style(color="#3b4261"), # Dark Grey Blue

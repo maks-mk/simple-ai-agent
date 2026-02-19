@@ -13,6 +13,9 @@ from core.state import AgentState
 from core.config import AgentConfig
 from core import constants
 from core.cli_utils import format_exception_friendly
+from core.validation import validate_tool_result
+from core.utils import truncate_output
+from core.errors import format_error, ErrorType
 
 logger = logging.getLogger("agent")
 
@@ -57,14 +60,16 @@ class AgentNodes:
         
         try:
             res = await self.llm.ainvoke(prompt)
-            # Ensure metadata exists for summary too
-            self._ensure_usage_metadata(res, [HumanMessage(content=prompt)])
             
             delete_msgs = [RemoveMessage(id=m.id) for m in to_summarize if m.id]
             logger.info(f"🧹 Summary: Removed {len(delete_msgs)} messages.")
             return {"summary": res.content, "messages": delete_msgs}
         except Exception as e:
-            logger.error(f"Summarization Error: {e}")
+            err_str = str(e)
+            if "content_filter" in err_str or "Moderation Block" in err_str:
+                 logger.warning(f"🧹 Summarization skipped due to Content Filter (False Positive). Continuing with full history.")
+            else:
+                logger.error(f"Summarization Error: {format_exception_friendly(e)}")
             return {}
 
     def _format_history_for_summary(self, messages: List[BaseMessage]) -> str:
@@ -91,14 +96,9 @@ class AgentNodes:
         # Invoke LLM
         response = await self._invoke_llm_with_retry(self.llm_with_tools, full_context)
         
-        # Ensure metadata is present (inject estimate if missing)
-        self._ensure_usage_metadata(response, full_context)
-
         # Token Updates
         token_usage_update = {}
         if isinstance(response, AIMessage):
-            # No need to call _update_token_usage separately if we rely on metadata now
-            # But let's keep it consistent with existing state logic
             if response.usage_metadata:
                  token_usage_update = {"token_usage": response.usage_metadata}
 
@@ -110,6 +110,9 @@ class AgentNodes:
     # --- NODE: TOOLS ---
 
     async def tools_node(self, state: AgentState):
+        # Invariants Check (Debug Mode)
+        self._check_invariants(state)
+
         messages = state["messages"]
         last_msg = messages[-1]
         
@@ -125,23 +128,33 @@ class AgentNodes:
             t_id = tool_call["id"]
             
             # Execute
-            content = await self._execute_tool(t_name, t_args)
+            if self._check_loop(messages, t_name, t_args):
+                content = format_error(ErrorType.LOOP_DETECTED, f"Loop detected. You have called '{t_name}' with these exact arguments 3 times in the recent history. Please try a different approach.")
+                has_error = True
+            else:
+                content = await self._execute_tool(t_name, t_args)
             
-            # Check for error signature
-            if content.startswith("Error:") or content.startswith("Ошибка:"):
+            # Post-Tool Validation Layer
+            validation_error = validate_tool_result(t_name, t_args, content)
+            if validation_error:
+                content = f"{content}\n\n{validation_error}"
                 has_error = True
 
-            # Truncate output to avoid context window explosion
-            # 4000 chars ~ 1000 tokens. This is a safe limit for tool outputs.
-            MAX_TOOL_OUTPUT = 4000
-            if len(content) > MAX_TOOL_OUTPUT:
-                content = content[:MAX_TOOL_OUTPUT] + f"\n... [Output truncated. Total length: {len(content)} chars]"
+            # Check for error signature (unified format)
+            if "ERROR[" in content:
+                has_error = True
+
+            # Truncate output (Safety Layer)
+            # Use SafetyPolicy limit from config (defaults to 5000)
+            limit = self.config.safety.max_tool_output
+            content = truncate_output(content, limit, source=t_name)
 
             tool_msg = ToolMessage(content=content, tool_call_id=t_id, name=t_name)
-            
             final_messages.append(tool_msg)
 
-        if has_error:
+        # Reflection Hint (Conditional)
+        # If strict_mode is ON, we disable auto-reflection hint.
+        if has_error and not self.config.strict_mode:
             # Inject reflection prompt to guide the agent
             reflection_msg = HumanMessage(content=constants.REFLECTION_PROMPT)
             final_messages.append(reflection_msg)
@@ -150,32 +163,49 @@ class AgentNodes:
             "messages": final_messages,
         }
 
+    def _check_invariants(self, state: AgentState):
+        """Debug-only validator for graph state."""
+        if not self.config.debug:
+            return
+            
+        steps = state.get("steps", 0)
+        
+        if steps < 0:
+            logger.error(f"INVARIANT VIOLATION: steps ({steps}) < 0")
+        
+    def _check_loop(self, messages: List[BaseMessage], tool_name: str, tool_args: dict) -> bool:
+        """
+        Detects if the exact same tool call has been made repeatedly (>= 3 times) in recent history.
+        """
+        count = 0
+        # Check last 20 messages to catch loops
+        for m in reversed(messages[-20:]):
+            if isinstance(m, AIMessage) and m.tool_calls:
+                for tc in m.tool_calls:
+                    if tc.get("name") == tool_name and tc.get("args") == tool_args:
+                        count += 1
+        
+        return count >= 3
+
     async def _execute_tool(self, name: str, args: dict) -> str:
         tool = next((t for t in self.tools if t.name == name), None)
         if not tool:
-            return f"Error: Tool '{name}' not found."
+            return format_error(ErrorType.NOT_FOUND, f"Tool '{name}' not found.")
         try:
             raw_result = await tool.ainvoke(args)
             content = str(raw_result)
             if not content.strip():
-                return "Error: Tool returned empty response."
+                return format_error(ErrorType.EXECUTION, "Tool returned empty response.")
             return content
         except Exception as e:
-            return f"Error: {str(e)}"
+            return format_error(ErrorType.EXECUTION, str(e))
 
     # --- HELPERS ---
 
     def _build_system_message(self, summary: str, tools_available: bool = True) -> SystemMessage:
-        # 1. Try configured path
+        # 1. Load prompt from config path
         if self.config.prompt_path.exists():
-            prompt_file = self.config.prompt_path
-        elif (constants.BASE_DIR / "prompt.txt").exists():
-            prompt_file = constants.BASE_DIR / "prompt.txt"
-        else:
-            prompt_file = None
-
-        if prompt_file:
-            raw_prompt = prompt_file.read_text("utf-8")
+            raw_prompt = self.config.prompt_path.read_text("utf-8")
         else:
             raw_prompt = (
                 "You are an autonomous AI agent.\n"
@@ -188,6 +218,9 @@ class AgentNodes:
         
         prompt = raw_prompt.replace("{{current_date}}", datetime.now().strftime("%Y-%m-%d"))
         prompt = prompt.replace("{{cwd}}", str(Path.cwd()))
+        
+        if self.config.strict_mode:
+            prompt += "\nNOTE: STRICT MODE ENABLED. Be precise. No guessing."
         
         if not tools_available:
             prompt += "\nNOTE: You are in CHAT-ONLY mode. Tools are disabled."
@@ -225,22 +258,3 @@ class AgentNodes:
                     return AIMessage(content=f"System Error: API request failed after 3 retries. \n{friendly_error}")
                 await asyncio.sleep(1)
         return AIMessage(content="System Error: Unknown failure.")
-
-    def _ensure_usage_metadata(self, response: AIMessage, context: List[BaseMessage]):
-        """Injects estimated usage metadata if missing."""
-        if not response.usage_metadata:
-            # Estimate Input
-            # Rough estimate: 4 chars per token
-            in_chars = sum(len(str(m.content)) for m in context)
-            in_tokens = in_chars // 4
-            
-            # Estimate Output
-            out_chars = len(str(response.content))
-            out_tokens = out_chars // 4
-            
-            response.usage_metadata = {
-                "input_tokens": in_tokens,
-                "output_tokens": out_tokens,
-                "total_tokens": in_tokens + out_tokens,
-                "token_source": "Est"
-            }

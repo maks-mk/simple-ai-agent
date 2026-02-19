@@ -10,7 +10,6 @@ pyinstaller --name "ai_agent" --onefile --clean ^
  --collect-all dotenv ^
  --hidden-import=tiktoken_ext ^
  --hidden-import=tiktoken_ext.openai_public ^
- --hidden-import=pydantic.deprecated.decorator ^
  --icon=icon.ico ^
  agent_cli.py
 

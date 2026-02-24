@@ -131,10 +131,10 @@ class FontManager:
             "regular":      "Roboto-Regular",
             "bold":         "Roboto-Bold",
             "italic":       "Roboto-Italic",
-            "mono":         "Courier",
+            "mono":         "Roboto-Regular",  # Fallback to Roboto-Regular for Cyrillic support
             "path_regular": paths["Roboto-Regular"],
         }
-        logger.info(f"Fonts registered from {fonts_dir}")
+        #logger.info(f"Fonts registered from {fonts_dir}")
         return cls._fonts_cache
 
 # ---------------------------------------------------------------------------
@@ -610,14 +610,30 @@ class PDFProcessor:
                         bbox.x1, bbox.y0 + max(orig_h, needed_h),
                     )
 
-                    result = page.insert_textbox(
-                        insert_bbox, new_text,
-                        fontsize=fontsize,
-                        fontname="Roboto-Regular",
-                        fontfile=fonts["path_regular"],
-                        color=style["color"],
-                        align=0,
-                    )
+                    # Try to use existing font if available to reduce size
+                    inserted = False
+                    try:
+                        result = page.insert_textbox(
+                            insert_bbox, new_text,
+                            fontsize=fontsize,
+                            fontname="Roboto-Regular",
+                            fontfile=None, # Attempt reuse
+                            color=style["color"],
+                            align=0,
+                        )
+                        inserted = True
+                    except Exception:
+                        pass # Fallback to embedding
+
+                    if not inserted:
+                        result = page.insert_textbox(
+                            insert_bbox, new_text,
+                            fontsize=fontsize,
+                            fontname="Roboto-Regular",
+                            fontfile=fonts["path_regular"],
+                            color=style["color"],
+                            align=0,
+                        )
 
                     if result < 0:
                         failed_inserts += 1
@@ -670,14 +686,30 @@ class PDFProcessor:
             if rect.y1 > page_height - 20:
                 rect = fitz.Rect(rect.x0, rect.y0, rect.x1, page_height - 20)
 
-            result = page.insert_textbox(
-                rect, text,
-                fontsize=fontsize,
-                fontname="Roboto-Regular",
-                fontfile=fonts["path_regular"],
-                color=(0, 0, 0),
-                align=0,
-            )
+            # Try to use existing font if available to reduce size
+            inserted = False
+            try:
+                result = page.insert_textbox(
+                    rect, text,
+                    fontsize=fontsize,
+                    fontname="Roboto-Regular",
+                    fontfile=None, # Attempt reuse
+                    color=(0, 0, 0),
+                    align=0,
+                )
+                inserted = True
+            except Exception:
+                pass
+
+            if not inserted:
+                result = page.insert_textbox(
+                    rect, text,
+                    fontsize=fontsize,
+                    fontname="Roboto-Regular",
+                    fontfile=fonts["path_regular"],
+                    color=(0, 0, 0),
+                    align=0,
+                )
 
             out = output_path or str(path.parent / f"{path.stem}_edited.pdf")
             doc.save(out, garbage=4, deflate=True)
@@ -888,5 +920,29 @@ def pdf_from_images(image_paths: List[str], output_path: str) -> str:
     except Exception as e:
         raise PDFProcessingError(f"Conversion failed: {e}")
 
+import sys
+
 if __name__ == "__main__":
-    mcp.run()
+    # Пишем информацию о запуске в stderr
+    #logger.info("=== Starting Local PDF MCP Server ===")
+    #logger.info(f"Максимальный размер PDF: {MAX_PDF_SIZE_BYTES / 1024 / 1024:.0f} MB")
+    #logger.info(f"Ожидаемая папка со шрифтами: {FontManager.get_fonts_dir()}")
+    
+    # Можно сразу проверить наличие шрифтов при запуске, 
+    # чтобы сервер упал с понятной ошибкой до того, как к нему обратится ИИ
+    try:
+        FontManager.ensure_fonts()
+        logger.info("Fonts loaded successfully.")
+    except Exception as e:
+        logger.error(f"Font initialization error: {e}")
+        sys.exit(1)
+
+    logger.info("Server started successfully and listening on stdio...")
+    
+    try:
+        # Запускаем сервер
+        mcp.run()
+    except KeyboardInterrupt:
+        # Перехватываем нажатие Ctrl+C
+        logger.info("Received shutdown signal (Ctrl+C). Shutting down gracefully...")
+        sys.exit(0)

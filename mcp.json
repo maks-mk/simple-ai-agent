@@ -26,13 +26,13 @@
 	"transport": "stdio",
     "enabled": false
     },
-  "local-pdf-tools": {
+  "pdf-tools": {
     "command": "uv",
 	"args": [
       "run",
-      "D:/pdf_mcp/pdf_server.py"
+      "./pdf_mcp/pdf_server.py"
     ],
 	"transport": "stdio",
-    "enabled": true
+    "enabled": false
   }
 }

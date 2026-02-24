@@ -2,7 +2,7 @@ import asyncio
 import logging
 import json
 import os
-from typing import List, Any
+from typing import List, Any, Dict, Union
 from langchain_core.tools import BaseTool
 
 from core.config import AgentConfig
@@ -57,9 +57,11 @@ class ToolRegistry:
                 edit_file_tool,
                 list_directory_tool,
                 download_file,
+                search_in_file_tool,
+                search_in_directory_tool,
+                tail_file_tool,
                 set_safety_policy
             )
-            # Safe delete is still useful separately
             from tools.delete_tools import safe_delete_file, safe_delete_directory
             
             # Apply safety policy
@@ -72,18 +74,19 @@ class ToolRegistry:
                 list_directory_tool,
                 safe_delete_file,
                 safe_delete_directory,
-                download_file
+                download_file,
+                search_in_file_tool,
+                search_in_directory_tool,
+                tail_file_tool,
             ]
             self.tools.extend(fs_tools)
-        except ImportError as e:
-            logger.error(f"Failed to load filesystem tools: {e}")
+        except Exception as e:
+            # ✅ ИСправлено: logger.exception покажет реальную ошибку синтаксиса, а не только ImportError
+            logger.exception(f"Failed to load filesystem tools: {e}")
 
     def _load_process_tools(self):
         """Загрузка инструментов управления процессами."""
         try:
-            # Обрати внимание: проверь, называется ли файл os_tools.py или process_tools.py
-            # В твоем предыдущем коде это было os_tools.py, но в дампе реестра process_tools.
-            # Здесь я использую process_tools, как в твоем последнем примере реестра.
             from tools.process_tools import (
                 run_background_process,
                 stop_background_process,
@@ -99,8 +102,8 @@ class ToolRegistry:
                 find_process_by_port
             ]
             self.tools.extend(proc_tools)
-        except ImportError as e:
-            logger.error(f"Failed to load process tools: {e}")
+        except Exception as e:
+            logger.exception(f"Failed to load process tools: {e}")
 
     def _load_shell_tool(self):
         """Загрузка инструмента командной строки (cli_exec)."""
@@ -111,24 +114,22 @@ class ToolRegistry:
             
             self.tools.append(cli_exec)
             logger.debug("✔ Shell tool (cli_exec) loaded")
-        except ImportError as e:
-            logger.error(f"Failed to load shell tool: {e}")
+        except Exception as e:
+            logger.exception(f"Failed to load shell tool: {e}")
 
     def _load_local_tools(self):
         """Загрузка базовых локальных утилит (Fallback)."""
         try:
             from tools.delete_tools import safe_delete_file, safe_delete_directory
-            # from tools.patch_tool import smart_replace # Removed: file missing
 
             local_tools = [
                 safe_delete_file,
                 safe_delete_directory,
-                # smart_replace,
             ]
             self.tools.extend(local_tools)
             
-        except ImportError as e:
-            logger.error(f"Failed to load local tools: {e}")
+        except Exception as e:
+            logger.exception(f"Failed to load local tools: {e}")
 
     def _load_search_tools(self):
         if not self.config.enable_search_tools:
@@ -142,7 +143,6 @@ class ToolRegistry:
                 batch_web_search,
                 set_safety_policy
             )
-            # crawl_site might be missing or not updated, check import
             try:
                 from tools.search_tools import crawl_site
                 has_crawl = True
@@ -157,8 +157,8 @@ class ToolRegistry:
                 
             self.tools.extend(search_tools)
 
-        except ImportError as e:
-            logger.warning(f"Search tools dependencies missing: {e}")
+        except Exception as e:
+            logger.exception(f"Search tools dependencies missing or failed to load: {e}")
 
     def _load_system_tools(self):
         """Загрузка информационных утилит."""
@@ -177,14 +177,13 @@ class ToolRegistry:
                 get_local_network_info
             ]
             self.tools.extend(system_tools)
-        except ImportError as e:
-            logger.error(f"Failed to load system tools: {e}")
+        except Exception as e:
+            logger.exception(f"Failed to load system tools: {e}")
 
     async def _load_mcp_tools(self):
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient
             
-            # Чтение конфига
             try:
                 raw_cfg = json.loads(self.config.mcp_config_path.read_text("utf-8"))
             except json.JSONDecodeError:
@@ -195,7 +194,6 @@ class ToolRegistry:
                 logger.error(f"❌ MCP Config must be a dictionary, got {type(raw_cfg).__name__}")
                 return
             
-            # Рекурсивно раскрываем переменные окружения в конфигурации
             raw_cfg = self._expand_env_vars(raw_cfg)
 
             for name, cfg in raw_cfg.items():
@@ -207,22 +205,18 @@ class ToolRegistry:
                     if not cfg.get("enabled", True):
                         continue
                     
-                    # Фильтрация аргументов для MultiServerMCPClient
                     valid_keys = {
-                        "command", "args", "env", "cwd", "encoding", "encoding_error_handler", # stdio
-                        "url", "headers", "timeout", "sse_read_timeout", "auth", # http/sse
-                        "terminate_on_close", "httpx_client_factory", # streamable specific
-                        "transport", "session_kwargs" # common
+                        "command", "args", "env", "cwd", "encoding", "encoding_error_handler",
+                        "url", "headers", "timeout", "sse_read_timeout", "auth",
+                        "terminate_on_close", "httpx_client_factory",
+                        "transport", "session_kwargs"
                     }
                     
                     server_config = {k: v for k, v in cfg.items() if k in valid_keys}
                     
-                    # 🔹 IMPORTANT: Create client for this server
-                    # MultiServerMCPClient expects a dict {server_name: config}
                     client = MultiServerMCPClient({name: server_config})
-                    self.mcp_clients.append(client) # Prevent GC
+                    self.mcp_clients.append(client)
                     
-                    # 🔹 Load Tools (No explicit connect() needed for MultiServerMCPClient)
                     mcp_tools = await client.get_tools()
                     
                     if mcp_tools:
@@ -235,9 +229,9 @@ class ToolRegistry:
                     logger.error(f"❌ MCP Server '{name}' Error: {e}")
 
         except Exception as e:
-            logger.error(f"Failed to load MCP tools: {e}")
+            logger.exception(f"Failed to load MCP tools: {e}")
 
-    def _expand_env_vars(self, data: Any) -> Any:
+    def _expand_env_vars(self, data: Union[Dict[str, Any], List[Any], str]) -> Any:
         """
         Рекурсивно проходит по структуре (dict/list/str) и подставляет ENV vars.
         Поддерживает синтаксис ${VAR} или $VAR.
@@ -253,13 +247,27 @@ class ToolRegistry:
 
     async def cleanup(self):
         """Cleanup resources (close MCP connections)."""
-        # MultiServerMCPClient doesn't have close/cleanup methods yet in 0.2.1,
-        # but we hold references to clients.
-        # Ideally, we should close them if they support it.
-        # Checking mcp source, MultiServerMCPClient is not a context manager in 0.2.1 and doesn't have close().
-        # But individual sessions are context managers.
-        # We don't have active sessions here, they are created per-call or handled internally.
-        
-        # However, we might want to clear the list.
+        # ✅ Исправлено: Активное закрытие соединений
+        for client in self.mcp_clients:
+            try:
+                # Пытаемся вызвать close(), если он существует
+                if hasattr(client, "close") and callable(client.close):
+                    if asyncio.iscoroutinefunction(client.close):
+                        await client.close()
+                    else:
+                        client.close()
+                # Или закрываем через асинхронный контекстный менеджер
+                elif hasattr(client, "__aexit__"):
+                    try:
+                        await client.__aexit__(None, None, None)
+                    except Exception as e:
+                        # MultiServerMCPClient raise error on __aexit__ in 0.1.0+
+                        if "MultiServerMCPClient cannot be used as a context manager" in str(e):
+                            pass 
+                        else:
+                            raise e
+            except Exception as e:
+                logger.error(f"Error closing MCP client: {e}")
+                
         self.mcp_clients.clear()
         logger.info("ToolRegistry cleanup completed.")

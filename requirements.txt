@@ -13,6 +13,7 @@ tavily-python
 # System Tools
 psutil
 httpx
+aiofiles
 
 # MCP адаптер (нужен, если у вас есть mcp.json и вы планируете расширять тулы)
 langchain-mcp-adapters

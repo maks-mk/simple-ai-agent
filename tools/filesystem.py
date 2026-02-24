@@ -10,7 +10,7 @@ Features:
 
 import os
 import difflib
-import aiofiles  # ✅ Исправлено: Добавлено для неблокирующего скачивания
+import aiofiles
 from pathlib import Path
 from typing import Union, Optional
 import logging

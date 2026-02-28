@@ -1,9 +1,8 @@
-import json
 import logging
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 from langchain_core.messages import (
     BaseMessage, SystemMessage, RemoveMessage, HumanMessage, AIMessage, ToolMessage
@@ -22,6 +21,8 @@ from core.errors import format_error, ErrorType
 logger = logging.getLogger("agent")
 
 class AgentNodes:
+    __slots__ = ('config', 'llm', 'tools', 'llm_with_tools', 'tools_map', '_cached_base_prompt')
+
     def __init__(self, config: AgentConfig, llm: BaseChatModel, tools: List[BaseTool], llm_with_tools: Optional[BaseChatModel] = None):
         self.config = config
         self.llm = llm
@@ -112,13 +113,10 @@ class AgentNodes:
             return {}
             
     def _format_history_for_summary(self, messages: List[BaseMessage]) -> str:
-        parts =[]
-        for m in messages:
-            content = str(m.content)
-            if len(content) > 500:
-                content = content[:500] + "... [truncated]"
-            parts.append(f"{m.type}: {content}")
-        return "\n".join(parts)
+        return "\n".join(
+            f"{m.type}: {str(m.content)[:500]}{'... [truncated]' if len(str(m.content)) > 500 else ''}"
+            for m in messages
+        )
 
     # --- NODE: AGENT ---
 

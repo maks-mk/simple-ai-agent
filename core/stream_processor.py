@@ -23,6 +23,9 @@ from core.cli_utils import (
 DIFF_REGEX = re.compile(r"```diff\r?\n(.*?)```", re.DOTALL)
 
 class StreamProcessor:
+    __slots__ = ('console', 'tracker', 'full_text', 'clean_full', 'has_thought',
+                 'printed_len', 'printed_tool_ids', 'tool_buffer', 'status_text', 'start_time')
+
     def __init__(self, console: Console):
         self.console = console
         self.tracker = TokenTracker()
@@ -73,8 +76,12 @@ class StreamProcessor:
         """Adds text and updates the parsed caches efficiently."""
         if chunk:
             self.full_text += chunk
-            # Парсим только один раз при обновлении, а не 3 раза на каждый кадр
-            _, self.clean_full, self.has_thought = parse_thought(self.full_text)
+            # Быстрая проверка: если нет тегов мыслей, пропускаем дорогой parse_thought
+            if '<th' in self.full_text:
+                _, self.clean_full, self.has_thought = parse_thought(self.full_text)
+            else:
+                self.clean_full = self.full_text
+                self.has_thought = False
 
     def _handle_updates(self, payload: Dict):
         self.tracker.update_from_node_update(payload)

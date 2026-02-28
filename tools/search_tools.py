@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-import hashlib
+import zlib
 import time
 import ast
 from functools import wraps, lru_cache
@@ -71,7 +71,7 @@ def with_cache(ttl: int = 600):
         async def wrapper(*args, **kwargs):
             # Быстрая генерация ключа без медленного json.dumps
             key_str = f"{func.__name__}:{args}:{kwargs}"
-            key = hashlib.md5(key_str.encode()).hexdigest()
+            key = str(zlib.adler32(key_str.encode()))
 
             # Проверка кэша
             if key in _SEARCH_CACHE:

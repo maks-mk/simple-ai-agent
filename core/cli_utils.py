@@ -233,21 +233,18 @@ def get_key_bindings():
 # ======================================================
 
 class TokenTracker:
-    __slots__ = ('max_input', 'total_output', '_streaming_len')
+    __slots__ = ('max_input', 'total_output', '_streaming_len', '_seen_msg_ids')
 
     def __init__(self):
         self.max_input = 0
         self.total_output = 0
-        self._streaming_len = 0 
+        self._streaming_len = 0
+        self._seen_msg_ids: set = set()  # Дедупликация metadata по id сообщения
 
     def update_from_message(self, msg: Any):
         """Updates counters based on message content or metadata."""
-        # 1. Prefer Metadata if available
-        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-            self._apply_metadata(msg.usage_metadata)
-            return
-
-        # 2. Fallback: Estimate from content length (for streaming)
+        
+        # 1. ВСЕГДА считаем длину контента, даже если есть метаданные
         if isinstance(msg, (AIMessage, AIMessageChunk)):
             content = msg.content
             chunk_len = 0
@@ -257,7 +254,15 @@ class TokenTracker:
                 # Faster sum via generator expression
                 chunk_len = sum(len(x.get("text", "")) for x in content if isinstance(x, dict))
             
-            self._streaming_len += chunk_len
+            # Для потока (чанков) суммируем. Для целого сообщения заменяем (если поток не работал)
+            if isinstance(msg, AIMessageChunk):
+                self._streaming_len += chunk_len
+            elif self._streaming_len == 0:
+                self._streaming_len = chunk_len
+
+        # 2. Применяем метаданные, если они есть
+        if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+            self._apply_metadata(msg.usage_metadata, msg_id=getattr(msg, "id", None))
 
     def update_from_node_update(self, update: Dict):
         """Updates counters from state updates (final messages with metadata)."""
@@ -270,23 +275,34 @@ class TokenTracker:
             
         for msg in messages:
             if hasattr(msg, "usage_metadata") and msg.usage_metadata:
-                self._apply_metadata(msg.usage_metadata)
+                self._apply_metadata(msg.usage_metadata, msg_id=getattr(msg, "id", None))
 
-    def _apply_metadata(self, usage: Dict):
+    def _apply_metadata(self, usage: Dict, msg_id: str = None):
+        # Дедупликация: одно и то же сообщение приходит через messages и updates
+        if msg_id:
+            if msg_id in self._seen_msg_ids:
+                return
+            self._seen_msg_ids.add(msg_id)
+        
         in_t = usage.get("input_tokens", 0)
         if in_t > self.max_input: 
             self.max_input = in_t
         
         out_t = usage.get("output_tokens", 0)
-        if out_t > self.total_output:
-            self.total_output = out_t
+        # Суммируем output_tokens (каждый вызов LLM генерирует новые токены)
+        self.total_output += out_t
 
     def render(self, duration: float) -> str:
-        # Display: Prefer exact metadata, else estimate (chars / 3)
         display_out = self.total_output
-        if display_out == 0 and self._streaming_len > 0:
+        
+        # ЗАЩИТА ОТ БАГОВ ПРОВАЙДЕРА (Xiaomi mimo-v2-flash и другие)
+        # Агент мог сделать несколько шагов, тогда API вернет 2-3 токена. 
+        # Проверяем "плотность" токенов. В норме 1 токен = 3-4 символа.
+        # Если API заявляет, что 1 токен вместил больше 10 символов текста - это баг API.
+        if self._streaming_len > 10 and display_out < (self._streaming_len // 10):
             display_out = self._streaming_len // 3
         
         in_display = str(self.max_input) if self.max_input > 0 else "?"
         
         return f"[dim]• {duration:.1f}s   In: {in_display}   Out: {display_out}[/]"
+        

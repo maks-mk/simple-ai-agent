@@ -16,7 +16,7 @@ from core.ui_theme import AGENT_THEME
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-# --- UI IMPORTS ---
+# --- UI IMPORTS (lazy loaded later if needed) ---
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -28,17 +28,17 @@ from prompt_toolkit.lexers import PygmentsLexer
 from pygments.lexers.markup import MarkdownLexer
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.completion import WordCompleter, PathCompleter, Completer
+from prompt_toolkit.completion import WordCompleter, Completer
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
 # --- LOCAL IMPORTS ---
 try:
-    from agent import build_agent_app, logger
+    from agent import build_agent_app
 except ImportError as e:
     if str(Path.cwd()) != str(BASE_DIR):
         sys.path.append(".")
     try:
-        from agent import build_agent_app, logger
+        from agent import build_agent_app
     except ImportError:
         raise ImportError(f"Could not import 'agent' module. sys.path: {sys.path}. Error: {e}")
 
@@ -150,7 +150,6 @@ async def main():
     model_name = temp_cfg.gemini_model if temp_cfg.provider == "gemini" else temp_cfg.openai_model
     
     # Modern Header
-    from rich.table import Table
     grid = Table.grid(expand=True)
     grid.add_column(justify="left")
     grid.add_column(justify="center")

@@ -14,6 +14,7 @@ import re
 import difflib
 import aiofiles
 import itertools
+from functools import lru_cache
 from pathlib import Path
 from typing import Union, Optional
 import logging
@@ -39,7 +40,43 @@ IGNORED_DIRS = {
     ".idea", ".vscode",
 }
 
+# Быстрая проверка бинарности по расширению (skip disk I/O)
+_KNOWN_TEXT_EXTS = {
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.scss', '.less',
+    '.json', '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.md', '.rst', '.txt', '.csv', '.log', '.sh', '.bat', '.ps1',
+    '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.rb', '.php',
+    '.sql', '.env', '.gitignore', '.dockerignore', '.editorconfig',
+}
+_KNOWN_BINARY_EXTS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg',
+    '.mp3', '.mp4', '.avi', '.mkv', '.wav', '.flac', '.ogg',
+    '.zip', '.tar', '.gz', '.bz2', '.7z', '.rar', '.xz',
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.dat',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.ttf', '.otf', '.woff', '.woff2', '.eot',
+    '.pyc', '.pyo', '.class', '.o', '.obj',
+}
+
+@lru_cache(maxsize=512)
+def _is_binary_cached(path_str: str) -> bool:
+    """Check if file is binary. Cached by path string, with fast extension shortcut."""
+    p = Path(path_str)
+    ext = p.suffix.lower()
+    if ext in _KNOWN_TEXT_EXTS:
+        return False
+    if ext in _KNOWN_BINARY_EXTS:
+        return True
+    try:
+        with open(path_str, 'rb') as f:
+            chunk = f.read(8192)
+            return b'\x00' in chunk
+    except Exception:
+        return True
+
 class FilesystemManager:
+    __slots__ = ('cwd', 'virtual_mode', 'safety_policy')
+
     def __init__(self, root_dir: Union[str, Path] = None, virtual_mode: bool = True):
         self.cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
         self.virtual_mode = virtual_mode
@@ -49,13 +86,8 @@ class FilesystemManager:
         self.safety_policy = policy
 
     def _is_binary(self, path: Union[str, Path]) -> bool:
-        """Check if file is binary by reading first 8KB."""
-        try:
-            with open(path, 'rb') as f:
-                chunk = f.read(8192)
-                return b'\x00' in chunk
-        except Exception:
-            return True
+        """Check if file is binary. Uses cached function with extension shortcuts."""
+        return _is_binary_cached(str(path))
 
     def _count_lines(self, path: Path) -> int:
         """Count lines in file efficiently using binary chunk reading."""

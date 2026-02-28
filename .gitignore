@@ -38,6 +38,27 @@ venv.bak/
 .vscode/
 .idea/
 
+# PyInstaller
+*.spec
+*.exe
+*.app
+*.dmg
+build/
+dist/
+
 # Project specific
 mcp_config_secret.json
 .agent_history
+.history/
+
+# Cache directories
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# OS specific
+.DS_Store
+Thumbs.db

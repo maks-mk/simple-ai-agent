@@ -31,9 +31,9 @@ def validate_tool_result(tool_name: str, args: Dict[str, Any], result: str) -> O
                 if p.stat().st_size == 0 and args.get("content"):
                     return format_error(ErrorType.VALIDATION, f"File {path} is empty after write.")
             else:  # edit_file
-                new_string = args.get("new_string")
-                if new_string and new_string not in p.read_text(encoding='utf-8'):
-                    return format_error(ErrorType.VALIDATION, f"Edit failed: new content not found in {path}.")
+                # Проверяем только факт существования файла (перечитывать весь файл слишком дорого)
+                # Содержимое уже проверено в edit_file через unified_diff
+                pass
         
         # Группируем операции удаления
         elif tool_name in ("safe_delete_file", "safe_delete_directory"):

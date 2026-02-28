@@ -1,5 +1,3 @@
-from typing import Optional
-
 def truncate_output(text: str, limit: int, source: str = "tool") -> str:
     """
     Truncates text to the specified limit and appends a truncation message.

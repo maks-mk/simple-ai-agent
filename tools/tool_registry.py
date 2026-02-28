@@ -11,11 +11,13 @@ from core.config import AgentConfig
 logger = logging.getLogger(__name__)
 
 class ToolRegistry:
+    __slots__ = ('config', 'tools', 'mcp_clients')
+
     def __init__(self, config: AgentConfig):
         self.config = config
-        self.tools: List[BaseTool] =[]
+        self.tools: List[BaseTool] = []
         # Сохраняем список клиентов, чтобы соединения не разрывались GC
-        self.mcp_clients =[] 
+        self.mcp_clients = [] 
 
     async def load_all(self):
         """Загружает все инструменты в зависимости от конфигурации."""

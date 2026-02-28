@@ -1,9 +1,9 @@
 import os
 import logging
 import asyncio
-import json
 import hashlib
 import time
+import ast
 from functools import wraps, lru_cache
 from typing import Optional, List, Any, Union, Dict
 
@@ -24,8 +24,16 @@ except ImportError:
     logger.warning("Tavily SDK not installed. Search tools will be disabled.")
 
 _client: Optional[Any] = None
-# Семафор для ограничения параллельных запросов (Rate Limit)
-_search_semaphore = asyncio.Semaphore(5)
+_client_initialized: bool = False
+
+# Ленивая инициализация семафора, чтобы избежать ошибки "Task attached to a different loop"
+_search_semaphore: Optional[asyncio.Semaphore] = None
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _search_semaphore
+    if _search_semaphore is None:
+        _search_semaphore = asyncio.Semaphore(5)
+    return _search_semaphore
 
 # Global safety policy
 _SAFETY_POLICY: Optional[SafetyPolicy] = None
@@ -57,24 +65,19 @@ def _cleanup_cache():
     logger.debug(f"🧹 Cache cleanup: removed {remove_count} items. Size: {len(_SEARCH_CACHE)}")
 
 def with_cache(ttl: int = 600):
-    """
-    Асинхронный декоратор для кэширования результатов (Time-To-Live).
-    """
+    """Асинхронный декоратор для кэширования результатов (Time-To-Live)."""
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            try:
-                # Сериализуем аргументы в JSON для хэширования
-                key_data = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True, default=str)
-                key = hashlib.md5(key_data.encode()).hexdigest()
-            except Exception:
-                return await func(*args, **kwargs)
+            # Быстрая генерация ключа без медленного json.dumps
+            key_str = f"{func.__name__}:{args}:{kwargs}"
+            key = hashlib.md5(key_str.encode()).hexdigest()
 
             # Проверка кэша
             if key in _SEARCH_CACHE:
                 result, timestamp = _SEARCH_CACHE[key]
                 if time.time() - timestamp < ttl:
-                    logger.info(f"⚡ Cache hit for {func.__name__} (key: {key[:8]})")
+                    logger.debug(f"⚡ Cache hit for {func.__name__} (key: {key[:8]})")
                     return result
                 else:
                     del _SEARCH_CACHE[key]
@@ -83,7 +86,7 @@ def with_cache(ttl: int = 600):
             result = await func(*args, **kwargs)
 
             # Сохранение (если не ошибка)
-            if isinstance(result, str) and not result.lower().startswith(("error:", "ошибка:")):
+            if isinstance(result, str) and not result.lower().startswith(("error:", "ошибка:", "error[")):
                 if len(_SEARCH_CACHE) >= _MAX_CACHE_SIZE:
                     _cleanup_cache()
                 _SEARCH_CACHE[key] = (result, time.time())
@@ -101,26 +104,24 @@ def _get_config() -> AgentConfig:
     return AgentConfig()
 
 def get_tavily_client() -> Optional[Any]:
-    global _client
+    global _client, _client_initialized
     
-    # Load config once or per call (lightweight)
+    if _client_initialized:
+        return _client
+
+    _client_initialized = True
+    
     try:
         config = _get_config()
     except Exception as e:
         logger.error(f"Config load failed: {e}")
         return None
 
-    if not config.enable_search_tools:
-        return None 
-
-    if _client is not None:
-        return _client
-
-    if AsyncTavilyClient is None:
+    if not config.enable_search_tools or AsyncTavilyClient is None:
         return None
 
     if not config.tavily_api_key:
-        logger.error("TAVILY_API_KEY is not set.")
+        logger.warning("TAVILY_API_KEY is not set. Web search tools will return errors.")
         return None
 
     try:
@@ -141,8 +142,9 @@ async def _execute_with_retry(coroutine_func, *args, **kwargs):
         retry_delay = 2
 
     last_error = None
+    semaphore = _get_semaphore()
 
-    async with _search_semaphore:
+    async with semaphore:
         for attempt in range(max_retries):
             try:
                 return await coroutine_func(*args, **kwargs)
@@ -157,12 +159,9 @@ async def _execute_with_retry(coroutine_func, *args, **kwargs):
 # TOOLS
 # ======================================================
 
-@tool("web_search")
 @with_cache(ttl=600)
-async def web_search(query: str, max_results: int = 5) -> str:
-    """
-    Search internet for snippets and AI summary. Best for facts, news, comparisons.
-    """
+async def _web_search_impl(query: str, max_results: int = 5) -> str:
+    """Implementation of web search logic."""
     if not get_tavily_client():
         return format_error(ErrorType.CONFIG, "Search is unavailable due to missing configuration (API Key or SDK).")
 
@@ -185,14 +184,14 @@ async def web_search(query: str, max_results: int = 5) -> str:
             return format_error(ErrorType.ACCESS_DENIED, "Invalid API credentials (401 Unauthorized).")
         return format_error(ErrorType.NETWORK, f"Search failed. Details: {str(e)}")
 
-    results = []
+    results =[]
     
     # AI Answer
     answer = response.get("answer")
     if answer:
         results.append(f"AI Overview:\n{answer}\n{'='*40}")
 
-    items = response.get("results", [])
+    items = response.get("results",[])
     if not items:
         return "\n".join(results) if results else format_error(ErrorType.NOT_FOUND, "No results found.")
 
@@ -222,6 +221,13 @@ async def web_search(query: str, max_results: int = 5) -> str:
     results.append("[Search completed. Use the context above.]")
     return "\n".join(results)
 
+@tool("web_search")
+async def web_search(query: str, max_results: int = 5) -> str:
+    """
+    Search internet for snippets and AI summary. Best for facts, news, comparisons.
+    """
+    return await _web_search_impl(query, max_results)
+
 @tool("fetch_content")
 @with_cache(ttl=1800)
 async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> str:
@@ -237,31 +243,21 @@ async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> 
     if not client:
         return format_error(ErrorType.CONFIG, "Fetch unavailable due to missing configuration.")
 
-    # Robust handling for models that pass stringified lists
+    # Мощный парсинг для защиты от галлюцинаций LLM (когда передается строка вместо списка)
     if isinstance(urls, str):
         urls = urls.strip()
-        # Check if it looks like a JSON list
-        if urls.startswith("[") and urls.endswith("]"):
-            try:
-                parsed = json.loads(urls)
-                if isinstance(parsed, list):
-                    urls = parsed
-                else:
-                    urls = [urls] # Fallback
-            except json.JSONDecodeError:
-                urls = [urls] # Treat as single URL if parse fails
-        else:
-            urls = [urls]
+        try:
+            # ast.literal_eval идеально парсит питоновские массивы (в отличие от JSON, который ломается на одинарных кавычках)
+            parsed = ast.literal_eval(urls)
+            urls = parsed if isinstance(parsed, list) else [urls]
+        except (ValueError, SyntaxError):
+            # Fallback на парсинг через запятую
+            urls =[u.strip().strip('"\' ') for u in urls.strip('[]').split(',')]
     
-    clean_urls = []
-    for u in urls:
-        if isinstance(u, str):
-             # Remove quotes and whitespace that models sometimes add
-             u_clean = u.strip().strip('"\'')
-             if u_clean.startswith("http"):
-                 clean_urls.append(u_clean)
+    # Очистка, удаление дубликатов с сохранением порядка (dict.fromkeys) и лимит
+    clean_urls =[u for u in urls if isinstance(u, str) and u.startswith("http")]
+    clean_urls = list(dict.fromkeys(clean_urls))[:20]
     
-    clean_urls = list(set(clean_urls))[:20]
     if not clean_urls:
         return format_error(ErrorType.VALIDATION, f"No valid URLs provided. Input was: {urls}")
 
@@ -271,20 +267,20 @@ async def fetch_content(urls: Union[str, List[str]], advanced: bool = False) -> 
     except Exception as e:
         return format_error(ErrorType.EXECUTION, f"Fetch failed. Details: {e}")
 
-    output_parts = []
-    # Dynamic limit per URL based on count
-    max_tool_output = _SAFETY_POLICY.max_tool_output if _SAFETY_POLICY else 4000
-    max_chars_per_url = max_tool_output if len(clean_urls) == 1 else int(max_tool_output / len(clean_urls)) + 500
+    output_parts =[]
+    # Use max_search_chars for content fetching as it allows for more context than standard tool output
+    max_chars_limit = _SAFETY_POLICY.max_search_chars if _SAFETY_POLICY else 15000
     
-    for item in response.get("results", []):
+    max_chars_per_url = max_chars_limit if len(clean_urls) == 1 else int(max_chars_limit / len(clean_urls)) + 500
+    
+    for item in response.get("results",[]):
         url = item.get("url", "Unknown")
         content = item.get("raw_content") or item.get("content") or ""
         
         content = truncate_output(content, max_chars_per_url, source=url)
-        
         output_parts.append(f"=== SOURCE: {url} ===\n{content or '[Empty]'}\n{'='*30}")
 
-    failed = response.get("failed_results", [])
+    failed = response.get("failed_results",[])
     if failed:
         for f in failed:
             output_parts.append(f"❌ FAILED: {f.get('url')} - {f.get('error')}")
@@ -302,9 +298,18 @@ async def batch_web_search(queries: List[str]) -> str:
     if not queries:
         return format_error(ErrorType.VALIDATION, "No queries provided.")
     
-    results = []
-    for q in queries[:5]: # Limit to 5 parallel searches
-        res = await web_search(q)
-        results.append(f"Query: {q}\n{res}\n{'='*50}")
+    results =[]
+    
+    # Сообщаем агенту, если он превысил лимит
+    if len(queries) > 5:
+        results.append("⚠ WARNING: Only the first 5 queries were executed to prevent API limits.\n" + "="*40)
+    
+    # Запускаем в параллель
+    tasks = [_web_search_impl(q) for q in queries[:5]]
+    search_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for q, res in zip(queries[:5], search_results):
+        res_str = f"Error: {res}" if isinstance(res, Exception) else str(res)
+        results.append(f"Query: {q}\n{res_str}\n{'='*50}")
         
     return "\n".join(results)

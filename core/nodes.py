@@ -1,6 +1,8 @@
 import json
 import logging
 import asyncio
+from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from langchain_core.messages import (
@@ -25,32 +27,64 @@ class AgentNodes:
         self.llm = llm
         self.tools = tools
         self.llm_with_tools = llm_with_tools or llm
+        
+        # Оптимизация: O(1) доступ к инструментам вместо O(N) перебора списка
+        self.tools_map = {t.name: t for t in tools}
+        
+        # Оптимизация: кэширование базового промпта (чтобы не читать с диска на каждый шаг)
+        self._cached_base_prompt: Optional[str] = None
 
     # --- NODE: SUMMARIZE ---
     
+    def _estimate_tokens(self, messages: List[BaseMessage]) -> int:
+        """Грубая оценка токенов входящего контекста: сумма символов / 3.
+        Учитывает как текстовый контент, так и аргументы вызовов инструментов."""
+        total_chars = 0
+        for m in messages:
+            # 1. Текстовый контент (строка или мультимодальный список)
+            content = m.content
+            if isinstance(content, list):
+                content = " ".join(str(part) for part in content)
+            total_chars += len(str(content))
+            
+            # 2. Вызовы инструментов (JSON аргументы от LLM могут быть огромными)
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                total_chars += sum(len(str(tc)) for tc in m.tool_calls)
+                
+        return total_chars // 3
+
     async def summarize_node(self, state: AgentState):
         messages = state["messages"]
         summary = state.get("summary", "")
 
-        if len(messages) <= self.config.summary_threshold:
+        estimated_tokens = self._estimate_tokens(messages)
+
+        if estimated_tokens <= self.config.summary_threshold:
             return {}
 
+        logger.debug(f"📊 Context size: ~{estimated_tokens} tokens. Summarizing...")
+
         # Determine cut-off point
-        idx = len(messages) - self.config.summary_keep_last
-        if idx < 0: idx = 0
+        idx = max(0, len(messages) - self.config.summary_keep_last)
 
         # Try to find a clean break at a HumanMessage
-        scan_idx = idx
-        while scan_idx < len(messages):
+        for scan_idx in range(idx, len(messages)):
             if isinstance(messages[scan_idx], HumanMessage):
                 idx = scan_idx
                 break
-            scan_idx += 1
         
         to_summarize = messages[:idx]
-        if not to_summarize: return {}
+        
+        # ЗАЩИТА: Если последние N сообщений сами по себе весят больше лимита,
+        # мы не можем ничего сжать без потери недавнего контекста.
+        if not to_summarize: 
+            logger.warning(
+                f"⚠ Context (~{estimated_tokens} tokens) exceeds threshold, "
+                "but cannot summarize further without deleting the most recent active messages. "
+                "Expanding context dynamically for this turn."
+            )
+            return {}
 
-        # Format history for LLM
         history_text = self._format_history_for_summary(to_summarize)
         
         prompt = constants.SUMMARY_PROMPT_TEMPLATE.format(
@@ -61,19 +95,24 @@ class AgentNodes:
         try:
             res = await self.llm.ainvoke(prompt)
             
-            delete_msgs = [RemoveMessage(id=m.id) for m in to_summarize if m.id]
-            logger.info(f"🧹 Summary: Removed {len(delete_msgs)} messages.")
+            delete_msgs =[RemoveMessage(id=m.id) for m in to_summarize if m.id]
+            logger.info(f"🧹 Summary: Removed {len(delete_msgs)} messages. Generated new summary.")
+            
+            # --- USER REQUESTED NOTIFICATION ---
+            print(f"\n\033[93m[SYSTEM] 🧹 Сработала автоматическая суммаризация (контекст > {self.config.summary_threshold}). Старые сообщения сжаты.\033[0m\n")
+            # -----------------------------------
+
             return {"summary": res.content, "messages": delete_msgs}
         except Exception as e:
             err_str = str(e)
             if "content_filter" in err_str or "Moderation Block" in err_str:
-                 logger.warning(f"🧹 Summarization skipped due to Content Filter (False Positive). Continuing with full history.")
+                 logger.warning("🧹 Summarization skipped due to Content Filter (False Positive). Continuing with full history.")
             else:
                 logger.error(f"Summarization Error: {format_exception_friendly(e)}")
             return {}
-
+            
     def _format_history_for_summary(self, messages: List[BaseMessage]) -> str:
-        parts = []
+        parts =[]
         for m in messages:
             content = str(m.content)
             if len(content) > 500:
@@ -87,20 +126,14 @@ class AgentNodes:
         messages = state["messages"]
         summary = state.get("summary", "")
         
-        # Build System Prompt
         sys_msg = self._build_system_message(summary, tools_available=bool(self.tools))
-        
-        # Prepare context
         full_context = [sys_msg] + messages
         
-        # Invoke LLM
         response = await self._invoke_llm_with_retry(self.llm_with_tools, full_context)
         
-        # Token Updates
         token_usage_update = {}
-        if isinstance(response, AIMessage):
-            if response.usage_metadata:
-                 token_usage_update = {"token_usage": response.usage_metadata}
+        if isinstance(response, AIMessage) and response.usage_metadata:
+            token_usage_update = {"token_usage": response.usage_metadata}
 
         return {
             "messages": [response],
@@ -110,7 +143,6 @@ class AgentNodes:
     # --- NODE: TOOLS ---
 
     async def tools_node(self, state: AgentState):
-        # Invariants Check (Debug Mode)
         self._check_invariants(state)
 
         messages = state["messages"]
@@ -119,16 +151,24 @@ class AgentNodes:
         if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
             return {}
             
-        final_messages = []
+        final_messages =[]
         has_error = False
+        
+        # Оптимизация: собираем историю вызовов один раз, а не для каждого инструмента
+        recent_calls =[]
+        for m in reversed(messages[-20:]):
+            if isinstance(m, AIMessage) and m.tool_calls:
+                recent_calls.extend(m.tool_calls)
 
         for tool_call in last_msg.tool_calls:
             t_name = tool_call["name"]
             t_args = tool_call["args"]
             t_id = tool_call["id"]
             
-            # Execute
-            if self._check_loop(messages, t_name, t_args):
+            # Проверка на зацикливание (теперь работает моментально)
+            loop_count = sum(1 for tc in recent_calls if tc.get("name") == t_name and tc.get("args") == t_args)
+            
+            if loop_count >= 3:
                 content = format_error(ErrorType.LOOP_DETECTED, f"Loop detected. You have called '{t_name}' with these exact arguments 3 times in the recent history. Please try a different approach.")
                 has_error = True
             else:
@@ -140,55 +180,30 @@ class AgentNodes:
                 content = f"{content}\n\n{validation_error}"
                 has_error = True
 
-            # Check for error signature (unified format)
             if "ERROR[" in content:
                 has_error = True
 
-            # Truncate output (Safety Layer)
-            # Use SafetyPolicy limit from config (defaults to 5000)
             limit = self.config.safety.max_tool_output
             content = truncate_output(content, limit, source=t_name)
 
             tool_msg = ToolMessage(content=content, tool_call_id=t_id, name=t_name)
             final_messages.append(tool_msg)
 
-        # Reflection Hint (Conditional)
-        # If strict_mode is ON, we disable auto-reflection hint.
         if has_error and not self.config.strict_mode:
-            # Inject reflection prompt to guide the agent
             reflection_msg = HumanMessage(content=constants.REFLECTION_PROMPT)
             final_messages.append(reflection_msg)
 
-        return {
-            "messages": final_messages,
-        }
+        return {"messages": final_messages}
 
     def _check_invariants(self, state: AgentState):
-        """Debug-only validator for graph state."""
-        if not self.config.debug:
-            return
-            
+        if not self.config.debug: return
         steps = state.get("steps", 0)
-        
         if steps < 0:
             logger.error(f"INVARIANT VIOLATION: steps ({steps}) < 0")
-        
-    def _check_loop(self, messages: List[BaseMessage], tool_name: str, tool_args: dict) -> bool:
-        """
-        Detects if the exact same tool call has been made repeatedly (>= 3 times) in recent history.
-        """
-        count = 0
-        # Check last 20 messages to catch loops
-        for m in reversed(messages[-20:]):
-            if isinstance(m, AIMessage) and m.tool_calls:
-                for tc in m.tool_calls:
-                    if tc.get("name") == tool_name and tc.get("args") == tool_args:
-                        count += 1
-        
-        return count >= 3
 
     async def _execute_tool(self, name: str, args: dict) -> str:
-        tool = next((t for t in self.tools if t.name == name), None)
+        # Быстрый поиск за O(1)
+        tool = self.tools_map.get(name)
         if not tool:
             return format_error(ErrorType.NOT_FOUND, f"Tool '{name}' not found.")
         try:
@@ -202,19 +217,21 @@ class AgentNodes:
 
     # --- HELPERS ---
 
+    def _get_base_prompt(self) -> str:
+        """Ленивая загрузка и кэширование промпта для устранения дискового I/O"""
+        if self._cached_base_prompt is None:
+            if self.config.prompt_path.exists():
+                self._cached_base_prompt = self.config.prompt_path.read_text("utf-8")
+            else:
+                self._cached_base_prompt = (
+                    "You are an autonomous AI agent.\n"
+                    "Reason in English, Reply in Russian.\n"
+                    "Date: {{current_date}}"
+                )
+        return self._cached_base_prompt
+
     def _build_system_message(self, summary: str, tools_available: bool = True) -> SystemMessage:
-        # 1. Load prompt from config path
-        if self.config.prompt_path.exists():
-            raw_prompt = self.config.prompt_path.read_text("utf-8")
-        else:
-            raw_prompt = (
-                "You are an autonomous AI agent.\n"
-                "Reason in English, Reply in Russian.\n"
-                "Date: {{current_date}}"
-            )
-        
-        from datetime import datetime
-        from pathlib import Path
+        raw_prompt = self._get_base_prompt()
         
         prompt = raw_prompt.replace("{{current_date}}", datetime.now().strftime("%Y-%m-%d"))
         prompt = prompt.replace("{{cwd}}", str(Path.cwd()))
@@ -241,13 +258,11 @@ class AgentNodes:
                 return response
             except Exception as e:
                 err_str = str(e)
-                # Handle specific tool choice errors from vLLM/OpenAI-compatible servers
                 if "auto" in err_str and "tool choice" in err_str and "requires" in err_str:
                     logger.warning("⚠ Server does not support 'auto' tool choice. Falling back to chat-only mode.")
-                    # Fallback to base LLM (without tools) for this request
                     current_llm = self.llm 
-                    # Add system note about disabled tools
-                    context = [m for m in context] # Copy
+                    # Безопасное копирование контекста
+                    context = list(context)
                     if isinstance(context[0], SystemMessage):
                         context[0] = SystemMessage(content=str(context[0].content) + "\n\nWARNING: Tools are disabled due to server configuration error.")
                     continue

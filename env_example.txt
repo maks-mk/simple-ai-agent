@@ -1,71 +1,103 @@
 # ===========================
-# .env example (v6.5b)
+# .env example (v7.4b)
 # ===========================
 #
 # ВНИМАНИЕ:
-# - Не коммитьте реальные ключи.
-# - Значения ниже — примеры/плейсхолдеры.
+# - Переименуйте этот файл в .env для использования.
+# - Не коммитьте реальный .env с ключами в репозиторий.
 #
 
 # ===========================
-# 1) Общие настройки
+# 1) Провайдеры LLM (Обязательно)
+# ===========================
+
+# Выбор провайдера: gemini или openai
+PROVIDER=gemini
+
+# --- Google Gemini ---
+GEMINI_API_KEY=AIzaSyREPLACE_WITH_YOUR_KEY
+GEMINI_MODEL=gemini-1.5-flash
+# GEMINI_MODEL=gemini-2.0-flash-thinking-exp-1219
+
+# --- OpenAI / Compatible (OpenRouter, LocalLLM, etc.) ---
+# OPENAI_API_KEY=sk-REPLACE_WITH_YOUR_KEY
+# OPENAI_MODEL=gpt-4o
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# Для OpenRouter:
+# OPENAI_BASE_URL=https://openrouter.ai/api/v1
+# OPENAI_MODEL=deepseek/deepseek-r1
+
+# ===========================
+# 2) Основные настройки агента
 # ===========================
 TEMPERATURE=0.2
 MAX_LOOPS=50
+# Путь к системному промпту (относительно корня проекта)
+PROMPT_PATH=prompt.txt
+# Включить подробный вывод отладочной информации
+DEBUG=false
+# Строгий режим (LLM меньше фантазирует, но менее креативна)
+STRICT_MODE=false
+
+# ===========================
+# 3) Подсистемы и Инструменты
+# ===========================
+# Разрешить модели использовать инструменты (Function Calling)
 MODEL_SUPPORTS_TOOLS=true
 
-# Включение/отключение подсистем
+# Поиск в интернете (требует TAVILY_API_KEY)
 ENABLE_SEARCH_TOOLS=true
-ENABLE_SYSTEM_TOOLS=false
+TAVILY_API_KEY=tvly-REPLACE_WITH_YOUR_KEY
+
+# Работа с файловой системой (чтение, запись, редактирование)
 ENABLE_FILESYSTEM_TOOLS=true
-ENABLE_SHELL_TOOL=true
+
+# Системные утилиты (IP, Network info, System stats)
+ENABLE_SYSTEM_TOOLS=true
+
+# Управление процессами (запуск, остановка фоновых задач)
 ENABLE_PROCESS_TOOLS=false
 
-# Логи/отладка
-DEBUG=false
+# Shell / Терминал (выполнение команд cmd/bash).
+# ВНИМАНИЕ: Дает модели доступ к выполнению любых команд. Используйте с осторожностью.
+ENABLE_SHELL_TOOL=false
 
-# Ретраи для сетевых инструментов поиска (Tavily tools)
+# ===========================
+# 4) Лимиты и Безопасность
+# ===========================
+# Максимальный размер вывода инструмента (символов).
+# Если вывод больше, он будет обрезан.
+MAX_TOOL_OUTPUT=10000
+
+# Максимальный размер контента при поиске/чтении веб-страниц (символов).
+# Обычно больше, чем MAX_TOOL_OUTPUT, чтобы захватывать длинные статьи.
+MAX_SEARCH_CHARS=15000
+
+# Максимальный размер файла для чтения/записи (в МБ, если < 10000, иначе байты).
+MAX_FILE_SIZE=300
+
+# Максимальное количество строк при чтении файла (защита от чтения логов на 1млн строк).
+MAX_READ_LINES=2000
+
+# Максимальное количество фоновых процессов (если ENABLE_PROCESS_TOOLS=true).
+MAX_BACKGROUND_PROCESSES=5
+
+# ===========================
+# 5) Память и Сеть
+# ===========================
+# Порог токенов (примерно chars/3), после которого запускается суммаризация истории.
+# 8000 токенов ~ 24000 символов.
+SESSION_SIZE=8000
+
+# Сколько последних сообщений оставлять "сырыми" (без сжатия) при суммаризации.
+SUMMARY_KEEP_LAST=4
+
+# Настройки повторных попыток для сетевых запросов (Search, Fetch).
 MAX_RETRIES=3
 RETRY_DELAY=2
 
-# Память/сжатие контекста
-SESSION_SIZE=20
-SUMMARY_KEEP_LAST=4
-
-# Путь к системному промпту (относительно корня проекта)
-PROMPT_PATH=prompt.txt
-
 # ===========================
-# 2) Поиск (Tavily)
+# 6) MCP (Model Context Protocol)
 # ===========================
-TAVILY_API_KEY=tvly-REPLACE_WITH_YOUR_KEY
-
-# ===========================
-# 3) Провайдер: Gemini (пример)
-# ===========================
-PROVIDER=gemini
-GEMINI_API_KEY=AIzaSyREPLACE_WITH_YOUR_KEY
-GEMINI_MODEL=gemini-1.5-flash
-# GEMINI_MODEL=models/gemini-3-flash-preview
-
-# ===========================
-# 4) Провайдер: OpenAI-compatible (примеры)
-# ===========================
-#
-# Оригинальный OpenAI:
-# PROVIDER=openai
-# OPENAI_API_KEY=sk-REPLACE_WITH_YOUR_KEY
-# OPENAI_BASE_URL=https://api.openai.com/v1
-# OPENAI_MODEL=gpt-4o
-#
-# OpenRouter:
-# PROVIDER=openai
-# OPENAI_API_KEY=sk-or-REPLACE_WITH_YOUR_KEY
-# OPENAI_BASE_URL=https://openrouter.ai/api/v1
-# OPENAI_MODEL=deepseek/deepseek-r1
-#
-# Любой другой OpenAI-compatible:
-# PROVIDER=openai
-# OPENAI_API_KEY=sk-REPLACE_WITH_YOUR_KEY
-# OPENAI_BASE_URL=https://your-provider.example/v1
-# OPENAI_MODEL=deepseek-ai/deepseek-v3.1-terminus
+# Путь к конфигурации MCP серверов
+MCP_CONFIG_PATH=mcp.json

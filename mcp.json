@@ -17,15 +17,15 @@
     "transport": "http",
     "enabled": false
   },
-  "sequential-thinking": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-sequential-thinking"
-      ],
-	"transport": "stdio",
-    "enabled": false
-    },
+    "sequential-thinking": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-sequential-thinking"
+        ],
+  	"transport": "stdio",
+      "enabled": false
+      },
   "pdf-tools": {
     "command": "uv",
 	"args": [

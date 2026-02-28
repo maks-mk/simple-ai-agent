@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import os
+import inspect
 from typing import List, Any, Dict, Union
 from langchain_core.tools import BaseTool
 
@@ -12,9 +13,9 @@ logger = logging.getLogger(__name__)
 class ToolRegistry:
     def __init__(self, config: AgentConfig):
         self.config = config
-        self.tools: List[BaseTool] = []
+        self.tools: List[BaseTool] =[]
         # Сохраняем список клиентов, чтобы соединения не разрывались GC
-        self.mcp_clients = [] 
+        self.mcp_clients =[] 
 
     async def load_all(self):
         """Загружает все инструменты в зависимости от конфигурации."""
@@ -60,6 +61,7 @@ class ToolRegistry:
                 search_in_file_tool,
                 search_in_directory_tool,
                 tail_file_tool,
+                find_file_tool,  # <-- ДОБАВЛЕНО: наш новый инструмент поиска по имени
                 set_safety_policy
             )
             from tools.delete_tools import safe_delete_file, safe_delete_directory
@@ -67,7 +69,7 @@ class ToolRegistry:
             # Apply safety policy
             set_safety_policy(self.config.safety)
 
-            fs_tools = [
+            fs_tools =[
                 read_file_tool,
                 write_file_tool,
                 edit_file_tool,
@@ -78,10 +80,10 @@ class ToolRegistry:
                 search_in_file_tool,
                 search_in_directory_tool,
                 tail_file_tool,
+                find_file_tool,  # <-- ДОБАВЛЕНО: регистрируем в агенте
             ]
             self.tools.extend(fs_tools)
         except Exception as e:
-            # ✅ ИСправлено: logger.exception покажет реальную ошибку синтаксиса, а не только ImportError
             logger.exception(f"Failed to load filesystem tools: {e}")
 
     def _load_process_tools(self):
@@ -96,7 +98,7 @@ class ToolRegistry:
             
             set_safety_policy(self.config.safety)
 
-            proc_tools = [
+            proc_tools =[
                 run_background_process,
                 stop_background_process,
                 find_process_by_port
@@ -122,7 +124,7 @@ class ToolRegistry:
         try:
             from tools.delete_tools import safe_delete_file, safe_delete_directory
 
-            local_tools = [
+            local_tools =[
                 safe_delete_file,
                 safe_delete_directory,
             ]
@@ -151,7 +153,7 @@ class ToolRegistry:
 
             set_safety_policy(self.config.safety)
 
-            search_tools = [web_search, batch_web_search, fetch_content]
+            search_tools =[web_search, batch_web_search, fetch_content]
             if has_crawl:
                 search_tools.append(crawl_site)
                 
@@ -170,7 +172,7 @@ class ToolRegistry:
                 get_local_network_info
             )
             
-            system_tools = [
+            system_tools =[
                 get_public_ip, 
                 lookup_ip_info,
                 get_system_info, 
@@ -247,12 +249,11 @@ class ToolRegistry:
 
     async def cleanup(self):
         """Cleanup resources (close MCP connections)."""
-        # ✅ Исправлено: Активное закрытие соединений
         for client in self.mcp_clients:
             try:
                 # Пытаемся вызвать close(), если он существует
                 if hasattr(client, "close") and callable(client.close):
-                    if asyncio.iscoroutinefunction(client.close):
+                    if inspect.iscoroutinefunction(client.close):
                         await client.close()
                     else:
                         client.close()
@@ -261,7 +262,6 @@ class ToolRegistry:
                     try:
                         await client.__aexit__(None, None, None)
                     except Exception as e:
-                        # MultiServerMCPClient raise error on __aexit__ in 0.1.0+
                         if "MultiServerMCPClient cannot be used as a context manager" in str(e):
                             pass 
                         else:

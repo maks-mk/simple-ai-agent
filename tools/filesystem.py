@@ -6,27 +6,30 @@ Features:
 - Unified Diff generation for edits
 - Pagination for reading large files
 - Safe Path Resolution
+- Optimized os.scandir traversals
 """
 
 import os
+import re
 import difflib
 import aiofiles
+import itertools
 from pathlib import Path
 from typing import Union, Optional
 import logging
 import httpx
+
 from langchain_core.tools import tool
 from tools.system_tools import get_net_client
 from core.safety_policy import SafetyPolicy
 from core.errors import format_error, ErrorType
 from core.utils import truncate_output
+from core.config import DEFAULT_MAX_FILE_SIZE, DEFAULT_READ_LIMIT
 
 logger = logging.getLogger(__name__)
 
 # --- Constants ---
-DEFAULT_READ_LIMIT = 2000
 
-# Directories to skip during recursive search (noise / non-user code)
 IGNORED_DIRS = {
     ".git", ".hg", ".svn",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
@@ -37,9 +40,6 @@ IGNORED_DIRS = {
 }
 
 class FilesystemManager:
-    """
-    Manages filesystem operations with security checks.
-    """
     def __init__(self, root_dir: Union[str, Path] = None, virtual_mode: bool = True):
         self.cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
         self.virtual_mode = virtual_mode
@@ -48,88 +48,97 @@ class FilesystemManager:
     def set_policy(self, policy: SafetyPolicy):
         self.safety_policy = policy
 
+    def _is_binary(self, path: Union[str, Path]) -> bool:
+        """Check if file is binary by reading first 8KB."""
+        try:
+            with open(path, 'rb') as f:
+                chunk = f.read(8192)
+                return b'\x00' in chunk
+        except Exception:
+            return True
+
+    def _count_lines(self, path: Path) -> int:
+        """Count lines in file efficiently using binary chunk reading."""
+        try:
+            if path.stat().st_size == 0:
+                return 0
+            
+            count = 0
+            last_chunk = b""
+            with open(path, 'rb') as f:
+                # Walrus operator for efficient chunk reading
+                while chunk := f.read(65536):
+                    count += chunk.count(b'\n')
+                    last_chunk = chunk
+            
+            if last_chunk and not last_chunk.endswith(b'\n'):
+                count += 1
+            return count 
+        except Exception:
+             return 0
+
     def _resolve_path(self, path_str: str) -> Path:
-        """
-        Resolves path with security checks against Path Traversal.
-        """
+        """Resolves and validates paths strictly within the sandbox if virtual_mode is on."""
         if not path_str:
             raise ValueError("Path cannot be empty")
             
-        # 1. Normalize separators
         clean_path = str(path_str).replace("\\", "/")
-        path_obj = Path(clean_path)
+        path_obj = Path(clean_path).expanduser()
         
-        # ✅ Исправлено: Явный блок абсолютных путей (защита Windows: C:/Windows)
-        if self.virtual_mode and path_obj.is_absolute():
-            raise ValueError(f"ACCESS DENIED: Absolute paths not allowed in virtual mode: {path_str}")
-        
-        # 2. Virtual Mode Checks (Strict Sandbox)
         if self.virtual_mode:
-            if clean_path.startswith("/"):
-                clean_path = clean_path.lstrip("/")
+            if path_obj.is_absolute():
+                raise ValueError(f"ACCESS DENIED: Absolute paths not allowed in virtual mode: {path_str}")
             
-            # Block traversal sequences
-            if ".." in clean_path or clean_path.startswith("~"):
-                raise ValueError(f"ACCESS DENIED: Path traversal not allowed in virtual mode: {path_str}")
-                
-            full_path = (self.cwd / clean_path).resolve()
+            full_path = (self.cwd / path_obj).resolve()
             
-            # Final verify: must be inside root
-            try:
-                full_path.relative_to(self.cwd)
-            except ValueError:
-                raise ValueError(f"ACCESS DENIED: Path is outside working directory: {full_path}")
+            # Use native is_relative_to (Python 3.9+) for safe bounds checking
+            if not full_path.is_relative_to(self.cwd):
+                raise ValueError(f"ACCESS DENIED: Path traversal outside working directory: {full_path}")
                 
             return full_path
 
-        # 3. Legacy Mode (Less Secure)
-        if path_obj.is_absolute():
-            return path_obj.resolve()
-        return (self.cwd / path_obj).resolve()
+        return path_obj.resolve() if path_obj.is_absolute() else (self.cwd / path_obj).resolve()
 
-    def read_file(self, path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT) -> str:
+    def read_file(self, path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT, show_line_numbers: bool = True) -> str:
         try:
             target = self._resolve_path(path)
             if not target.exists(): return format_error(ErrorType.NOT_FOUND, f"File '{path}' not found.")
             if not target.is_file(): return format_error(ErrorType.VALIDATION, f"'{path}' is not a file.")
             
-            # Check size (skip huge files)
             stats = target.stat()
-            max_size = self.safety_policy.max_file_size if self.safety_policy else 10 * 1024 * 1024
+            max_size = self.safety_policy.max_file_size if self.safety_policy else DEFAULT_MAX_FILE_SIZE
             if stats.st_size > max_size:
                 return format_error(ErrorType.LIMIT_EXCEEDED, f"File is too large ({stats.st_size} bytes). Max: {max_size}.")
 
-            try:
-                content = target.read_text(encoding='utf-8')
-            except UnicodeDecodeError:
+            if self._is_binary(target):
                 return format_error(ErrorType.VALIDATION, "File binary or unknown encoding.")
 
-            if not content:
+            if stats.st_size == 0:
                 return "System reminder: File exists but has empty contents."
 
-            lines = content.splitlines()
-            total_lines = len(lines)
+            total_lines = self._count_lines(target)
             
-            # Policy limit for read lines
             policy_limit = self.safety_policy.max_read_lines if self.safety_policy else DEFAULT_READ_LIMIT
-            if limit > policy_limit:
-                limit = policy_limit
+            limit = min(limit, policy_limit)
 
-            # Pagination
-            if offset >= total_lines:
+            if offset >= total_lines and total_lines > 0:
                 return format_error(ErrorType.VALIDATION, f"Line offset {offset} exceeds file length ({total_lines} lines).")
             
-            end_index = min(offset + limit, total_lines)
-            selected_lines = lines[offset:end_index]
-            
-            # Format with line numbers
-            result = []
-            for i, line in enumerate(selected_lines):
-                result.append(f"{offset + i + 1:6}  {line}")
+            result =[]
+            try:
+                with open(target, 'r', encoding='utf-8', errors='replace') as f:
+                    for i, line in enumerate(itertools.islice(f, offset, offset + limit)):
+                        clean_line = line.rstrip('\n').rstrip('\r')
+                        if show_line_numbers:
+                            result.append(f"{offset + i + 1:6}  {clean_line}")
+                        else:
+                            result.append(clean_line)
+            except Exception as e:
+                return format_error(ErrorType.EXECUTION, f"Error reading file stream: {e}")
                 
             output = "\n".join(result)
             
-            # Add context info if truncated
+            end_index = offset + len(result)
             if total_lines > end_index:
                 output += f"\n\n... (Showing lines {offset+1}-{end_index} of {total_lines}. Use offset/limit to read more)"
                 
@@ -141,10 +150,7 @@ class FilesystemManager:
     def write_file(self, path: str, content: str) -> str:
         try:
             target = self._resolve_path(path)
-            
-            # Ensure parent exists
             target.parent.mkdir(parents=True, exist_ok=True)
-            
             target.write_text(content, encoding='utf-8')
             return f"Success: File '{path}' saved ({len(content)} chars)."
         except Exception as e:
@@ -152,36 +158,87 @@ class FilesystemManager:
 
     def edit_file(self, path: str, old_string: str, new_string: str) -> str:
         """
-        Exact string replacement with Unified Diff output.
+        Smart text replacement: attempts exact match first, 
+        then falls back to fuzzy line-by-line match (ignoring ALL whitespace).
         """
         try:
             target = self._resolve_path(path)
             if not target.exists(): return format_error(ErrorType.NOT_FOUND, f"File '{path}' not found.")
             
             content = target.read_text(encoding='utf-8')
+            original_newline = '\r\n' if '\r\n' in content else '\n'
             
-            # ✅ Исправлено: Нормализация и строгая проверка уникальности вхождений
             content_norm = content.replace('\r\n', '\n')
             old_string_norm = old_string.replace('\r\n', '\n')
+            new_string_norm = new_string.replace('\r\n', '\n')
             
             count = content_norm.count(old_string_norm)
             
-            if count == 0:
-                snippet = old_string_norm[:50].replace('\n', '\\n')
-                return format_error(ErrorType.VALIDATION, f"Could not find exact target text starting with: '{snippet}...'")
+            if count == 1:
+                new_content = content_norm.replace(old_string_norm, new_string_norm, 1)
             elif count > 1:
                 return format_error(
                     ErrorType.VALIDATION, 
-                    f"Found {count} identical occurrences of the target text. "
-                    "Please provide more context (e.g., surrounding lines) to uniquely identify the block to replace."
+                    f"Found {count} identical occurrences of the exact target text. "
+                    "Please provide more context (e.g., surrounding lines) to uniquely identify the block."
                 )
-
-            # Perform safe replacement (exactly 1 occurrence)
-            new_content = content_norm.replace(old_string_norm, new_string, 1)
+            else:
+                # FUZZY MATCH (Бронебойная стратегия)
+                file_lines = content_norm.split('\n')
+                search_lines = old_string_norm.split('\n')
+                
+                while search_lines and not search_lines[0].strip():
+                    search_lines.pop(0)
+                while search_lines and not search_lines[-1].strip():
+                    search_lines.pop()
+                    
+                if not search_lines:
+                    return format_error(ErrorType.VALIDATION, "old_string is empty or only contains whitespaces.")
+                
+                # Функция для удаления ВСЕХ пробелов и табов для сравнения
+                def normalize_line(s: str) -> str:
+                    return "".join(s.split())
+                    
+                search_lines_normalized =[normalize_line(l) for l in search_lines]
+                file_lines_normalized =[normalize_line(l) for l in file_lines]
+                
+                matches =[]
+                search_len = len(search_lines)
+                
+                for i in range(len(file_lines) - search_len + 1):
+                    if file_lines_normalized[i : i + search_len] == search_lines_normalized:
+                        matches.append(i)
+                        
+                if len(matches) == 0:
+                    snippet = old_string_norm[:50].replace('\n', '\\n')
+                    return format_error(
+                        ErrorType.VALIDATION, 
+                        f"Could not find a match for 'old_string' (even when ignoring ALL spaces/indentation).\n"
+                        f"Snippet: '{snippet}...'.\n"
+                        "Make sure you are replacing existing lines and DID NOT include line numbers in old_string."
+                    )
+                elif len(matches) > 1:
+                    return format_error(
+                        ErrorType.VALIDATION, 
+                        f"Found {len(matches)} occurrences of the text (ignoring spaces). "
+                        "Please include more surrounding lines to uniquely identify the block."
+                    )
+                else:
+                    match_idx = matches[0]
+                    new_string_lines = new_string_norm.split('\n')
+                    new_file_lines = (
+                        file_lines[:match_idx] + 
+                        new_string_lines + 
+                        file_lines[match_idx + len(search_lines):]
+                    )
+                    new_content = '\n'.join(new_file_lines)
             
-            target.write_text(new_content, encoding='utf-8')
+            final_content = new_content.replace('\n', original_newline)
             
-            # Generate Diff
+            with open(target, 'w', encoding='utf-8', newline='') as f:
+                f.write(final_content)
+            
+            # Generator expression inline diff creation
             diff = difflib.unified_diff(
                 content_norm.splitlines(),
                 new_content.splitlines(),
@@ -189,7 +246,7 @@ class FilesystemManager:
                 tofile=f"b/{path}",
                 lineterm=""
             )
-            diff_text = "\n".join(list(diff))
+            diff_text = "\n".join(diff)
             
             return f"Success: File edited.\n\nDiff:\n```diff\n{diff_text}\n```"
 
@@ -197,36 +254,50 @@ class FilesystemManager:
             return format_error(ErrorType.EXECUTION, f"Error editing file: {e}")
 
     def search_in_file(self, path: str, pattern: str, use_regex: bool = False, ignore_case: bool = False) -> str:
-        import re
         try:
             target = self._resolve_path(path)
             if not target.exists(): return format_error(ErrorType.NOT_FOUND, f"File '{path}' not found.")
             if not target.is_file(): return format_error(ErrorType.VALIDATION, f"'{path}' is not a file.")
 
-            try:
-                content = target.read_text(encoding='utf-8')
-            except UnicodeDecodeError:
+            if self._is_binary(target):
                 return format_error(ErrorType.VALIDATION, "File is binary or has unknown encoding.")
 
             flags = re.IGNORECASE if ignore_case else 0
+            matches =[]
 
             if use_regex:
+                try:
+                    content = target.read_text(encoding='utf-8', errors='replace')
+                except UnicodeDecodeError:
+                    return format_error(ErrorType.VALIDATION, "File is binary or has unknown encoding.")
+
+                flags |= re.MULTILINE
                 try:
                     compiled = re.compile(pattern, flags)
                 except re.error as e:
                     return format_error(ErrorType.VALIDATION, f"Invalid regex pattern: {e}")
-                matches = [
-                    (i + 1, line)
-                    for i, line in enumerate(content.splitlines())
-                    if compiled.search(line)
-                ]
+                
+                for m in compiled.finditer(content):
+                    start_pos = m.start()
+                    line_no = content.count('\n', 0, start_pos) + 1
+                    match_str = m.group(0)
+                    display_line = match_str.splitlines()[0] if match_str else ""
+                    if not display_line.strip():
+                        line_start = content.rfind('\n', 0, start_pos) + 1
+                        line_end = content.find('\n', start_pos)
+                        if line_end == -1: line_end = len(content)
+                        display_line = content[line_start:line_end]
+                    
+                    matches.append((line_no, display_line))
             else:
                 needle = pattern.lower() if ignore_case else pattern
-                matches = [
-                    (i + 1, line)
-                    for i, line in enumerate(content.splitlines())
-                    if needle in (line.lower() if ignore_case else line)
-                ]
+                try:
+                    with open(target, 'r', encoding='utf-8', errors='replace') as f:
+                        for i, line in enumerate(f):
+                            if needle in (line.lower() if ignore_case else line):
+                                matches.append((i + 1, line.rstrip('\n').rstrip('\r')))
+                except Exception as e:
+                     return format_error(ErrorType.EXECUTION, f"Error reading file stream: {e}")
 
             if not matches:
                 return f"No matches found for '{pattern}' in '{path}'."
@@ -243,7 +314,6 @@ class FilesystemManager:
                             ignore_case: bool = False, extensions: Optional[str] = None,
                             max_matches: int = 500, max_files: int = 200,
                             max_depth: Optional[int] = None) -> str:
-        import re
         try:
             target = self._resolve_path(path)
             if not target.exists(): return format_error(ErrorType.NOT_FOUND, f"Path '{path}' not found.")
@@ -255,103 +325,123 @@ class FilesystemManager:
                               for e in extensions.split(",")}
 
             flags = re.IGNORECASE if ignore_case else 0
+            compiled_regex = None
+            needle = None
+
             if use_regex:
+                flags |= re.MULTILINE
                 try:
-                    compiled = re.compile(pattern, flags)
-                    match_fn = lambda line: bool(compiled.search(line))
+                    compiled_regex = re.compile(pattern, flags)
                 except re.error as e:
                     return format_error(ErrorType.VALIDATION, f"Invalid regex pattern: {e}")
             else:
                 needle = pattern.lower() if ignore_case else pattern
-                match_fn = lambda line: needle in (line.lower() if ignore_case else line)
 
-            all_results: list[str] = []
+            all_results: list[str] =[]
             files_scanned = 0
             dirs_skipped_ignored = 0
             files_skipped_binary = 0
-            max_size = self.safety_policy.max_file_size if self.safety_policy else 10 * 1024 * 1024
+            max_size = self.safety_policy.max_file_size if self.safety_policy else DEFAULT_MAX_FILE_SIZE
             truncated = False
 
-            # ✅ Исправлено: os.walk вместо rglob("*") для предотвращения Out of Memory
-            for root, dirs, files in os.walk(target):
-                # ── 🔴 In-place фильтрация директорий (не сканируем мусорные папки) ──
-                original_dirs_count = len(dirs)
-                dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-                dirs_skipped_ignored += (original_dirs_count - len(dirs))
+            # Optimized tree traversal using Stack and os.scandir to avoid extra stat() calls
+            dirs_to_scan = [(target, 0)]
+            
+            while dirs_to_scan and not truncated:
+                current_dir, depth = dirs_to_scan.pop()
                 
-                root_path = Path(root)
+                if max_depth is not None and depth >= max_depth:
+                    continue
+
                 try:
-                    rel_to_target = root_path.relative_to(target)
-                except ValueError:
-                    rel_to_target = Path(".")
+                    with os.scandir(current_dir) as it:
+                        for entry in it:
+                            if truncated: break
+                            
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name in IGNORED_DIRS:
+                                    dirs_skipped_ignored += 1
+                                else:
+                                    dirs_to_scan.append((Path(entry.path), depth + 1))
+                                continue
+                                
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
 
-                # ── 🟡 Depth limit ──
-                if max_depth is not None:
-                    depth = len(rel_to_target.parts)
-                    if depth >= max_depth:
-                        dirs[:] = []  # Блокируем дальнейшее погружение
-                    if depth > max_depth:
-                        continue
+                            # Fast extension filter
+                            if ext_filter and Path(entry.name).suffix not in ext_filter:
+                                continue
+                            
+                            # Fast size filter (scandir caches stat)
+                            try:
+                                if entry.stat(follow_symlinks=False).st_size > max_size:
+                                    continue
+                            except OSError:
+                                continue
 
-                for file_name in files:
-                    file = root_path / file_name
-
-                    if ext_filter and file.suffix not in ext_filter:
-                        continue
-                    
-                    try:
-                        if file.stat().st_size > max_size:
-                            continue
-                    except OSError:
-                        continue
-
-                    # ── 🔴 File cap ──
-                    if files_scanned >= max_files:
-                        truncated = True
-                        break
-
-                    try:
-                        lines_content = file.read_text(encoding='utf-8').splitlines()
-                    except (UnicodeDecodeError, OSError):
-                        files_skipped_binary += 1
-                        continue
-
-                    files_scanned += 1
-
-                    try:
-                        rel = file.relative_to(self.cwd)
-                    except ValueError:
-                        rel = file
-
-                    for i, line in enumerate(lines_content):
-                        if match_fn(line):
-                            all_results.append(f"{rel}:{i + 1}  {line}")
-                            # ── 🔴 Match cap ──
-                            if len(all_results) >= max_matches:
+                            if files_scanned >= max_files:
                                 truncated = True
                                 break
-                    
-                    if truncated:
-                        break
-                
-                if truncated:
-                    break
 
-            # ── Build output ──
+                            file_path = entry.path
+                            
+                            try:
+                                if self._is_binary(file_path):
+                                    files_skipped_binary += 1
+                                    continue
+                            except OSError:
+                                files_skipped_binary += 1
+                                continue
+
+                            files_scanned += 1
+                            try:
+                                rel_path = Path(file_path).relative_to(self.cwd)
+                            except ValueError:
+                                rel_path = file_path
+
+                            # Scanning content
+                            try:
+                                if use_regex:
+                                    content = Path(file_path).read_text(encoding='utf-8', errors='replace')
+                                    for m in compiled_regex.finditer(content):
+                                        start_pos = m.start()
+                                        line_no = content.count('\n', 0, start_pos) + 1
+                                        match_str = m.group(0)
+                                        display_line = match_str.splitlines()[0] if match_str else ""
+                                        if not display_line.strip():
+                                            line_start = content.rfind('\n', 0, start_pos) + 1
+                                            line_end = content.find('\n', start_pos)
+                                            if line_end == -1: line_end = len(content)
+                                            display_line = content[line_start:line_end]
+                                        
+                                        all_results.append(f"{rel_path}:{line_no}  {display_line}")
+                                        if len(all_results) >= max_matches:
+                                            truncated = True
+                                            break
+                                else:
+                                    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                                        for i, line in enumerate(f):
+                                            target_line = line.lower() if ignore_case else line
+                                            if needle in target_line:
+                                                all_results.append(f"{rel_path}:{i + 1}  {line.rstrip()}")
+                                                if len(all_results) >= max_matches:
+                                                    truncated = True
+                                                    break
+                            except Exception:
+                                continue
+
+                except PermissionError:
+                    continue
+
             if not all_results:
                 return (f"No matches found for '{pattern}' in '{path}'. "
                         f"Scanned {files_scanned} file(s), "
                         f"skipped {dirs_skipped_ignored} ignored dirs, "
                         f"{files_skipped_binary} binary files.")
 
-            header_lines = [
-                f"Found {len(all_results)} match(es) across {files_scanned} file(s).",
-            ]
+            header_lines =[f"Found {len(all_results)} match(es) across {files_scanned} file(s)."]
             if truncated:
-                header_lines.append(
-                    f"⚠ Results truncated (max_matches={max_matches}, max_files={max_files}). "
-                    "Narrow your search or increase limits."
-                )
+                header_lines.append(f"⚠ Results truncated (max_matches={max_matches}, max_files={max_files}). Narrow search.")
             if dirs_skipped_ignored:
                 header_lines.append(f"  Skipped {dirs_skipped_ignored} ignored directory branches.")
 
@@ -362,7 +452,7 @@ class FilesystemManager:
         except Exception as e:
             return format_error(ErrorType.EXECUTION, f"Error searching in directory: {e}")
 
-    def tail_file(self, path: str, lines: int = 50) -> str:
+    def tail_file(self, path: str, lines: int = 50, show_line_numbers: bool = True) -> str:
         try:
             target = self._resolve_path(path)
             if not target.exists(): return format_error(ErrorType.NOT_FOUND, f"File '{path}' not found.")
@@ -371,7 +461,7 @@ class FilesystemManager:
             policy_limit = self.safety_policy.max_read_lines if self.safety_policy else DEFAULT_READ_LIMIT
             lines = min(lines, policy_limit)
 
-            collected: list[bytes] = []
+            collected: list[bytes] =[]
             newlines_found = 0
             chunk_size = 8192
 
@@ -402,37 +492,106 @@ class FilesystemManager:
 
             selected = all_lines[-lines:] if len(all_lines) > lines else all_lines
 
-            result = "\n".join(f"{i + 1:6}  {line}" for i, line in enumerate(selected))
+            if show_line_numbers:
+                result = "\n".join(f"tail-{i + 1:02}  {line}" for i, line in enumerate(selected))
+            else:
+                result = "\n".join(selected)
+                
             header = f"Last {len(selected)} line(s) of '{path}':\n\n"
             return header + result
 
         except Exception as e:
             return format_error(ErrorType.EXECUTION, f"Error reading tail of file: {e}")
 
+    def find_files(self, path: str, name_pattern: str, max_results: int = 200, max_depth: Optional[int] = None) -> str:
+        import fnmatch
+        try:
+            target = self._resolve_path(path)
+            if not target.exists(): return format_error(ErrorType.NOT_FOUND, f"Path '{path}' not found.")
+            if not target.is_dir(): return format_error(ErrorType.VALIDATION, f"'{path}' is not a directory.")
+
+            all_results =[]
+            files_scanned = 0
+            dirs_skipped = 0
+            truncated = False
+
+            dirs_to_scan =[(target, 0)]
+            
+            while dirs_to_scan and not truncated:
+                current_dir, depth = dirs_to_scan.pop()
+                
+                if max_depth is not None and depth >= max_depth:
+                    continue
+
+                try:
+                    with os.scandir(current_dir) as it:
+                        for entry in it:
+                            if truncated: break
+                            
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name in IGNORED_DIRS:
+                                    dirs_skipped += 1
+                                else:
+                                    dirs_to_scan.append((Path(entry.path), depth + 1))
+                                continue
+                                
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+
+                            files_scanned += 1
+                            
+                            # Поиск по имени с поддержкой масок (*, ?)
+                            if fnmatch.fnmatch(entry.name, name_pattern) or fnmatch.fnmatch(entry.name.lower(), name_pattern.lower()):
+                                try:
+                                    rel_path = Path(entry.path).relative_to(self.cwd)
+                                except ValueError:
+                                    rel_path = Path(entry.path)
+                                
+                                all_results.append(str(rel_path).replace("\\", "/"))
+                                if len(all_results) >= max_results:
+                                    truncated = True
+                                    break
+                except PermissionError:
+                    continue
+
+            if not all_results:
+                return (f"No files matching '{name_pattern}' found in '{path}'. "
+                        f"Scanned {files_scanned} files, skipped {dirs_skipped} ignored directories.")
+
+            header = f"Found {len(all_results)} match(es) for '{name_pattern}':"
+            if truncated:
+                header += f" (Truncated to {max_results} max results)"
+                
+            output = header + "\n\n" + "\n".join(all_results)
+            limit = self.safety_policy.max_tool_output if self.safety_policy else 5000
+            return truncate_output(output, limit, source="filesystem")
+
+        except Exception as e:
+            return format_error(ErrorType.EXECUTION, f"Error finding files: {e}")
+    
     def list_files(self, path: str, include_hidden: bool = False) -> str:
         try:
             target = self._resolve_path(path)
             if not target.exists(): return format_error(ErrorType.NOT_FOUND, f"Path '{path}' not found.")
             
-            results = []
             if target.is_file():
-                st = target.stat()
-                return f"[FILE] {target.name} ({st.st_size} bytes)"
+                return f"[FILE] {target.name} ({target.stat().st_size} bytes)"
             
-            # ✅ Исправлено: Возможность отображения скрытых файлов по флагу
-            for child in sorted(target.iterdir()):
-                if child.name.startswith('.') and not include_hidden: 
-                    continue
-                # Откровенный системный мусор не показываем даже если include_hidden=True
-                if child.name in {'.DS_Store', '__pycache__'}:
-                    continue
-                
-                try:
-                    prefix = "[DIR] " if child.is_dir() else "[FILE]"
-                    name = child.name
-                    results.append(f"{prefix} {name}")
-                except OSError:
-                    continue
+            results =[]
+            try:
+                # Optimized directory listing using os.scandir
+                with os.scandir(target) as it:
+                    entries = sorted(list(it), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+                    for entry in entries:
+                        if entry.name.startswith('.') and not include_hidden:
+                            continue
+                        if entry.name in {'.DS_Store', '__pycache__'}:
+                            continue
+                        
+                        prefix = "[DIR] " if entry.is_dir(follow_symlinks=False) else "[FILE]"
+                        results.append(f"{prefix} {entry.name}")
+            except PermissionError:
+                return format_error(ErrorType.EXECUTION, "Permission denied while accessing directory.")
             
             count = len(results)
             output = f"Directory '{path}':\n" + "\n".join(results) + f"\n\n(Total {count} items)"
@@ -451,18 +610,20 @@ def set_safety_policy(policy: SafetyPolicy):
     fs_manager.set_policy(policy)
 
 @tool("read_file")
-def read_file_tool(path: str, offset: int = 0, limit: int = 2000) -> str:
+def read_file_tool(path: str, offset: int = 0, limit: int = 2000, show_line_numbers: bool = True) -> str:
     """Reads a file from the filesystem.
     Args:
         path: Relative path to file
         offset: Line number to start reading from (0-indexed, default 0)
         limit: Max lines to read (default 2000)
+        show_line_numbers: Set to False to get raw text without line numbers. Use False if you plan to copy-paste exact text into edit_file!
     """
-    return fs_manager.read_file(path, offset, limit)
+    return fs_manager.read_file(path, offset, limit, show_line_numbers)
 
 @tool("write_file")
 def write_file_tool(path: str, content: str) -> str:
-    """Writes content to a file. Creates directories if needed. Overwrites existing files.
+    """Writes content to a file. Overwrites existing files completely.
+    WARNING: NEVER use this tool to modify an existing file. It will destroy the file's formatting or minify it. ALWAYS use 'edit_file' to modify existing files.
     Args:
         path: Relative path to file
         content: Text content to write
@@ -471,11 +632,15 @@ def write_file_tool(path: str, content: str) -> str:
 
 @tool("edit_file")
 def edit_file_tool(path: str, old_string: str, new_string: str) -> str:
-    """Replaces exact text in a file. Returns a Unified Diff of changes.
+    """Replaces text in a file. Very smart: if exact match fails, it ignores spaces/indentation and finds the right block automatically.
+    IMPORTANT RULES FOR LLM:
+    1. 'old_string' MUST contain the exact text from the file (do NOT include the line numbers from read_file output).
+    2. Provide enough context (2-3 surrounding lines in old_string) so the tool can uniquely identify the block to replace.
+    3. Do not use regex here.
     Args:
         path: Relative path to file
-        old_string: Exact text block to replace. MUST be unique within the file.
-        new_string: New text block to insert
+        old_string: The text block to replace.
+        new_string: The new text block to insert.
     """
     return fs_manager.edit_file(path, old_string, new_string)
 
@@ -490,7 +655,8 @@ def list_directory_tool(path: str = ".", include_hidden: bool = False) -> str:
 
 @tool("search_in_file")
 def search_in_file_tool(path: str, pattern: str, use_regex: bool = False, ignore_case: bool = False) -> str:
-    """Searches for a text pattern (or regex) in a single file."""
+    """Searches for a text pattern (or regex) in a single file.
+    Supports multiline regex if use_regex=True (e.g. use '(?s)pattern' to match across lines)."""
     return fs_manager.search_in_file(path, pattern, use_regex, ignore_case)
 
 @tool("search_in_directory")
@@ -503,9 +669,14 @@ def search_in_directory_tool(path: str, pattern: str, use_regex: bool = False,
                                           extensions, max_matches, max_files, max_depth)
 
 @tool("tail_file")
-def tail_file_tool(path: str, lines: int = 50) -> str:
-    """Returns the last N lines of a file with line numbers (like Unix `tail`)."""
-    return fs_manager.tail_file(path, lines)
+def tail_file_tool(path: str, lines: int = 50, show_line_numbers: bool = True) -> str:
+    """Returns the last N lines of a file (like Unix `tail`).
+    Args:
+        path: Relative path to file
+        lines: Number of lines to return
+        show_line_numbers: Whether to prepend line numbers
+    """
+    return fs_manager.tail_file(path, lines, show_line_numbers)
 
 @tool("download_file")
 async def download_file(url: str, filename: Optional[str] = None) -> str:
@@ -514,10 +685,11 @@ async def download_file(url: str, filename: Optional[str] = None) -> str:
         if not filename:
             filename = url.split("/")[-1] or "downloaded_file"
         
-        if os.path.sep in filename or (os.path.altsep and os.path.altsep in filename):
-             return format_error(ErrorType.VALIDATION, f"Invalid filename '{filename}'.")
+        try:
+            destination = fs_manager._resolve_path(filename)
+        except ValueError as e:
+            return format_error(ErrorType.VALIDATION, str(e))
              
-        destination = Path.cwd() / filename
         client = get_net_client() 
         logger.info(f"⬇️ Downloading {url} to {destination}")
         
@@ -526,11 +698,10 @@ async def download_file(url: str, filename: Optional[str] = None) -> str:
                 response.raise_for_status()
                 content_length = response.headers.get("content-length")
                 
-                max_size = fs_manager.safety_policy.max_file_size if fs_manager.safety_policy else 10*1024*1024
+                max_size = fs_manager.safety_policy.max_file_size if fs_manager.safety_policy else DEFAULT_MAX_FILE_SIZE
                 if content_length and int(content_length) > max_size:
                     return format_error(ErrorType.LIMIT_EXCEEDED, f"File too large (>{max_size} bytes). Download aborted.")
 
-                # ✅ Исправлено: Асинхронная запись с помощью aiofiles (не блокирует event loop)
                 async with aiofiles.open(destination, "wb") as f:
                     downloaded = 0
                     async for chunk in response.aiter_bytes():
@@ -546,3 +717,16 @@ async def download_file(url: str, filename: Optional[str] = None) -> str:
             return format_error(ErrorType.NETWORK, f"Network request failed: {e}")
     except Exception as e:
         return format_error(ErrorType.EXECUTION, f"Error downloading file: {e}")
+        
+@tool("find_file")
+def find_file_tool(path: str, name_pattern: str, max_results: int = 200, max_depth: Optional[int] = None) -> str:
+    """Finds files by their name pattern in a directory (recursive).
+    Supports glob patterns like '*.py', 'mcp.json', 'test_*.py'.
+    Does NOT search inside files, only checks file names.
+    Args:
+        path: Directory path to search in (default ".")
+        name_pattern: The filename or glob pattern to search for
+        max_results: Max number of file paths to return
+        max_depth: How deep to search (None for unlimited)
+    """
+    return fs_manager.find_files(path, name_pattern, max_results, max_depth)

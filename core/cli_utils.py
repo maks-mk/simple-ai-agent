@@ -1,13 +1,20 @@
 import re
-from typing import Tuple, Dict, Any
+from pathlib import Path
+from typing import Tuple, Dict, Any, Optional
 from langchain_core.messages import AIMessage, AIMessageChunk
 from prompt_toolkit.key_binding import KeyBindings
 
 # ======================================================
+# PRE-COMPILED REGEXES (Optimization)
+# ======================================================
+_THOUGHT_RE = re.compile(r"<(thought|think)>(.*?)</\1>", re.DOTALL)
+_CLEAN_MD_RE = re.compile(r'\n{3,}')
+_CRAWL_PAGES_RE = re.compile(r"(\d+) pages processed")
+_CRAWL_DEPTH_RE = re.compile(r"max_depth: (\d+)")
+
+# ======================================================
 # TEXT PROCESSING
 # ======================================================
-
-_THOUGHT_RE = re.compile(r"<(thought|think)>(.*?)</\1>", re.DOTALL)
 
 def truncate_value(value: str, max_length: int = 60) -> str:
     """Truncate a string value if it exceeds max_length."""
@@ -17,7 +24,6 @@ def truncate_value(value: str, max_length: int = 60) -> str:
 
 def abbreviate_path(path_str: str, max_length: int = 60) -> str:
     """Abbreviate a file path intelligently - show basename or relative path."""
-    from pathlib import Path
     try:
         path = Path(path_str)
         # If it's just a filename (no directory parts), return as-is
@@ -26,8 +32,7 @@ def abbreviate_path(path_str: str, max_length: int = 60) -> str:
 
         # Try to get relative path from current working directory
         try:
-            rel_path = path.relative_to(Path.cwd())
-            rel_str = str(rel_path)
+            rel_str = str(path.relative_to(Path.cwd()))
             # Use relative if it's shorter and not too long
             if len(rel_str) < len(path_str) and len(rel_str) <= max_length:
                 return rel_str
@@ -49,77 +54,65 @@ def format_tool_display(tool_name: str, tool_args: Dict[str, Any]) -> str:
     Based on deepagents-cli UI.
     """
     # Tool-specific formatting - show the most important argument(s)
-    if tool_name in {"read_file", "write_file", "edit_file", "Read", "Write", "SearchReplace"}:
-        # File operations: show the primary file path argument
+    if tool_name in {"read_file", "write_file", "edit_file", "Read", "Write", "SearchReplace", "tail_file"}:
         path_value = tool_args.get("file_path") or tool_args.get("path")
         if path_value:
-            path = abbreviate_path(str(path_value))
-            return f"{tool_name}({path})"
+            return f"{tool_name}({abbreviate_path(str(path_value))})"
 
     elif tool_name in {"web_search", "WebSearch"}:
-        # Web search: show the query string
         if "query" in tool_args:
-            query = truncate_value(str(tool_args["query"]), 80)
-            return f'{tool_name}("{query}")'
+            return f'{tool_name}("{truncate_value(str(tool_args["query"]), 80)}")'
 
-    elif tool_name in {"grep", "Grep", "glob", "Glob"}:
-        # Search tools: show pattern
+    elif tool_name in {"grep", "Grep", "glob", "Glob", "search_in_file", "search_in_directory", "find_file"}:
         if "pattern" in tool_args:
-            pattern = truncate_value(str(tool_args["pattern"]), 70)
-            return f'{tool_name}("{pattern}")'
+            pattern_val = tool_args.get("pattern") or tool_args.get("name_pattern")
+            return f'{tool_name}("{truncate_value(str(pattern_val), 70)}")'
 
-    elif tool_name in {"execute", "RunCommand"}:
-        # Execute: show the command
+    elif tool_name in {"execute", "RunCommand", "cli_exec"}:
         if "command" in tool_args:
-            command = truncate_value(str(tool_args["command"]), 100)
-            return f'{tool_name}("{command}")'
+            return f'{tool_name}("{truncate_value(str(tool_args["command"]), 100)}")'
 
-    elif tool_name in {"ls", "LS"}:
-        # ls: show directory, or empty if current directory
+    elif tool_name in {"ls", "LS", "list_directory"}:
         if tool_args.get("path"):
-            path = abbreviate_path(str(tool_args["path"]))
-            return f"{tool_name}({path})"
+            return f"{tool_name}({abbreviate_path(str(tool_args['path']))})"
         return f"{tool_name}()"
 
-    elif tool_name in {"fetch_url", "WebFetch"}:
-        if "url" in tool_args:
-            url = truncate_value(str(tool_args["url"]), 80)
-            return f'{tool_name}("{url}")'
+    elif tool_name in {"fetch_url", "WebFetch", "fetch_content", "download_file"}:
+        url_val = tool_args.get("url") or tool_args.get("urls")
+        if url_val:
+            return f'{tool_name}("{truncate_value(str(url_val), 80)}")'
 
     # Fallback: generic formatting
-    args_str = ", ".join(
-        f"{k}={truncate_value(str(v), 50)}" for k, v in tool_args.items()
-    )
+    args_str = ", ".join(f"{k}={truncate_value(str(v), 50)}" for k, v in tool_args.items())
     return f"{tool_name}({args_str})"
 
 def clean_markdown_text(text: str) -> str:
     """Убирает лишние отступы и двойные переносы строк."""
     if not text: return text
-    # Схлопываем множественные переносы
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    # Убираем пустую строку перед элементами списка - REMOVED to fix list rendering
-    # text = re.sub(r'\n\s*\n(\s*[•\-\*]|\d+\.)', r'\n\1', text)
-    return text
+    # Используем пре-скомпилированный regex для скорости
+    return _CLEAN_MD_RE.sub('\n\n', text)
 
 def parse_thought(text: str) -> Tuple[str, str, bool]:
     """Отделяет скрытые мысли <thought>/<think> от основного текста."""
-    match = _THOUGHT_RE.search(text)
-    if match: 
-        return match.group(2).strip(), _THOUGHT_RE.sub('', text).strip(), True
+    # 1. Сначала удаляем ВСЕ полностью завершенные мысли (чтобы они не ломали флаг)
+    clean_text = _THOUGHT_RE.sub('', text)
     
-    # Fallback for unclosed tags (streaming)
-    for tag in ["<thought>", "<think>"]:
-        if tag in text:
+    # 2. Проверяем, есть ли сейчас открытая (незавершенная) мысль
+    for tag in ("<thought>", "<think>"):
+        start_idx = clean_text.find(tag)
+        if start_idx != -1:
             close_tag = tag.replace("<", "</")
-            if close_tag not in text:
-                start = text.find(tag) + len(tag)
-                return text[start:].strip(), text[:text.find(tag)], False
-        
-    return "", text, False
-
+            if close_tag not in clean_text:
+                content_start = start_idx + len(tag)
+                # Возвращаем: (текущая мысль, чистый текст до нее, флаг "идет мысль")
+                return clean_text[content_start:].strip(), clean_text[:start_idx], True
+                
+    return "", clean_text.strip(), False
+    
 def format_tool_output(name: str, content: str, is_error: bool) -> str:
     """Форматирует результат инструмента для компактного вывода."""
     content = str(content).strip()
+    
     if is_error: 
         # Smart Hints for common errors
         hint = ""
@@ -137,16 +130,16 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
         return f"[red]{summary}[/][yellow italic]{hint}[/]"
     
     # Специальные форматтеры для разных типов инструментов
-    if "web_search" in name: 
+    name_lower = name.lower()
+    
+    if "web_search" in name_lower: 
         count = content.count('http')
         return f"Found {count} results" if count > 0 else "No results found"
         
-    elif "crawl_site" in name:
-        # Extract page count and depth if available
-        # Format: [Crawl completed. X pages processed. max_depth: Y]
-        import re
-        pages_match = re.search(r"(\d+) pages processed", content)
-        depth_match = re.search(r"max_depth: (\d+)", content)
+    elif "crawl_site" in name_lower:
+        # Используем пре-скомпилированные регулярные выражения
+        pages_match = _CRAWL_PAGES_RE.search(content)
+        depth_match = _CRAWL_DEPTH_RE.search(content)
         
         pages = pages_match.group(1) if pages_match else "?"
         depth = depth_match.group(1) if depth_match else "?"
@@ -155,28 +148,22 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
              return f"Crawled {pages} pages (depth: {depth})"
         return "Crawl completed"
         
-    elif "cli_exec" in name:
+    elif "cli_exec" in name_lower or "shell" in name_lower:
         # Разбиваем вывод на строки и убираем пустые
-        lines = [line.strip() for line in content.splitlines() if line.strip()]
-        
+        lines =[line.strip() for line in content.splitlines() if line.strip()]
         if not lines:
             return "Command executed (no output)"
         
         # Берем первую значимую строку для превью
-        first_line = lines[0]
-        # Если в первой строке есть "[stderr]", убираем его для красоты
-        first_line = first_line.replace("[stderr]", "").strip()
-        
-        # Обрезаем, если длинная
+        first_line = lines[0].replace("[stderr]", "").strip()
         preview = first_line[:60] + "..." if len(first_line) > 60 else first_line
         
         # Если строк много, добавляем счетчик
         if len(lines) > 1:
             return f"{preview} [dim](+{len(lines)-1} lines)[/]"
-        
         return preview
 
-    elif "list" in name and "directory" in name:
+    elif "list" in name_lower and "directory" in name_lower:
         lines = content.splitlines()
         count = len(lines)
         preview = ", ".join([l.strip() for l in lines[:3]])
@@ -184,23 +171,20 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
             return f"Listed {count} items: {preview}, ..."
         return f"Listed {count} items: {preview}"
 
-    elif "read" in name:
-        size = len(content)
-        lines = len(content.splitlines())
-        return f"Read {lines} lines ({size} chars)"
+    elif "read" in name_lower:
+        return f"Read {len(content.splitlines())} lines ({len(content)} chars)"
         
-    elif "write" in name or "save" in name: 
+    elif "write" in name_lower or "save" in name_lower: 
         return "File saved successfully"
         
-    elif "edit_file" in name:
+    elif "edit_file" in name_lower:
         return "File edited successfully"
     
-    elif "delete" in name:
+    elif "delete" in name_lower:
         return "Deleted successfully"
         
-    elif "fetch" in name or "download" in name:
-        size = len(content)
-        return f"Fetched content ({size} chars)"
+    elif "fetch" in name_lower or "download" in name_lower:
+        return f"Fetched content ({len(content)} chars)"
 
     return content[:150] + "..." if len(content) > 150 else content
 
@@ -227,7 +211,7 @@ def format_exception_friendly(e: Exception) -> str:
 
     # 5. Fallback: Shorten extremely long messages (often JSON dumps)
     if len(err_str) > 300:
-        return f"⚠ Error ({err_type}): {err_str[:300]}... [truncated]"
+        return f"⚠ Error ({err_type}): {err_str[:300]}...[truncated]"
         
     return f"⚠ Error ({err_type}): {err_str}"
 
@@ -249,15 +233,15 @@ def get_key_bindings():
 # ======================================================
 
 class TokenTracker:
+    __slots__ = ('max_input', 'total_output', '_streaming_len')
+
     def __init__(self):
         self.max_input = 0
         self.total_output = 0
         self._streaming_len = 0 
 
     def update_from_message(self, msg: Any):
-        """
-        Updates counters based on message content or metadata.
-        """
+        """Updates counters based on message content or metadata."""
         # 1. Prefer Metadata if available
         if hasattr(msg, "usage_metadata") and msg.usage_metadata:
             self._apply_metadata(msg.usage_metadata)
@@ -270,27 +254,29 @@ class TokenTracker:
             if isinstance(content, str): 
                 chunk_len = len(content)
             elif isinstance(content, list):
+                # Faster sum via generator expression
                 chunk_len = sum(len(x.get("text", "")) for x in content if isinstance(x, dict))
             
             self._streaming_len += chunk_len
 
     def update_from_node_update(self, update: Dict):
-        """
-        Updates counters from state updates (final messages with metadata).
-        """
+        """Updates counters from state updates (final messages with metadata)."""
         agent_data = update.get("agent")
         if not agent_data: return
-        messages = agent_data.get("messages", [])
-        if not isinstance(messages, list): messages = [messages]
+        
+        messages = agent_data.get("messages",[])
+        if not isinstance(messages, list): 
+            messages = [messages]
+            
         for msg in messages:
             if hasattr(msg, "usage_metadata") and msg.usage_metadata:
                 self._apply_metadata(msg.usage_metadata)
 
     def _apply_metadata(self, usage: Dict):
         in_t = usage.get("input_tokens", 0)
-        if in_t > self.max_input: self.max_input = in_t
+        if in_t > self.max_input: 
+            self.max_input = in_t
         
-        # Assume output_tokens in metadata is the total for the response
         out_t = usage.get("output_tokens", 0)
         if out_t > self.total_output:
             self.total_output = out_t

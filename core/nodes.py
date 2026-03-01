@@ -4,6 +4,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+from rich import print as rprint
+from rich.panel import Panel
+
 from langchain_core.messages import (
     BaseMessage, SystemMessage, RemoveMessage, HumanMessage, AIMessage, ToolMessage
 )
@@ -99,9 +102,16 @@ class AgentNodes:
             delete_msgs =[RemoveMessage(id=m.id) for m in to_summarize if m.id]
             logger.info(f"🧹 Summary: Removed {len(delete_msgs)} messages. Generated new summary.")
             
-            # --- USER REQUESTED NOTIFICATION ---
-            print(f"\n\033[93m[SYSTEM] 🧹 Сработала автоматическая суммаризация (контекст > {self.config.summary_threshold}). Старые сообщения сжаты.\033[0m\n")
-            # -----------------------------------
+            # --- КРАСИВОЕ УВЕДОМЛЕНИЕ ЧЕРЕЗ RICH ---
+            rprint(Panel(
+                f"[dim]Контекст превысил порог в {self.config.summary_threshold} токенов.\n"
+                f"Старые сообщения ({len(delete_msgs)} шт.) успешно сжаты в память.[/dim]",
+                title="[bold yellow]🧹 Авто-суммаризация памяти[/]",
+                border_style="yellow",
+                padding=(0, 2),
+                expand=False
+            ))
+            # --------------------------------------
 
             return {"summary": res.content, "messages": delete_msgs}
         except Exception as e:
@@ -134,7 +144,7 @@ class AgentNodes:
             token_usage_update = {"token_usage": response.usage_metadata}
 
         return {
-            "messages": [response],
+            "messages":[response],
             **token_usage_update
         }
 

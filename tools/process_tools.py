@@ -1,11 +1,10 @@
-import asyncio
 import logging
 import subprocess
 import shlex
 import psutil
 import platform
 import atexit
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
 from langchain_core.tools import tool
 
 from core.safety_policy import SafetyPolicy
@@ -144,3 +143,4 @@ def find_process_by_port(port: int) -> str:
         return format_error(ErrorType.NOT_FOUND, f"No process found listening on port {port}.")
     except Exception as e:
         return format_error(ErrorType.EXECUTION, f"Error searching process: {e}")
+

@@ -1,186 +1,222 @@
-# 🤖 Autonomous AI Agent (LangGraph + MCP + Rich UI)
+# Autonomous AI Agent (LangGraph + MCP + Rich UI)
 
-**v7.4b**
+**v7.43b**
 
-Мощный автономный AI-агент, построенный на архитектуре **LangGraph** и протоколе **MCP (Model Context Protocol)**.  
-Обеспечивает безопасное выполнение задач, работу с локальной файловой системой, поиск в интернете и управление процессами через удобный CLI-интерфейс.
-
----
-
-## ✨ Основные возможности
-
-### 🚀 Продвинутый CLI и UI
-- **Smart Formatting:** Умное отображение вызовов инструментов. Сворачивание длинных аргументов, подсветка путей и запросов.
-- **Real-time Streaming:** Потоковый вывод ответов и статусов инструментов без задержек.
-- **Rich UI:** Красивое оформление на базе библиотеки `rich`. Визуализация процесса мышления, статусов и ошибок.
-- **Fuzzy Autocomplete:** Умное автодополнение путей к файлам и команд (поддержка Windows/Linux путей, нечеткий поиск).
-- **Session Recovery:** Автоматическое восстановление сессии при сбоях.
-
-### 🧠 Архитектура и Логика
-- **LangGraph Core:** Надежная детерминированная машина состояний (`Start -> Summarize -> Agent <-> Tools`).
-- **Memory Management:** Автоматическая динамическая суммаризация истории диалога на базе подсчета токенов (`SESSION_SIZE`), с сохранением последних N сообщений (`SUMMARY_KEEP_LAST`).
-- **Native LLM Judgment:** Агент самостоятельно оценивает результаты выполнения инструментов и принимает решения о дальнейших действиях.
-- **Resilient Token Tracking:** Защита от багов API-провайдеров при подсчете потраченных токенов.
-
-### 🛠️ Модульная система инструментов
-Инструменты разделены на группы, которые можно включать/отключать через `.env`:
-
-1.  **Filesystem Tools** (`ENABLE_FILESYSTEM_TOOLS`):
-    *   `read_file`, `write_file`, `edit_file` (Smart Replace), `list_directory`.
-    *   `search_in_file`, `search_in_directory`, `find_file`, `tail_file` (Advanced Reading).
-    *   `download_file` (HTTP Downloader).
-    *   `safe_delete_file`, `safe_delete_directory`.
-    *   Встроенная защита от Path Traversal (Virtual Sandbox Mode).
-2.  **Search Tools** (`ENABLE_SEARCH_TOOLS`):
-    *   `web_search` (через Tavily API).
-    *   `fetch_content` (извлечение текста по URL).
-    *   `batch_web_search` (параллельный поиск).
-    *   `crawl_site` (опционально, если есть зависимости).
-    *   Умное кэширование результатов и ретраи при сбоях сети.
-3.  **System Tools** (`ENABLE_SYSTEM_TOOLS`):
-    *   `get_system_info` (CPU/RAM/Disk).
-    *   `get_public_ip`, `lookup_ip_info`, `get_local_network_info` (Network).
-4.  **Shell Tools** (`ENABLE_SHELL_TOOL`):
-    *   `cli_exec` — выполнение shell-команд (с таймаутами и защитой).
-5.  **Process Tools** (`ENABLE_PROCESS_TOOLS`):
-    *   `run_background_process`, `stop_background_process`, `find_process_by_port`.
+Автономный AI-агент на базе **LangGraph** и **MCP (Model Context Protocol)** с CLI-интерфейсом для Windows/Linux.
 
 ---
 
-## ⚙️ Конфигурация (.env)
+## Основные возможности
 
-Настройки проекта управляются через файл `.env`. Все параметры имеют безопасные значения по умолчанию.
+### CLI и UI
+- **Smart Formatting:** компактное отображение вызовов инструментов, сокращение длинных аргументов, подсветка ключевых данных.
+- **Real-time Streaming:** потоковый вывод ответов и tool-статусов.
+- **Rich UI:** консольный интерфейс на `rich`.
+- **Fuzzy Autocomplete:** нечеткое автодополнение путей и команд.
+- **Session Recovery:** восстановление сессии после сбоев.
 
-### 🤖 Провайдеры LLM
+### Архитектура и логика
+- **LangGraph Core:** `Start -> Summarize -> UpdateStep -> Agent -> (Tools -> UpdateStep -> Agent | End)`.
+- **Memory Management:** автосуммаризация при достижении `SESSION_SIZE` с сохранением последних `SUMMARY_KEEP_LAST` сообщений.
+- **Loop Guard (graph):** ограничение шагов по `MAX_LOOPS`.
+- **Loop Guard (tools):** защита от повторов одинаковых вызовов инструментов; дефолты синхронизированы с `MAX_LOOPS`, но могут быть переопределены в `.env`.
+- **Parallel Tool Calls:** параллельный запуск только для безопасного набора read-only инструментов.
+- **Token Tracking:** учет usage metadata с fallback-логикой.
+
+### Инструменты (модульно через `.env`)
+1. **Filesystem Tools** (`ENABLE_FILESYSTEM_TOOLS`):
+   - `read_file`, `write_file`, `edit_file`, `list_directory`
+   - `search_in_file`, `search_in_directory`, `find_file`, `tail_file`
+   - `download_file`, `safe_delete_file`, `safe_delete_directory`
+   - защита от path traversal
+2. **Search Tools** (`ENABLE_SEARCH_TOOLS`):
+   - `web_search(query, max_results=5, search_depth="basic", topic="general")`
+   - `fetch_content(urls, advanced=False, content_format="markdown", query=None, chunks_per_source=3)`
+   - `batch_web_search(queries, max_results=5, search_depth="basic", topic="general")`
+   - `crawl_site` (опционально, если доступен в окружении)
+3. **System Tools** (`ENABLE_SYSTEM_TOOLS`):
+   - `get_system_info`, `get_public_ip`, `lookup_ip_info`, `get_local_network_info`
+4. **Shell Tool** (`ENABLE_SHELL_TOOL`):
+   - `cli_exec` (timeout + safety policy, с подсказками Windows для Unix-команд)
+5. **Process Tools** (`ENABLE_PROCESS_TOOLS`):
+   - `run_background_process`, `stop_background_process`, `find_process_by_port`
+
+### MCP интеграция
+- Конфигурация: `mcp.json`
+- Загружаются только серверы с `"enabled": true`
+- MCP-инструменты подключаются асинхронно и параллельно (с ограничением конкурентности)
+
+---
+
+## Конфигурация (.env)
+
+### Провайдеры LLM
 
 | Параметр | Описание | Пример |
 | :--- | :--- | :--- |
-| `PROVIDER` | Выбор провайдера (`gemini` или `openai`) | `gemini` |
-| `GEMINI_API_KEY` | API ключ для Google Gemini | `AIzaSy...` |
+| `PROVIDER` | `gemini` или `openai` | `openai` |
+| `GEMINI_API_KEY` | API ключ Gemini | `AIzaSy...` |
 | `GEMINI_MODEL` | Модель Gemini | `gemini-1.5-flash` |
-| `OPENAI_API_KEY` | API ключ для OpenAI/Compatible | `sk-...` |
-| `OPENAI_BASE_URL` | URL для совместимых API (OpenRouter/Ollama) | `https://openrouter.ai/api/v1` |
-| `OPENAI_MODEL` | Модель OpenAI | `gpt-4o` |
+| `OPENAI_API_KEY` | API ключ OpenAI/совместимых API | `sk-...` |
+| `OPENAI_BASE_URL` | Base URL совместимого API | `https://openrouter.ai/api/v1` |
+| `OPENAI_MODEL` | Имя модели OpenAI/совместимой | `gpt-4o` |
 
-### 🎛️ Основные настройки
+### Основные настройки
 
-| Параметр | По умолч. | Описание |
+| Параметр | По умолчанию | Описание |
 | :--- | :--- | :--- |
-| `TEMPERATURE` | `0.2` | Креативность модели (0.0 - строгая логика, 1.0 - творчество) |
-| `MAX_LOOPS` | `50` | Максимальное количество шагов агента на один запрос (защита от зацикливания) |
-| `DEBUG` | `false` | Включить подробный вывод логов в консоль |
-| `PROMPT_PATH` | `prompt.txt` | Путь к файлу с системным промптом |
+| `TEMPERATURE` | `0.2` | Температура модели |
+| `MAX_LOOPS` | `50` | Максимум шагов графа на запрос |
+| `TOOL_LOOP_LIMIT_MUTATING` | `auto` | Лимит повторов mutating tools (дефолт: `max(3, min(8, MAX_LOOPS // 10))`) |
+| `TOOL_LOOP_LIMIT_READONLY` | `auto` | Лимит повторов read-only tools (дефолт: `max(6, min(20, MAX_LOOPS // 4))`) |
+| `TOOL_LOOP_WINDOW` | `auto` | Окно истории для проверки повторов (дефолт: `max(10, min(60, MAX_LOOPS))`) |
+| `DEBUG` | `false` | Расширенные логи |
+| `PROMPT_PATH` | `prompt.txt` | Путь к системному промпту |
+| `MODEL_SUPPORTS_TOOLS` | `true` | Разрешить tool-calling (иначе chat-only) |
 
-### 🔌 Управление подсистемами (Tools)
+### Управление инструментами
 
-| Параметр | По умолч. | Описание |
+| Параметр | По умолчанию | Описание |
 | :--- | :--- | :--- |
-| `ENABLE_SEARCH_TOOLS` | `true` | Включить поиск в интернете (требует `TAVILY_API_KEY`) |
-| `TAVILY_API_KEY` | - | API ключ Tavily для поиска |
-| `ENABLE_FILESYSTEM_TOOLS` | `true` | Включить работу с файлами |
-| `ENABLE_SHELL_TOOL` | `false` | Включить выполнение shell команд (Осторожно!) |
-| `ENABLE_SYSTEM_TOOLS` | `true` | Включить системную диагностику |
-| `ENABLE_PROCESS_TOOLS` | `false` | Включить управление процессами |
+| `ENABLE_SEARCH_TOOLS` | `true` | Включить search tools |
+| `TAVILY_API_KEY` | - | Ключ Tavily |
+| `ENABLE_FILESYSTEM_TOOLS` | `true` | Включить filesystem tools |
+| `ENABLE_SHELL_TOOL` | `false` | Включить `cli_exec` |
+| `ENABLE_SYSTEM_TOOLS` | `true` | Включить system tools |
+| `ENABLE_PROCESS_TOOLS` | `false` | Включить process tools |
 
-### 🛡️ Безопасность и Лимиты
+### Search API детали (Tavily)
 
-| Параметр | По умолч. | Описание |
+- `web_search`:
+  - `max_results`: `1..20`
+  - `search_depth`: `basic | advanced | fast | ultra-fast`
+  - `topic`: `general | news | finance`
+- `fetch_content`:
+  - поддерживает до `20` URL за вызов
+  - `content_format`: `markdown | text`
+  - при `query` можно задавать `chunks_per_source` (`1..20`)
+- `batch_web_search`:
+  - выполняет до `5` уникальных запросов параллельно
+  - использует те же параметры `max_results/search_depth/topic`, что и `web_search`
+- Ошибки Tavily приводятся к типизированным ошибкам агента (`CONFIG`, `ACCESS_DENIED`, `LIMIT_EXCEEDED`, `TIMEOUT`, `NETWORK`).
+
+### Безопасность и лимиты
+
+| Параметр | По умолчанию | Описание |
 | :--- | :--- | :--- |
-| `MAX_TOOL_OUTPUT` | `4000` | Лимит символов для вывода большинства инструментов (stdout, чтение файлов и т.д.) |
-| `MAX_SEARCH_CHARS` | `15000` | Лимит символов для результатов поиска и контента веб-страниц (`fetch_content`) |
-| `MAX_FILE_SIZE` | `300MB` | Максимальный размер файла для операций чтения/записи |
-| `MAX_READ_LINES` | `2000` | Максимальное количество строк при чтении файла |
-| `MAX_BACKGROUND_PROCESSES`| `5` | Лимит фоновых процессов |
+| `MAX_TOOL_OUTPUT` | `4000` | Лимит вывода инструментов |
+| `MAX_SEARCH_CHARS` | `15000` | Лимит контента search/fetch |
+| `MAX_FILE_SIZE` | `300MB` | Максимальный размер файла |
+| `MAX_READ_LINES` | `2000` | Максимум строк при чтении |
+| `MAX_BACKGROUND_PROCESSES` | `5` | Лимит фоновых процессов |
 
-### 🧠 Память и Оптимизация
+### Память и retry
 
-| Параметр | По умолч. | Описание |
+| Параметр | По умолчанию | Описание |
 | :--- | :--- | :--- |
-| `SESSION_SIZE` | `8000` | Порог (в токенах), после которого запускается суммаризация контекста |
-| `SUMMARY_KEEP_LAST` | `4` | Сколько последних сообщений оставлять "сырыми" после сжатия истории |
-| `MAX_RETRIES` | `3` | Количество попыток повтора для сетевых запросов |
-| `RETRY_DELAY` | `2` | Задержка (сек) между попытками |
+| `SESSION_SIZE` | `8000` | Порог суммаризации контекста |
+| `SUMMARY_KEEP_LAST` | `4` | Сколько последних сообщений не сжимать |
+| `MAX_RETRIES` | `3` | Повторы сетевых запросов |
+| `RETRY_DELAY` | `2` | Задержка между повторами |
 
 ---
 
-## 📂 Структура проекта
-
-Детальное описание архитектуры файлов:
+## Структура проекта
 
 ```text
 .
-├── core/                       # ЯДРО АГЕНТА
-│   ├── config.py               # Загрузка и валидация конфигурации (Pydantic)
-│   ├── nodes.py                # Реализация узлов графа (Agent, Summarize)
-│   ├── state.py                # Определение TypedDict для состояния (AgentState)
-│   ├── stream_processor.py     # Обработчик потокового вывода LLM -> UI
-│   ├── cli_utils.py            # Утилиты форматирования, Smart UI, биндинги клавиш
-│   ├── ui_theme.py             # Тема оформления Rich (цвета, стили)
-│   ├── fuzzy_completer.py      # Логика нечеткого автодополнения путей
-│   ├── logging_config.py       # Настройка логгеров
-│   ├── constants.py            # Глобальные константы и шаблоны промптов
-│   └── session_utils.py        # Управление сессиями и восстановление
-│
-├── tools/                      # ИНСТРУМЕНТЫ
-│   ├── filesystem.py           # Операции с файлами (Safe Read/Write/Edit, Find, Search)
-│   ├── delete_tools.py         # Безопасное удаление (Safe Delete File/Dir)
-│   ├── search_tools.py         # Поиск (Tavily), Fetch Content, Batch Search, Кэширование
-│   ├── system_tools.py         # Диагностика ОС, сеть (IP, Network Info)
-│   ├── process_tools.py        # Управление процессами (Start, Stop, Find by Port)
-│   ├── local_shell.py          # Выполнение команд (Subprocess)
-│   └── tool_registry.py        # Реестр и динамическая загрузка инструментов
-│
-├── agent.py                    # Сборка графа (LangGraph) и привязка инструментов
-├── agent_cli.py                # ТОЧКА ВХОДА (Main Entry Point)
-├── mcp.json                    # Конфигурация MCP серверов (внешние инструменты)
-├── requirements.txt            # Зависимости Python
-├── .env                        # Секреты и настройки (не комитить!)
-├── env_example.txt             # Шаблон конфигурации
-└── prompt.txt                  # Системный промпт (инструкции для LLM)
+├── core/
+│   ├── config.py
+│   ├── nodes.py
+│   ├── state.py
+│   ├── stream_processor.py
+│   ├── cli_utils.py
+│   ├── ui_theme.py
+│   ├── fuzzy_completer.py
+│   ├── logging_config.py
+│   ├── constants.py
+│   └── session_utils.py
+├── tools/
+│   ├── filesystem.py
+│   ├── delete_tools.py
+│   ├── search_tools.py
+│   ├── system_tools.py
+│   ├── process_tools.py
+│   ├── local_shell.py
+│   └── tool_registry.py
+├── agent.py
+├── agent_cli.py
+├── mcp.json
+├── requirements.txt
+├── .env
+├── env_example.txt
+└── prompt.txt
 ```
 
 ---
 
-## 🚀 Установка и Запуск
+## Архитектурные детали
+
+1. `AgentConfig` загружает и валидирует `.env`.
+2. `ToolRegistry` подключает локальные и MCP-инструменты.
+3. `build_agent_app()` собирает граф с узлами `summarize`, `update_step`, `agent`, `tools`.
+4. Завершение происходит при:
+   - достижении `MAX_LOOPS`;
+   - отсутствии tool-вызовов от модели;
+   - chat-only режиме (`MODEL_SUPPORTS_TOOLS=false`).
+
+---
+
+## Установка и запуск
 
 ### 1. Подготовка окружения
-Требуется **Python 3.10+**. Для работы некоторых MCP-серверов (например, `npx`) может потребоваться установленный **Node.js (npm)**.
-Рекомендуется использовать виртуальное окружение Python.
+Нужен **Python 3.10+**. Для MCP-серверов типа `npx` может потребоваться **Node.js**.
 
 ```bash
-# Создание venv
 python -m venv venv
-
-# Активация (Windows):
-venv\Scripts\activate
-
-# Активация (Linux/Mac):
-source venv/bin/activate
 ```
 
+Активация:
+- Windows: `venv\Scripts\activate`
+- Linux/macOS: `source venv/bin/activate`
+
 ### 2. Установка зависимостей
+
 ```bash
 pip install -r requirements.txt
 ```
 
 ### 3. Настройка
-1.  Скопируйте пример конфига: `cp env_example.txt .env`
-2.  Откройте `.env` и укажите необходимые ключи:
-    *   `OPENAI_API_KEY` или `GEMINI_API_KEY` (в зависимости от провайдера)
-    *   `TAVILY_API_KEY` (для поиска в интернете)
-3.  Опционально настройте `mcp.json` для подключения дополнительных внешних серверов.
+
+1. Скопируйте шаблон:
+   - Windows (PowerShell): `Copy-Item env_example.txt .env`
+   - Linux/macOS: `cp env_example.txt .env`
+2. Заполните ключи в `.env` (`OPENAI_API_KEY`/`GEMINI_API_KEY`, при необходимости `TAVILY_API_KEY`).
+3. При необходимости включите MCP-серверы в `mcp.json` через `"enabled": true`.
 
 ### 4. Запуск
+
 ```bash
 python agent_cli.py
 ```
 
 ---
 
-## 🎮 Управление в CLI
+## Ограничения и безопасность
 
-*   `/help` — Показать справку по командам.
-*   `/tools` — Показать таблицу доступных инструментов.
-*   `/clear` — Очистить историю контекста (начать диалог заново).
-*   `/quit` или `exit` — Выход из агента.
-*   `Alt+Enter` — Перенос строки (многострочный ввод).
+- `MAX_LOOPS` ограничивает только шаги графа.
+- Per-tool loop guard работает отдельно и может остановить повторяющиеся вызовы раньше; по умолчанию его пороги вычисляются от `MAX_LOOPS`, либо задаются через `TOOL_LOOP_LIMIT_MUTATING`, `TOOL_LOOP_LIMIT_READONLY`, `TOOL_LOOP_WINDOW`.
+- `cli_exec` потенциально опасен, по умолчанию выключен.
+- `edit_file` содержит защитные проверки и дополнительную JSON-валидацию для `.json`.
+
+---
+
+## Команды в CLI
+
+- `/help` — справка
+- `/tools` — список доступных инструментов
+- `clear` / `reset` — очистка сессии
+- `exit` / `quit` — выход
+- `Alt+Enter` — перенос строки в вводе
+
+

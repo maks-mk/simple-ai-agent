@@ -52,9 +52,6 @@ class StreamProcessor:
                       transient=True) as live:
                 
                 async for mode, payload in stream:
-                    # Быстрый yield без искусственной задержки в 10мс!
-                    await asyncio.sleep(0)
-
                     if mode == "updates":
                         self._handle_updates(payload)
                     elif mode == "messages":
@@ -122,7 +119,7 @@ class StreamProcessor:
             new_text = self.clean_full[self.printed_len:limit]
             
             # Use standard rich Markdown renderer
-            formatted_content = Markdown(new_text, code_theme="dracula")
+            formatted_content = Markdown(new_text, code_theme="dracula", hyperlinks=False)
             
             # self.console.print безопасно прерывает Live, печатает и возвращает Live обратно
             self.console.print(Padding(formatted_content, (0, 0, 0, 2)))
@@ -229,7 +226,7 @@ class StreamProcessor:
                  if self.clean_full.count("```") % 2 != 0:
                      render_text += "\n```"
                  # Добавляем только Markdown, без спиннера сверху!
-                 grid.add_row(Padding(Markdown(clean_markdown_text(render_text), code_theme="ansi_dark"), (0, 0, 0, 2)))
+                 grid.add_row(Padding(Markdown(clean_markdown_text(render_text), code_theme="ansi_dark", hyperlinks=False), (0, 0, 0, 2)))
             else:
                  # Спиннер рисуется только пока текста нет
                  spinner = Spinner("dots", text=self.status_text, style="status.spinner")
@@ -238,3 +235,4 @@ class StreamProcessor:
             live.update(grid)
         except Exception:
             pass
+

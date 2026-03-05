@@ -1,4 +1,3 @@
-import os
 import re
 import psutil
 from pathlib import Path

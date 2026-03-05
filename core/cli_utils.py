@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any
 from langchain_core.messages import AIMessage, AIMessageChunk
 from prompt_toolkit.key_binding import KeyBindings
 

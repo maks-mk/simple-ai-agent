@@ -11,6 +11,7 @@ Features:
 
 import os
 import re
+import json
 import difflib
 import aiofiles
 import itertools
@@ -21,7 +22,6 @@ import logging
 import httpx
 
 from langchain_core.tools import tool
-from tools.system_tools import get_net_client
 from core.safety_policy import SafetyPolicy
 from core.errors import format_error, ErrorType
 from core.utils import truncate_output
@@ -190,8 +190,10 @@ class FilesystemManager:
 
     def edit_file(self, path: str, old_string: str, new_string: str) -> str:
         """
-        Smart text replacement: attempts exact match first, 
-        then falls back to fuzzy line-by-line match (ignoring ALL whitespace).
+        Smart text replacement with safety rails:
+        1) exact match,
+        2) indentation-insensitive match (strip line edges),
+        3) aggressive whitespace-insensitive match only for snippets >= 3 lines.
         """
         try:
             target = self._resolve_path(path)
@@ -227,36 +229,51 @@ class FilesystemManager:
                 if not search_lines:
                     return format_error(ErrorType.VALIDATION, "old_string is empty or only contains whitespaces.")
                 
-                # Функция для удаления ВСЕХ пробелов и табов для сравнения
-                def normalize_line(s: str) -> str:
-                    return "".join(s.split())
-                    
-                search_lines_normalized =[normalize_line(l) for l in search_lines]
-                file_lines_normalized =[normalize_line(l) for l in file_lines]
-                
-                matches =[]
                 search_len = len(search_lines)
-                
-                for i in range(len(file_lines) - search_len + 1):
-                    if file_lines_normalized[i : i + search_len] == search_lines_normalized:
-                        matches.append(i)
-                        
+
+                def find_matches(normalize_line):
+                    search_norm = [normalize_line(l) for l in search_lines]
+                    file_norm = [normalize_line(l) for l in file_lines]
+                    result = []
+                    for i in range(len(file_lines) - search_len + 1):
+                        if file_norm[i: i + search_len] == search_norm:
+                            result.append(i)
+                    return result
+
+                match_mode = "trim"
+                matches = find_matches(lambda s: s.strip())
+
+                # Aggressive mode is intentionally disabled for tiny snippets:
+                # 1-2 line edits are too collision-prone in structured files.
+                if not matches and search_len >= 3:
+                    match_mode = "aggressive"
+                    matches = find_matches(lambda s: "".join(s.split()))
+                elif not matches and search_len < 3:
+                    snippet = old_string_norm[:80].replace('\n', '\\n')
+                    return format_error(
+                        ErrorType.VALIDATION,
+                        f"Could not find an exact/indentation-safe match for short old_string snippet '{snippet}...'. "
+                        "For 1-2 line replacements, provide exact text or include more surrounding lines."
+                    )
+
                 if len(matches) == 0:
                     snippet = old_string_norm[:50].replace('\n', '\\n')
                     return format_error(
                         ErrorType.VALIDATION, 
-                        f"Could not find a match for 'old_string' (even when ignoring ALL spaces/indentation).\n"
+                        f"Could not find a match for 'old_string'.\n"
                         f"Snippet: '{snippet}...'.\n"
                         "Make sure you are replacing existing lines and DID NOT include line numbers in old_string."
                     )
                 elif len(matches) > 1:
                     return format_error(
                         ErrorType.VALIDATION, 
-                        f"Found {len(matches)} occurrences of the text (ignoring spaces). "
+                        f"Found {len(matches)} occurrences of the target block. "
                         "Please include more surrounding lines to uniquely identify the block."
                     )
                 else:
                     match_idx = matches[0]
+                    if match_mode == "aggressive":
+                        logger.warning("edit_file: aggressive whitespace-insensitive match used for '%s'.", path)
                     new_string_lines = new_string_norm.split('\n')
                     new_file_lines = (
                         file_lines[:match_idx] + 
@@ -266,6 +283,16 @@ class FilesystemManager:
                     new_content = '\n'.join(new_file_lines)
             
             final_content = new_content.replace('\n', original_newline)
+
+            # Structured-file safety: reject edits that break JSON syntax.
+            if target.suffix.lower() == ".json":
+                try:
+                    json.loads(final_content)
+                except json.JSONDecodeError as e:
+                    return format_error(
+                        ErrorType.VALIDATION,
+                        f"Edit would produce invalid JSON in '{path}' (line {e.lineno}, column {e.colno}): {e.msg}"
+                    )
             
             with open(target, 'w', encoding='utf-8', newline='') as f:
                 f.write(final_content)
@@ -722,7 +749,10 @@ async def download_file(url: str, filename: Optional[str] = None) -> str:
         except ValueError as e:
             return format_error(ErrorType.VALIDATION, str(e))
              
-        client = get_net_client() 
+        # Lazy import avoids loading system/network stack at agent startup.
+        from tools.system_tools import get_net_client
+
+        client = get_net_client()
         logger.info(f"⬇️ Downloading {url} to {destination}")
         
         try:
@@ -751,7 +781,7 @@ async def download_file(url: str, filename: Optional[str] = None) -> str:
         return format_error(ErrorType.EXECUTION, f"Error downloading file: {e}")
         
 @tool("find_file")
-def find_file_tool(path: str, name_pattern: str, max_results: int = 200, max_depth: Optional[int] = None) -> str:
+def find_file_tool(name_pattern: str, path: str = ".", max_results: int = 200, max_depth: Optional[int] = None) -> str:
     """Finds files by their name pattern in a directory (recursive).
     Supports glob patterns like '*.py', 'mcp.json', 'test_*.py'.
     Does NOT search inside files, only checks file names.

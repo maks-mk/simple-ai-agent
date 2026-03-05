@@ -14,6 +14,41 @@ DEFAULT_TIMEOUT = 120
 _SAFETY_POLICY: Optional[SafetyPolicy] = None
 _WORKING_DIRECTORY: str = os.getcwd()  # По умолчанию текущая папка процесса
 
+_WINDOWS_COMMAND_HINTS = {
+    "cat": "type <file> (или Get-Content <file>)",
+    "ls": "dir (или Get-ChildItem)",
+    "pwd": "cd (или Get-Location)",
+    "cp": "copy (или Copy-Item)",
+    "mv": "move (или Move-Item)",
+    "rm": "del (или Remove-Item)",
+    "grep": "findstr <pattern> <file> (или Select-String ...)",
+    "head": "Get-Content <file> -TotalCount N",
+    "tail": "Get-Content <file> -Tail N",
+    "which": "where <command> (или Get-Command <name>)",
+    "clear": "cls (или Clear-Host)",
+}
+
+
+def _get_windows_command_hint(command: str, stderr: str) -> str:
+    """Return a friendly Windows-specific hint for common Unix commands."""
+    if os.name != "nt":
+        return ""
+
+    lower_stderr = stderr.lower()
+    if "is not recognized as an internal or external command" not in lower_stderr:
+        return ""
+
+    parts = command.strip().split()
+    if not parts:
+        return ""
+
+    first_token = parts[0].strip("\"'").lower()
+    suggestion = _WINDOWS_COMMAND_HINTS.get(first_token)
+    if not suggestion:
+        return ""
+    return f"\nHint (Windows): команда '{first_token}' не найдена. Попробуйте: {suggestion}."
+
+
 def set_safety_policy(policy: SafetyPolicy):
     """Sets the global safety policy for shell execution."""
     global _SAFETY_POLICY
@@ -90,10 +125,13 @@ async def cli_exec(command: str) -> str:
         
         if process.returncode != 0:
             error_msg = f"Command failed with Exit Code {process.returncode}."
+            cmd_hint = _get_windows_command_hint(command, stderr)
             if output:
                 error_msg += f"\nOutput:\n{output}"
             else:
                 error_msg += " (No output)"
+            if cmd_hint:
+                error_msg += cmd_hint
             return format_error(ErrorType.EXECUTION, error_msg)
 
         if not output:

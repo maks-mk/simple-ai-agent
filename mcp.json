@@ -37,6 +37,6 @@
       "./pdf_mcp/pdf_server.py"
     ],
     "transport": "stdio",
-    "enabled": false
+    "enabled": true
   }
 }

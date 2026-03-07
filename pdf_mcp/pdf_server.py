@@ -13,8 +13,11 @@ import os
 import re
 import tempfile
 import zipfile
+import sys
+from functools import lru_cache
+from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import markdown as md_lib
@@ -56,6 +59,31 @@ CHAR_REPLACEMENTS = str.maketrans({
     "│": "|", "─": "-", "┌": "",  "┐": "",  "└": "",  "┘": "",
     "«": '"', "»": '"', "…": "...", "№": "N",
 })
+
+TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
+HORIZONTAL_RULE_RE = re.compile(r"^(-{3,}|\*{3,})$")
+MARKDOWN_IMAGE_RE = re.compile(r"!\[(.*?)\]\((.*?)\)$")
+MARKDOWN_TAG_REPLACEMENTS = (
+    ("<strong>", "<b>"), ("</strong>", "</b>"),
+    ("<em>", "<i>"), ("</em>", "</i>"),
+    ("<p>", ""), ("</p>", ""),
+    ("<code>", '<font name="Courier" backColor="#f0f0f0">'),
+    ("</code>", "</font>"),
+)
+
+HEADING_RULES: Tuple[Tuple[str, str, int], ...] = (
+    ("#### ", "h4", 5),
+    ("### ", "h3", 4),
+    ("## ", "h2", 3),
+    ("# ", "title", 2),
+)
+
+DEFAULT_DOC_MARGIN = 50
+DEFAULT_IMAGE_MAX_WIDTH = 6 * inch
+DEFAULT_FONT_NAME = "Roboto-Regular"
+DEFAULT_EDIT_SUFFIX = "_edited.pdf"
+DEFAULT_ROTATE_SUFFIX = "_rot.pdf"
+LINE_GROUP_TOLERANCE = 5.0
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -185,13 +213,18 @@ class PDFGenerator:
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        """Strips characters unsupported by standard PDF encoding if fonts fail."""
+        """Normalizes text for reliable PDF rendering."""
         if not text:
             return ""
         text = text.translate(CHAR_REPLACEMENTS)
-        return "".join(c if ord(c) <= 0xFFFF else " " for c in text)
+        if text.isascii():
+            return text
+        if any(ord(c) > 0xFFFF for c in text):
+            return "".join(c if ord(c) <= 0xFFFF else " " for c in text)
+        return text
 
     @staticmethod
+    @lru_cache(maxsize=4096)
     def _markdown_to_reportlab(text: str) -> str:
         """Parses inline Markdown and converts to ReportLab XML tags."""
         if not text:
@@ -199,15 +232,7 @@ class PDFGenerator:
 
         # markdown() handles escaping — do NOT unescape &amp; afterwards
         html = md_lib.markdown(text)
-
-        replacements = [
-            ("<strong>", "<b>"), ("</strong>", "</b>"),
-            ("<em>",     "<i>"), ("</em>",     "</i>"),
-            ("<p>", ""),         ("</p>", ""),
-            ("<code>", '<font name="Courier" backColor="#f0f0f0">'),
-            ("</code>", "</font>"),
-        ]
-        for old, new in replacements:
+        for old, new in MARKDOWN_TAG_REPLACEMENTS:
             html = html.replace(old, new)
 
         return html.strip()
@@ -216,19 +241,57 @@ class PDFGenerator:
         """Helper to clean and convert text for inline display."""
         return self._markdown_to_reportlab(self._clean_text(text))
 
+    def _normalize_for_compare(self, text: str) -> str:
+        return " ".join(self._clean_text(text).split()).lower()
+
+    @staticmethod
+    def _is_title_duplicate(title_norm: str, heading_norm: str) -> bool:
+        return (
+            heading_norm == title_norm
+            or title_norm.startswith(heading_norm + " ")
+            or title_norm.endswith(" " + heading_norm)
+        )
+
+    @staticmethod
+    def _render_code_block(lines: List[str]) -> str:
+        return "<br/>".join(
+            html_escape(line, quote=False).replace(" ", "&nbsp;")
+            for line in lines
+        )
+
+    def _append_image_block(self, story: List[Flowable], alt: str, image_path: Path) -> None:
+        styles = self.styles
+        if not image_path.exists():
+            story.append(Paragraph(f"[Image not found: {image_path.name}]", styles["body"]))
+            return
+
+        try:
+            img = RLImage(str(image_path))
+            if img.drawWidth > DEFAULT_IMAGE_MAX_WIDTH:
+                ratio = DEFAULT_IMAGE_MAX_WIDTH / img.drawWidth
+                img.drawHeight *= ratio
+                img.drawWidth = DEFAULT_IMAGE_MAX_WIDTH
+            story.append(img)
+            story.append(Paragraph(f"<i>{alt}</i>", styles["center"]))
+            story.append(Spacer(1, 10))
+        except Exception:
+            story.append(Paragraph(f"[Error loading image: {image_path.name}]", styles["body"]))
+
     def _create_table(self, buf: List[str]) -> Optional[Table]:
         """Creates a ReportLab Table from a buffer of markdown table rows."""
         if not buf:
             return None
-        
+
         rows = []
+        body_style = self.styles["body"]
+        inline = self._inline
         for row_str in buf:
             cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
             # Skip separator lines like |---|---|
-            if all(re.match(r"^:?-+:?$", c) for c in cells if c):
+            if cells and all(TABLE_SEPARATOR_CELL_RE.match(c) for c in cells if c):
                 continue
-            rows.append([Paragraph(self._inline(c), self.styles["body"]) for c in cells])
-        
+            rows.append([Paragraph(inline(c), body_style) for c in cells])
+
         if not rows:
             return None
 
@@ -250,42 +313,32 @@ class PDFGenerator:
         """Generates a PDF file from markdown content."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        story = [Paragraph(self._inline(title), self.styles["title"]), Spacer(1, 10)]
-        
+        styles = self.styles
+        inline = self._inline
+        story: List[Flowable] = [Paragraph(inline(title), styles["title"]), Spacer(1, 10)]
+
         in_code = False
-        code_lines = []
-        table_buf = []
+        code_lines: List[str] = []
+        table_buf: List[str] = []
 
-        def flush_table_buffer():
-            if table_buf:
-                table = self._create_table(table_buf)
-                if table:
-                    story.append(table)
-                    story.append(Spacer(1, 10))
-                table_buf.clear()
+        def flush_table_buffer() -> None:
+            if not table_buf:
+                return
+            table = self._create_table(table_buf)
+            if table:
+                story.append(table)
+                story.append(Spacer(1, 10))
+            table_buf.clear()
 
-        heading_map = {
-            "#### ": ("h4", 5),
-            "### ":  ("h3", 4),
-            "## ":   ("h2", 3),
-            "# ":    ("title", 2),
-        }
-
-        # Normalize title for deduplication
-        title_norm = " ".join(self._clean_text(title).split()).lower()
+        title_norm = self._normalize_for_compare(title)
         title_deduped = False
 
         for line in content.splitlines():
             stripped = line.strip()
 
-            # Handle Code Blocks
             if stripped.startswith("```"):
                 if in_code:
-                    code_text = "<br/>".join(
-                        ln.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                        for ln in code_lines
-                    ).replace(" ", "&nbsp;")
-                    story.append(Paragraph(code_text, self.styles["code"]))
+                    story.append(Paragraph(self._render_code_block(code_lines), styles["code"]))
                     code_lines.clear()
                     in_code = False
                 else:
@@ -297,7 +350,6 @@ class PDFGenerator:
                 code_lines.append(line)
                 continue
 
-            # Handle Tables
             if stripped.startswith("|"):
                 table_buf.append(stripped)
                 continue
@@ -306,82 +358,56 @@ class PDFGenerator:
             if not stripped:
                 continue
 
-            # Handle Horizontal Rules
-            if re.match(r"^(-{3,}|\*{3,})$", stripped):
+            if HORIZONTAL_RULE_RE.match(stripped):
                 story.append(SeparatorLine())
                 continue
 
-            # Handle Images
-            img_match = re.match(r"!\[(.*?)\]\((.*?)\)", stripped)
+            img_match = MARKDOWN_IMAGE_RE.match(stripped)
             if img_match:
-                alt, img_path_str = img_match.groups()
-                img_path = Path(img_path_str).resolve()
-                if img_path.exists():
-                    try:
-                        img = RLImage(str(img_path))
-                        max_w = 6 * inch
-                        if img.drawWidth > max_w:
-                            ratio = max_w / img.drawWidth
-                            img.drawHeight *= ratio
-                            img.drawWidth = max_w
-                        story += [img, Paragraph(f"<i>{alt}</i>", self.styles["center"]), Spacer(1, 10)]
-                    except Exception:
-                        story.append(Paragraph(f"[Error loading image: {img_path.name}]", self.styles["body"]))
-                else:
-                    story.append(Paragraph(f"[Image not found: {img_path.name}]", self.styles["body"]))
+                alt, image_path_str = img_match.groups()
+                self._append_image_block(story, alt, Path(image_path_str).resolve())
                 continue
 
-            clean_line = self._clean_text(stripped)
-
-            # Handle Headings
             matched_heading = False
-            for prefix, (style_key, skip) in heading_map.items():
-                if stripped.startswith(prefix):
-                    heading_text = stripped[skip:].strip()
-                    heading_norm = " ".join(self._clean_text(heading_text).split()).lower()
-                    
-                    # Deduplicate title if it appears as a heading
-                    is_title_dup = (
-                        heading_norm == title_norm
-                        or title_norm.startswith(heading_norm + " ")
-                        or title_norm.endswith(" " + heading_norm)
-                    )
-                    if prefix == "# " and not title_deduped and is_title_dup:
-                        title_deduped = True
-                        matched_heading = True
-                        break
-                    
-                    story.append(Paragraph(self._inline(heading_text), self.styles[style_key]))
+            for prefix, style_key, skip in HEADING_RULES:
+                if not stripped.startswith(prefix):
+                    continue
+
+                heading_text = stripped[skip:].strip()
+                heading_norm = self._normalize_for_compare(heading_text)
+                if prefix == "# " and not title_deduped and self._is_title_duplicate(title_norm, heading_norm):
+                    title_deduped = True
                     matched_heading = True
                     break
-            
+
+                story.append(Paragraph(inline(heading_text), styles[style_key]))
+                matched_heading = True
+                break
+
             if matched_heading:
                 continue
 
-            # Handle Quotes
             if stripped.startswith("> "):
-                story.append(Paragraph(self._inline(clean_line[2:]), self.styles["quote"]))
+                story.append(Paragraph(inline(stripped[2:]), styles["quote"]))
                 continue
 
-            # Handle Bullets
             if stripped.startswith(("- ", "* ")):
-                story.append(Paragraph(f"• {self._inline(clean_line[2:])}", self.styles["bullet"]))
+                story.append(Paragraph(f"• {inline(stripped[2:])}", styles["bullet"]))
                 continue
 
-            # Default Paragraph
-            story.append(Paragraph(self._inline(clean_line), self.styles["body"]))
+            story.append(Paragraph(inline(stripped), styles["body"]))
 
         flush_table_buffer()
-        
+
         SimpleDocTemplate(
-            str(output_path), 
-            pagesize=A4, 
-            rightMargin=50, 
-            leftMargin=50, 
-            topMargin=50, 
-            bottomMargin=50
+            str(output_path),
+            pagesize=A4,
+            rightMargin=DEFAULT_DOC_MARGIN,
+            leftMargin=DEFAULT_DOC_MARGIN,
+            topMargin=DEFAULT_DOC_MARGIN,
+            bottomMargin=DEFAULT_DOC_MARGIN,
         ).build(story)
-        
+
         return f"PDF created: {output_path} (Font: {self.fonts['regular']})"
 
 # ---------------------------------------------------------------------------
@@ -411,6 +437,61 @@ class PDFProcessor:
         if path.stat().st_size > MAX_PDF_SIZE_BYTES:
             raise PDFProcessingError(f"PDF too large (max {MAX_PDF_SIZE_BYTES/1024/1024:.0f} MB)")
         return path
+
+    @staticmethod
+    def _default_output_path(path: Path, suffix: str) -> str:
+        return str(path.parent / f"{path.stem}{suffix}")
+
+    @staticmethod
+    def _save_optimized(doc: fitz.Document, output_path: str) -> None:
+        doc.save(output_path, garbage=4, deflate=True)
+
+    @staticmethod
+    def _collect_search_hits(page: fitz.Page, query: str, case_sensitive: bool) -> List[fitz.Rect]:
+        if case_sensitive:
+            return page.search_for(query)
+
+        hits: List[fitz.Rect] = []
+        seen = set()
+        variants = tuple(dict.fromkeys((query, query.lower(), query.upper(), query.title())))
+        for variant in variants:
+            for rect in page.search_for(variant):
+                key = (round(rect.x0), round(rect.y0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                hits.append(rect)
+        hits.sort(key=lambda r: (r.y0, r.x0))
+        return hits
+
+    @staticmethod
+    def _group_hits_by_line(hits: List[fitz.Rect], tolerance: float = LINE_GROUP_TOLERANCE) -> List[List[fitz.Rect]]:
+        groups: List[List[fitz.Rect]] = []
+        for rect in sorted(hits, key=lambda r: (r.y0, r.x0)):
+            if groups and abs(rect.y0 - groups[-1][-1].y1) < tolerance:
+                groups[-1].append(rect)
+            else:
+                groups.append([rect])
+        return groups
+
+    @staticmethod
+    def _rect_union(rects: List[fitz.Rect]) -> fitz.Rect:
+        return fitz.Rect(
+            min(r.x0 for r in rects),
+            min(r.y0 for r in rects),
+            max(r.x1 for r in rects),
+            max(r.y1 for r in rects),
+        )
+
+    @staticmethod
+    def _split_range_token(token: str) -> Optional[Tuple[int, int]]:
+        try:
+            parts = token.split("-")
+            start = int(parts[0])
+            end = int(parts[-1]) if len(parts) > 1 else start
+            return start, end
+        except ValueError:
+            return None
 
     @staticmethod
     def extract_text(pdf_path: str, page_start: int = 1, page_end: Optional[int] = None, sort: bool = True) -> str:
@@ -449,72 +530,50 @@ class PDFProcessor:
     def search_text(pdf_path: str, query: str, case_sensitive: bool = False) -> str:
         """Searches for text in PDF and returns locations with context."""
         path = PDFProcessor.validate_file(pdf_path)
-        results = []
+        if not query:
+            return "Not found"
 
+        results: List[str] = []
         with fitz.open(path) as doc:
             for page_idx, page in enumerate(doc):
-                hits = []
-                if case_sensitive:
-                    hits = page.search_for(query)
-                else:
-                    # Optimization: Instead of multiple searches, use quad search if supported or regex?
-                    # MuPDF search_for is fast. The bottleneck is context extraction.
-                    seen = set()
-                    # We search for variations. This is O(K * Search), K=4. Acceptable.
-                    for variant in (query, query.lower(), query.upper(), query.title()):
-                        for r in page.search_for(variant):
-                            key = (round(r.x0), round(r.y0))
-                            if key not in seen:
-                                seen.add(key)
-                                hits.append(r)
-                    hits.sort(key=lambda r: (r.y0, r.x0))
-
+                page_num = page_idx + 1
+                hits = PDFProcessor._collect_search_hits(page, query, case_sensitive)
                 if not hits:
                     continue
 
-                # Optimization: Avoid extracting full page text if possible.
-                # However, accurate context requires text flow.
-                # If we have many hits, extracting full text once is better than N small extractions.
-                # If we have 1 hit, extracting small text is better.
-                # Heuristic: If hits < 5, use clipped extraction. Else full page.
-                
+                # Heuristic: clipped extraction is cheaper for a few hits, full page for many.
                 if len(hits) < 5:
                     for occ_idx, rect in enumerate(hits, start=1):
-                        # Define context window (e.g. +/- 100pt width, +/- 20pt height)
-                        # This is approximate.
                         clip_rect = fitz.Rect(rect.x0 - 50, rect.y0 - 20, rect.x1 + 50, rect.y1 + 20)
-                        # Intersect with page rect
                         clip_rect &= page.rect
                         context = page.get_text("text", clip=clip_rect).replace("\n", " ").strip()
-                        # Highlight the query in context? Simple string replace might fail if spacing differs.
-                        # We just return the area text.
                         results.append(
-                            f"Page {page_idx + 1} occurrence #{occ_idx}: "
+                            f"Page {page_num} occurrence #{occ_idx}: "
                             f"rect=({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f}) "
                             f'| context: "...{context}..."'
                         )
-                else:
-                    # Fallback to full page extraction for many hits (amortized cost lower)
-                    page_text = page.get_text()
-                    lower_page = page_text.lower()
-                    lower_q = query.lower()
-                    search_off = 0
+                    continue
 
-                    for occ_idx, rect in enumerate(hits, start=1):
-                        pos = lower_page.find(lower_q, search_off)
-                        ctx_str = ""
-                        if pos != -1:
-                            ctx_s = max(0, pos - 30)
-                            ctx_e = min(len(page_text), pos + len(query) + 30)
-                            context = page_text[ctx_s:ctx_e].replace("\n", " ").strip()
-                            ctx_str = f' | context: "...{context}..."'
-                            search_off = pos + 1
+                page_text = page.get_text()
+                lower_page = page_text.lower()
+                lower_q = query.lower()
+                search_off = 0
 
-                        results.append(
-                            f"Page {page_idx + 1} occurrence #{occ_idx}: "
-                            f"rect=({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f})"
-                            f"{ctx_str}"
-                        )
+                for occ_idx, rect in enumerate(hits, start=1):
+                    pos = lower_page.find(lower_q, search_off)
+                    ctx_str = ""
+                    if pos != -1:
+                        ctx_s = max(0, pos - 30)
+                        ctx_e = min(len(page_text), pos + len(query) + 30)
+                        context = page_text[ctx_s:ctx_e].replace("\n", " ").strip()
+                        ctx_str = f' | context: "...{context}..."'
+                        search_off = pos + 1
+
+                    results.append(
+                        f"Page {page_num} occurrence #{occ_idx}: "
+                        f"rect=({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f})"
+                        f"{ctx_str}"
+                    )
 
         if not results:
             return "Not found"
@@ -546,9 +605,47 @@ class PDFProcessor:
         except Exception:
             return defaults
 
+    @staticmethod
+    def _insert_textbox_with_font_fallback(
+        page: fitz.Page,
+        rect: fitz.Rect,
+        text: str,
+        fontsize: float,
+        color: tuple[float, float, float],
+        font_path: str,
+    ) -> float:
+        """Inserts text with a lightweight fallback when the font isn't already present."""
+        try:
+            return page.insert_textbox(
+                rect,
+                text,
+                fontsize=fontsize,
+                fontname=DEFAULT_FONT_NAME,
+                fontfile=None,
+                color=color,
+                align=0,
+            )
+        except Exception:
+            return page.insert_textbox(
+                rect,
+                text,
+                fontsize=fontsize,
+                fontname=DEFAULT_FONT_NAME,
+                fontfile=font_path,
+                color=color,
+                align=0,
+            )
+
     @classmethod
-    def edit_text(cls, pdf_path: str, page_num: int, old_text: str, new_text: str, 
-                  output_path: Optional[str] = None, occurrence: int = 0) -> str:
+    def edit_text(
+        cls,
+        pdf_path: str,
+        page_num: int,
+        old_text: str,
+        new_text: str,
+        output_path: Optional[str] = None,
+        occurrence: int = 0,
+    ) -> str:
         """Replaces or deletes text on a page."""
         path = cls.validate_file(pdf_path)
         fonts = FontManager.ensure_fonts()
@@ -558,17 +655,9 @@ class PDFProcessor:
                 raise PDFProcessingError(f"Page {page_num} out of range (1-{len(doc)})")
 
             page = doc[page_num - 1]
-            hits = page.search_for(old_text)
-            if not hits:
+            groups = cls._group_hits_by_line(page.search_for(old_text))
+            if not groups:
                 return f"Text not found: {old_text!r}"
-
-            # Group hits that are on the same line
-            groups: List[List[fitz.Rect]] = []
-            for rect in sorted(hits, key=lambda r: (r.y0, r.x0)):
-                if groups and abs(rect.y0 - groups[-1][-1].y1) < 5:
-                    groups[-1].append(rect)
-                else:
-                    groups.append([rect])
 
             total = len(groups)
             if occurrence == 0:
@@ -578,62 +667,34 @@ class PDFProcessor:
             else:
                 return f"Occurrence {occurrence} not found. Total: {total}"
 
-            # Redact old text
-            for grp in target_groups:
-                for rect in grp:
+            for group in target_groups:
+                for rect in group:
                     page.add_redact_annot(rect, fill=(1, 1, 1))
             page.apply_redactions()
 
-            warnings = []
+            warnings: List[str] = []
             failed_inserts = 0
-            
-            # Insert new text if provided
+            replacement_lines = max(1, len(new_text.splitlines()))
+
             if new_text.strip():
-                for grp in target_groups:
-                    # Calculate bounding box of the original text group
-                    bbox = fitz.Rect(
-                        min(r.x0 for r in grp), min(r.y0 for r in grp),
-                        max(r.x1 for r in grp), max(r.y1 for r in grp),
-                    )
+                for group in target_groups:
+                    bbox = cls._rect_union(group)
                     style = cls._detect_text_style(page, bbox)
                     fontsize = style["size"]
-                    # Optimization: Cache line_height calc if multiple groups have same font size?
-                    # Trivial optimization, skipped for readability.
                     line_height = fontsize * 1.4
 
-                    n_lines = max(1, len(new_text.splitlines()))
-                    needed_h = n_lines * line_height + fontsize
+                    needed_h = replacement_lines * line_height + fontsize
                     orig_h = bbox.y1 - bbox.y0
-                    
-                    insert_bbox = fitz.Rect(
-                        bbox.x0, bbox.y0,
-                        bbox.x1, bbox.y0 + max(orig_h, needed_h),
+                    insert_bbox = fitz.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y0 + max(orig_h, needed_h))
+
+                    result = cls._insert_textbox_with_font_fallback(
+                        page,
+                        insert_bbox,
+                        new_text,
+                        fontsize,
+                        style["color"],
+                        fonts["path_regular"],
                     )
-
-                    # Try to use existing font if available to reduce size
-                    inserted = False
-                    try:
-                        result = page.insert_textbox(
-                            insert_bbox, new_text,
-                            fontsize=fontsize,
-                            fontname="Roboto-Regular",
-                            fontfile=None, # Attempt reuse
-                            color=style["color"],
-                            align=0,
-                        )
-                        inserted = True
-                    except Exception:
-                        pass # Fallback to embedding
-
-                    if not inserted:
-                        result = page.insert_textbox(
-                            insert_bbox, new_text,
-                            fontsize=fontsize,
-                            fontname="Roboto-Regular",
-                            fontfile=fonts["path_regular"],
-                            color=style["color"],
-                            align=0,
-                        )
 
                     if result < 0:
                         failed_inserts += 1
@@ -642,14 +703,11 @@ class PDFProcessor:
                             f"(overflow {abs(result):.1f} pt). Try shorter replacement text."
                         )
 
-            if failed_inserts > 0 and failed_inserts == len(target_groups):
-                return (
-                    "ERROR: text insertion failed — file NOT saved to avoid data loss.\n"
-                    + "\n".join(warnings)
-                )
+            if failed_inserts and failed_inserts == len(target_groups):
+                return "ERROR: text insertion failed — file NOT saved to avoid data loss.\n" + "\n".join(warnings)
 
-            out = output_path or str(path.parent / f"{path.stem}_edited.pdf")
-            doc.save(out, garbage=4, deflate=True)
+            out = output_path or cls._default_output_path(path, DEFAULT_EDIT_SUFFIX)
+            cls._save_optimized(doc, out)
 
         msg = f"Saved to {out} (replaced {len(target_groups)} occurrences)"
         if warnings:
@@ -657,9 +715,16 @@ class PDFProcessor:
         return msg
 
     @classmethod
-    def add_text(cls, pdf_path: str, page_num: int, text: str, x: float = 56.0, 
-                 y: Optional[float] = None, fontsize: float = 10.0, 
-                 output_path: Optional[str] = None) -> str:
+    def add_text(
+        cls,
+        pdf_path: str,
+        page_num: int,
+        text: str,
+        x: float = 56.0,
+        y: Optional[float] = None,
+        fontsize: float = 10.0,
+        output_path: Optional[str] = None,
+    ) -> str:
         """Adds new text to a page."""
         path = cls.validate_file(pdf_path)
         fonts = FontManager.ensure_fonts()
@@ -672,7 +737,6 @@ class PDFProcessor:
             page_height = page.rect.height
             page_width = page.rect.width
 
-            # Auto-detect y: find lowest text block on the page
             if y is None:
                 blocks = page.get_text("blocks", sort=True)
                 text_y1s = [b[3] for b in blocks if b[6] == 0 and str(b[4]).strip()]
@@ -682,37 +746,20 @@ class PDFProcessor:
             line_height = fontsize * 1.4
             n_lines = max(1, len(text.splitlines()))
             rect = fitz.Rect(x, y, right_margin, y + n_lines * line_height + fontsize)
-
             if rect.y1 > page_height - 20:
                 rect = fitz.Rect(rect.x0, rect.y0, rect.x1, page_height - 20)
 
-            # Try to use existing font if available to reduce size
-            inserted = False
-            try:
-                result = page.insert_textbox(
-                    rect, text,
-                    fontsize=fontsize,
-                    fontname="Roboto-Regular",
-                    fontfile=None, # Attempt reuse
-                    color=(0, 0, 0),
-                    align=0,
-                )
-                inserted = True
-            except Exception:
-                pass
+            result = cls._insert_textbox_with_font_fallback(
+                page,
+                rect,
+                text,
+                fontsize,
+                (0, 0, 0),
+                fonts["path_regular"],
+            )
 
-            if not inserted:
-                result = page.insert_textbox(
-                    rect, text,
-                    fontsize=fontsize,
-                    fontname="Roboto-Regular",
-                    fontfile=fonts["path_regular"],
-                    color=(0, 0, 0),
-                    align=0,
-                )
-
-            out = output_path or str(path.parent / f"{path.stem}_edited.pdf")
-            doc.save(out, garbage=4, deflate=True)
+            out = output_path or cls._default_output_path(path, DEFAULT_EDIT_SUFFIX)
+            cls._save_optimized(doc, out)
 
         msg = f"Saved to {out} (text added at y={y:.1f})"
         if result < 0:
@@ -722,15 +769,12 @@ class PDFProcessor:
     @staticmethod
     def merge_pdfs(pdf_paths: List[str], output_path: str) -> str:
         """Merges multiple PDF files."""
-        doc = fitz.open()
-        try:
-            for p in pdf_paths:
-                with fitz.open(PDFProcessor.validate_file(p)) as src:
+        with fitz.open() as doc:
+            for pdf in pdf_paths:
+                with fitz.open(PDFProcessor.validate_file(pdf)) as src:
                     doc.insert_pdf(src)
             doc.save(output_path)
-            return f"Merged {len(pdf_paths)} files to {output_path}"
-        finally:
-            doc.close()
+        return f"Merged {len(pdf_paths)} files to {output_path}"
 
     @staticmethod
     def split_pdf(pdf_path: str, ranges: List[str], output_dir: str) -> str:
@@ -738,26 +782,26 @@ class PDFProcessor:
         path = PDFProcessor.validate_file(pdf_path)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        files = []
-        
+        files: List[str] = []
+
         with fitz.open(path) as doc:
-            for i, r in enumerate(ranges):
-                try:
-                    parts = r.split("-")
-                    start = int(parts[0])
-                    end = int(parts[-1]) if len(parts) > 1 else start
-                    start, end = max(1, start), min(len(doc), end)
-                    if start > end: continue
-                    
-                    new_doc = fitz.open()
+            for idx, token in enumerate(ranges, start=1):
+                parsed = PDFProcessor._split_range_token(token)
+                if parsed is None:
+                    logger.warning(f"Invalid range: {token}")
+                    continue
+
+                start, end = parsed
+                start, end = max(1, start), min(len(doc), end)
+                if start > end:
+                    continue
+
+                fname = out_dir / f"split_{idx}_{start}-{end}.pdf"
+                with fitz.open() as new_doc:
                     new_doc.insert_pdf(doc, from_page=start - 1, to_page=end - 1)
-                    fname = out_dir / f"split_{i + 1}_{start}-{end}.pdf"
                     new_doc.save(fname)
-                    new_doc.close()
-                    files.append(str(fname))
-                except ValueError:
-                    logger.warning(f"Invalid range: {r}")
-        
+                files.append(str(fname))
+
         return f"Created {len(files)} files in {out_dir}"
 
     @staticmethod
@@ -765,12 +809,12 @@ class PDFProcessor:
         """Rotates pages by 90/180/270."""
         path = PDFProcessor.validate_file(pdf_path)
         with fitz.open(path) as doc:
-            indices = [p - 1 for p in (pages or range(1, len(doc) + 1))]
+            indices = [page_num - 1 for page_num in (pages or range(1, len(doc) + 1))]
             for idx in indices:
                 if 0 <= idx < len(doc):
                     doc[idx].set_rotation(rotation)
-            out = str(path.parent / f"{path.stem}_rot.pdf")
-            doc.save(out, garbage=4, deflate=True)
+            out = PDFProcessor._default_output_path(path, DEFAULT_ROTATE_SUFFIX)
+            PDFProcessor._save_optimized(doc, out)
         return f"Rotated pages saved to {out}"
 
     @staticmethod
@@ -798,11 +842,10 @@ class PDFProcessor:
         """Creates a PDF from a list of images."""
         if not image_paths:
             raise PDFProcessingError("No images provided")
-        
-        doc = fitz.open()
-        try:
-            for p in image_paths:
-                path = Path(p).resolve()
+
+        with fitz.open() as doc:
+            for image in image_paths:
+                path = Path(image).resolve()
                 if not path.exists():
                     continue
                 with fitz.open(path) as img:
@@ -810,10 +853,9 @@ class PDFProcessor:
                     pdf_bytes = img.convert_to_pdf()
                     with fitz.open("pdf", pdf_bytes) as img_pdf:
                         doc.new_page(width=rect.width, height=rect.height).show_pdf_page(rect, img_pdf, 0)
-            doc.save(output_path, garbage=4, deflate=True)
-            return f"PDF created from {len(image_paths)} images at {output_path}"
-        finally:
-            doc.close()
+            PDFProcessor._save_optimized(doc, output_path)
+
+        return f"PDF created from {len(image_paths)} images at {output_path}"
 
 # ---------------------------------------------------------------------------
 # MCP Server & Tool Definitions
@@ -821,31 +863,43 @@ class PDFProcessor:
 
 mcp = FastMCP("PDFMcp")
 
+
+def _run_tool(
+    fn: Callable[..., str],
+    error_prefix: str,
+    *args: Any,
+    log_error: bool = False,
+    **kwargs: Any,
+) -> str:
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        if log_error:
+            logger.error(f"{error_prefix}: {e}", exc_info=True)
+        raise PDFProcessingError(f"{error_prefix}: {e}")
+
+
 @mcp.tool()
 def pdf_extract_text(pdf_path: str, page_start: int = 1, page_end: Optional[int] = None, sort: bool = True) -> str:
     """[PDF ONLY] Extracts text from a .pdf file."""
-    try:
-        return PDFProcessor.extract_text(pdf_path, page_start, page_end, sort)
-    except Exception as e:
-        raise PDFProcessingError(f"Extraction failed: {e}")
+    return _run_tool(PDFProcessor.extract_text, "Extraction failed", pdf_path, page_start, page_end, sort)
+
 
 @mcp.tool()
 def pdf_create(output_path: str, title: str, content: str) -> str:
     """[PDF ONLY] Creates a new .pdf file from Markdown text."""
-    try:
+    def _create() -> str:
         generator = PDFGenerator()
         return generator.create_pdf(Path(output_path).resolve(), title, content)
-    except Exception as e:
-        logger.error(f"PDF create error: {e}", exc_info=True)
-        raise PDFProcessingError(f"Failed to create PDF: {e}")
+
+    return _run_tool(_create, "Failed to create PDF", log_error=True)
+
 
 @mcp.tool()
 def pdf_search(pdf_path: str, query: str, case_sensitive: bool = False) -> str:
     """[PDF ONLY] Searches for text. Returns page number, occurrence, rect, context."""
-    try:
-        return PDFProcessor.search_text(pdf_path, query, case_sensitive)
-    except Exception as e:
-        raise PDFProcessingError(f"Search failed: {e}")
+    return _run_tool(PDFProcessor.search_text, "Search failed", pdf_path, query, case_sensitive)
+
 
 @mcp.tool()
 def pdf_edit_text(
@@ -859,10 +913,17 @@ def pdf_edit_text(
     """
     [PDF ONLY] Replaces or deletes EXISTING text on a specific page.
     """
-    try:
-        return PDFProcessor.edit_text(pdf_path, page_num, old_text, new_text, output_path, occurrence)
-    except Exception as e:
-        raise PDFProcessingError(f"Edit failed: {e}")
+    return _run_tool(
+        PDFProcessor.edit_text,
+        "Edit failed",
+        pdf_path,
+        page_num,
+        old_text,
+        new_text,
+        output_path,
+        occurrence,
+    )
+
 
 @mcp.tool()
 def pdf_add_text(
@@ -875,52 +936,38 @@ def pdf_add_text(
     output_path: Optional[str] = None,
 ) -> str:
     """[PDF ONLY] Adds NEW text at a specific position on a page."""
-    try:
-        return PDFProcessor.add_text(pdf_path, page_num, text, x, y, fontsize, output_path)
-    except Exception as e:
-        raise PDFProcessingError(f"Add text failed: {e}")
+    return _run_tool(PDFProcessor.add_text, "Add text failed", pdf_path, page_num, text, x, y, fontsize, output_path)
+
 
 @mcp.tool()
 def pdf_merge(pdf_paths: List[str], output_path: str) -> str:
     """[PDF ONLY] Merges multiple .pdf files."""
-    try:
-        return PDFProcessor.merge_pdfs(pdf_paths, output_path)
-    except Exception as e:
-        raise PDFProcessingError(f"Merge failed: {e}")
+    return _run_tool(PDFProcessor.merge_pdfs, "Merge failed", pdf_paths, output_path)
+
 
 @mcp.tool()
 def pdf_split(pdf_path: str, ranges: List[str], output_dir: str) -> str:
     """[PDF ONLY] Splits PDF by ranges (e.g. ["1-3", "5"])."""
-    try:
-        return PDFProcessor.split_pdf(pdf_path, ranges, output_dir)
-    except Exception as e:
-        raise PDFProcessingError(f"Split failed: {e}")
+    return _run_tool(PDFProcessor.split_pdf, "Split failed", pdf_path, ranges, output_dir)
+
 
 @mcp.tool()
 def pdf_rotate_pages(pdf_path: str, rotation: int, pages: Optional[List[int]] = None) -> str:
     """[PDF ONLY] Rotates pages by 90/180/270."""
-    try:
-        return PDFProcessor.rotate_pages(pdf_path, rotation, pages)
-    except Exception as e:
-        raise PDFProcessingError(f"Rotation failed: {e}")
+    return _run_tool(PDFProcessor.rotate_pages, "Rotation failed", pdf_path, rotation, pages)
+
 
 @mcp.tool()
 def pdf_extract_images(pdf_path: str) -> str:
     """[PDF ONLY] Extracts images to ZIP."""
-    try:
-        return PDFProcessor.extract_images(pdf_path)
-    except Exception as e:
-        raise PDFProcessingError(f"Image extraction failed: {e}")
+    return _run_tool(PDFProcessor.extract_images, "Image extraction failed", pdf_path)
+
 
 @mcp.tool()
 def pdf_from_images(image_paths: List[str], output_path: str) -> str:
     """[PDF ONLY] Creates PDF from images."""
-    try:
-        return PDFProcessor.images_to_pdf(image_paths, output_path)
-    except Exception as e:
-        raise PDFProcessingError(f"Conversion failed: {e}")
+    return _run_tool(PDFProcessor.images_to_pdf, "Conversion failed", image_paths, output_path)
 
-import sys
 
 if __name__ == "__main__":
     # Пишем информацию о запуске в stderr
@@ -946,3 +993,4 @@ if __name__ == "__main__":
         # Перехватываем нажатие Ctrl+C
         logger.info("Received shutdown signal (Ctrl+C). Shutting down gracefully...")
         sys.exit(0)
+

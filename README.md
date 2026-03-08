@@ -16,10 +16,11 @@
 - **Session Recovery:** восстановление сессии после сбоев.
 
 ### Архитектура и логика
-- **LangGraph Core:** `Start -> Summarize -> UpdateStep -> Agent -> (Tools -> UpdateStep -> Agent | End)`.
+- **LangGraph Core:** `Start -> Summarize -> UpdateStep -> Agent -> (Tools | Critic) -> ...`, где `critic` проверяет завершённость задачи перед любым нормальным завершением.
 - **Memory Management:** автосуммаризация при достижении `SESSION_SIZE` с сохранением последних `SUMMARY_KEEP_LAST` сообщений.
 - **Loop Guard (graph):** ограничение шагов по `MAX_LOOPS`.
 - **Loop Guard (tools):** защита от повторов одинаковых вызовов инструментов; дефолты синхронизированы с `MAX_LOOPS`, но могут быть переопределены в `.env`.
+- **Internal Critic:** отдельный внутренний узел верификации, который использует тот же LLM без новых `.env` настроек и не отображается в обычном CLI.
 - **Parallel Tool Calls:** параллельный запуск только для безопасного набора read-only инструментов.
 - **Token Tracking:** учет usage metadata с fallback-логикой.
 
@@ -159,11 +160,11 @@
 
 1. `AgentConfig` загружает и валидирует `.env`.
 2. `ToolRegistry` подключает локальные и MCP-инструменты.
-3. `build_agent_app()` собирает граф с узлами `summarize`, `update_step`, `agent`, `tools`.
+3. `build_agent_app()` собирает граф с узлами `summarize`, `update_step`, `agent`, `tools`, `critic`.
 4. Завершение происходит при:
    - достижении `MAX_LOOPS`;
-   - отсутствии tool-вызовов от модели;
-   - chat-only режиме (`MODEL_SUPPORTS_TOOLS=false`).
+   - verdict `FINISHED` от `critic` после финального ответа `agent`;
+   - chat-only режиме (`MODEL_SUPPORTS_TOOLS=false`), но всё равно через внутреннюю проверку `critic`.
 
 ---
 
@@ -204,7 +205,7 @@ python agent_cli.py
 
 ## Ограничения и безопасность
 
-- `MAX_LOOPS` ограничивает только шаги графа.
+- `MAX_LOOPS` ограничивает шаги графа; `critic` не имеет отдельного loop guard и работает внутри этого общего лимита.
 - Per-tool loop guard работает отдельно и может остановить повторяющиеся вызовы раньше; по умолчанию его пороги вычисляются от `MAX_LOOPS`, либо задаются через `TOOL_LOOP_LIMIT_MUTATING`, `TOOL_LOOP_LIMIT_READONLY`, `TOOL_LOOP_WINDOW`.
 - `cli_exec` потенциально опасен, по умолчанию выключен.
 - `edit_file` содержит защитные проверки и дополнительную JSON-валидацию для `.json`.

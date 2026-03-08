@@ -181,9 +181,25 @@ class AgentNodes:
     async def agent_node(self, state: AgentState):
         messages = state["messages"]
         summary = state.get("summary", "")
+        critic_feedback = (state.get("critic_feedback") or "").strip()
+        current_task = state.get("current_task") or self._derive_current_task(messages)
 
-        sys_msg = self._build_system_message(summary, tools_available=bool(self.tools))
-        full_context = [sys_msg] + messages
+        tools_available = bool(self.tools) and self.config.model_supports_tools
+        sys_msg = self._build_system_message(summary, tools_available=tools_available)
+        full_context: List[BaseMessage] = [sys_msg]
+
+        if critic_feedback:
+            full_context.append(
+                SystemMessage(
+                    content=(
+                        "INTERNAL CRITIC FEEDBACK:\n"
+                        f"{critic_feedback}\n"
+                        "Use this only as an internal hint. Do not mention the critic."
+                    )
+                )
+            )
+
+        full_context.extend(messages)
 
         response = await self._invoke_llm_with_retry(self.llm_with_tools, full_context)
 
@@ -191,7 +207,64 @@ class AgentNodes:
         if isinstance(response, AIMessage) and response.usage_metadata:
             token_usage_update = {"token_usage": response.usage_metadata}
 
-        return {"messages": [response], **token_usage_update}
+        has_tool_calls = bool(
+            tools_available and isinstance(response, AIMessage) and getattr(response, "tool_calls", None)
+        )
+
+        return {
+            "messages": [response],
+            "current_task": current_task,
+            "critic_feedback": "",
+            "critic_status": "",
+            "critic_source": "" if has_tool_calls else "agent",
+            **token_usage_update,
+        }
+
+    # --- NODE: CRITIC ---
+
+    async def critic_node(self, state: AgentState):
+        messages = state.get("messages", [])
+        current_task = (state.get("current_task") or self._derive_current_task(messages)).strip()
+        summary = state.get("summary", "")
+        critic_source = (state.get("critic_source") or "agent").strip().lower()
+        trace = self._format_trace_for_critic(messages)
+
+        prompt = constants.CRITIC_PROMPT_TEMPLATE.format(
+            current_task=current_task or "No explicit task provided.",
+            summary=summary or "No prior summary.",
+            source=critic_source or "agent",
+            trace=trace,
+        )
+
+        response = await self._invoke_llm_with_retry(self.llm, [SystemMessage(content=prompt)])
+        parsed = self._parse_critic_response(str(response.content))
+
+        if not parsed:
+            status, reason, next_step = self._infer_critic_fallback(messages, critic_source)
+            logger.info(
+                f"Critic returned malformed verdict. Falling back to heuristic {status}: {reason}"
+            )
+        else:
+            status, reason, next_step = parsed
+
+        if status == "FINISHED":
+            if critic_source == "tools":
+                feedback = (
+                    "Task appears complete based on the tool results. "
+                    "Provide a concise final answer to the user in Russian without calling more tools "
+                    "unless a final verification is still genuinely required."
+                )
+            else:
+                feedback = ""
+        else:
+            next_step_line = next_step if next_step and next_step != "NONE" else "perform an explicit verification step"
+            feedback = f"Task incomplete. Reason: {reason}. Next step: {next_step_line}."
+
+        return {
+            "critic_status": status,
+            "critic_feedback": feedback,
+            "current_task": current_task,
+        }
 
     # --- NODE: TOOLS ---
 
@@ -235,7 +308,7 @@ class AgentNodes:
             reflection_msg = HumanMessage(content=constants.REFLECTION_PROMPT)
             final_messages.append(reflection_msg)
 
-        return {"messages": final_messages}
+        return {"messages": final_messages, "critic_source": "tools"}
 
     def _can_parallelize_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> bool:
         if len(tool_calls) < 2:
@@ -310,6 +383,203 @@ class AgentNodes:
 
     # --- HELPERS ---
 
+    def _derive_current_task(self, messages: List[BaseMessage]) -> str:
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                content = self._stringify_content(message.content).strip()
+                if content and content != constants.REFLECTION_PROMPT:
+                    return content
+        return ""
+
+    def _format_trace_for_critic(self, messages: List[BaseMessage], max_messages: int = 12) -> str:
+        if not messages:
+            return "No recent messages."
+
+        trace_messages = messages[-max_messages:]
+        formatted = [self._format_message_for_critic(message) for message in trace_messages]
+        trace = "\n".join(part for part in formatted if part).strip()
+        if not trace:
+            return "No recent messages."
+        return trace[:12000]
+
+    def _format_message_for_critic(self, message: BaseMessage) -> str:
+        content = self._stringify_content(message.content)
+        content = self._compact_text(content, 1200)
+
+        if isinstance(message, ToolMessage):
+            label = f"tool[{message.name or 'unknown'}]"
+            return f"{label}: {content or '[empty tool output]'}"
+
+        if isinstance(message, AIMessage):
+            parts: List[str] = []
+            if content:
+                parts.append(f"assistant: {content}")
+            for tool_call in getattr(message, "tool_calls", []) or []:
+                name = tool_call.get("name", "unknown")
+                args = self._compact_text(str(tool_call.get("args", {})), 300)
+                parts.append(f"assistant_tool_call[{name}]: {args}")
+            return "\n".join(parts) if parts else "assistant: [empty response]"
+
+        if isinstance(message, HumanMessage):
+            role = "system_hint" if content == constants.REFLECTION_PROMPT else "user"
+            return f"{role}: {content or '[empty message]'}"
+
+        return f"{message.type}: {content or '[empty message]'}"
+
+    def _stringify_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(str(item))
+            return "".join(parts)
+        return str(content)
+
+    def _compact_text(self, text: str, limit: int) -> str:
+        compact = " ".join(str(text).split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 15] + "... [truncated]"
+
+    def _parse_critic_response(self, text: str) -> Optional[Tuple[str, str, str]]:
+        parsed: Dict[str, str] = {}
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().upper()
+            if key in {"STATUS", "REASON", "NEXT_STEP"} and key not in parsed:
+                parsed[key] = value.strip()
+
+        status = parsed.get("STATUS", "").upper().rstrip(".")
+        upper_text = text.upper()
+        if status not in {"FINISHED", "INCOMPLETE"}:
+            if "INCOMPLETE" in upper_text:
+                status = "INCOMPLETE"
+            elif "FINISHED" in upper_text or "COMPLETE" in upper_text or "DONE" in upper_text:
+                status = "FINISHED"
+            else:
+                return None
+
+        reason = parsed.get("REASON", "").strip()
+        if not reason:
+            reason = self._extract_reason_from_freeform_text(text, status)
+
+        next_step = parsed.get("NEXT_STEP", "").strip()
+        if not next_step:
+            next_step = "NONE" if status == "FINISHED" else "continue with the next obvious missing step"
+
+        return status, reason, next_step.upper() if next_step.upper() == "NONE" else next_step
+
+    def _extract_reason_from_freeform_text(self, text: str, status: str) -> str:
+        cleaned = " ".join(text.split()).strip(" -:")
+        if cleaned:
+            return self._compact_text(cleaned, 180)
+        if status == "FINISHED":
+            return "Task appears completed."
+        return "Task appears incomplete."
+
+    def _infer_critic_fallback(
+        self, messages: List[BaseMessage], critic_source: str
+    ) -> Tuple[str, str, str]:
+        last_ai = self._get_last_ai_message(messages)
+        recent_tools = self._get_recent_tool_messages(messages)
+
+        if any(self._is_tool_error_message(msg) for msg in recent_tools):
+            return "INCOMPLETE", "Recent tool execution reported an explicit error.", "fix the failed step"
+
+        if last_ai and self._message_indicates_incomplete(self._stringify_content(last_ai.content)):
+            return "INCOMPLETE", "The latest assistant message suggests work is still pending.", "continue with the remaining step"
+
+        if critic_source == "tools" and recent_tools:
+            return "FINISHED", "Recent tool results indicate the requested action completed successfully.", "NONE"
+
+        if last_ai and not getattr(last_ai, "tool_calls", None):
+            content = self._stringify_content(last_ai.content)
+            if content.strip():
+                return "FINISHED", "The latest assistant response appears to deliver the requested result.", "NONE"
+
+        return "INCOMPLETE", "Completion is still unclear from the latest trace.", "continue only if something obvious is still missing"
+
+    def _get_last_ai_message(self, messages: List[BaseMessage]) -> Optional[AIMessage]:
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                return message
+        return None
+
+    def _get_recent_tool_messages(self, messages: List[BaseMessage], limit: int = 6) -> List[ToolMessage]:
+        recent: List[ToolMessage] = []
+        for message in reversed(messages):
+            if isinstance(message, ToolMessage):
+                recent.append(message)
+                if len(recent) >= limit:
+                    break
+            elif recent:
+                break
+        recent.reverse()
+        return recent
+
+    def _is_tool_error_message(self, message: ToolMessage) -> bool:
+        content = self._stringify_content(message.content)
+        normalized = content.strip().lower()
+        return (
+            getattr(message, "status", "") == "error"
+            or normalized.startswith(("error", "ошибка", "error["))
+            or "error[" in normalized
+            or "traceback" in normalized
+        )
+
+    def _message_indicates_incomplete(self, text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        if not normalized:
+            return False
+
+        incomplete_markers = (
+            "task incomplete",
+            "incomplete",
+            "next step",
+            "need to",
+            "still need",
+            "remaining",
+            "not finished",
+            "failed",
+            "error",
+            "не заверш",
+            "ещё нужно",
+            "еще нужно",
+            "осталось",
+            "следующий шаг",
+            "нужно ",
+            "требуется",
+            "не удалось",
+            "ошибка",
+            "не готов",
+            "продолжу",
+            "теперь найду",
+            "теперь создам",
+        )
+        uncertainty_markers = (
+            "похоже",
+            "кажется",
+            "вероятно",
+            "probably",
+            "maybe",
+            "perhaps",
+            "likely",
+            "seems",
+        )
+
+        if any(marker in normalized for marker in incomplete_markers):
+            return True
+        if any(marker in normalized for marker in uncertainty_markers):
+            return True
+        return False
+
     def _get_base_prompt(self) -> str:
         """Ленивая загрузка и кэширование промпта для устранения дискового I/O"""
         if self._cached_base_prompt is None:
@@ -342,8 +612,10 @@ class AgentNodes:
 
     async def _invoke_llm_with_retry(self, llm, context: List[BaseMessage]) -> AIMessage:
         current_llm = llm
+        max_attempts = max(1, self.config.max_retries)
+        retry_delay = max(0, self.config.retry_delay)
 
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
                 response = await current_llm.ainvoke(context)
                 if not response.content and not response.tool_calls:
@@ -365,13 +637,37 @@ class AgentNodes:
                         )
                     continue
 
-                logger.warning(f"LLM Error (Attempt {attempt+1}): {e}")
-                if attempt == 2:
-                    friendly_error = format_exception_friendly(e)
-                    return AIMessage(
-                        content=f"System Error: API request failed after 3 retries. \n{friendly_error}"
-                    )
-                await asyncio.sleep(1)
-        return AIMessage(content="System Error: Unknown failure.")
+                is_fatal = self._is_fatal_llm_error(e)
+                logger.warning(f"LLM Error (Attempt {attempt+1}/{max_attempts}): {e}")
+
+                if is_fatal:
+                    logger.error(f"Fatal LLM error detected. Aborting request: {e}")
+                    raise
+
+                if attempt == max_attempts - 1:
+                    raise
+
+                await asyncio.sleep(retry_delay)
+
+        raise RuntimeError("LLM retry loop exited unexpectedly without a response.")
+
+    def _is_fatal_llm_error(self, error: Exception) -> bool:
+        err_str = " ".join(str(error).lower().split())
+        fatal_markers = (
+            "insufficient_balance",
+            "insufficient account balance",
+            "invalid_api_key",
+            "incorrect api key",
+            "authentication failed",
+            "unauthorized",
+            "forbidden",
+            "permission denied",
+            "billing",
+            "payment required",
+            "error code: 401",
+            "error code: 402",
+            "error code: 403",
+        )
+        return any(marker in err_str for marker in fatal_markers)
 
 

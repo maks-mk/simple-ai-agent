@@ -54,6 +54,62 @@ def create_llm(config: AgentConfig) -> BaseChatModel:
 
 # --- Builder ---
 
+def create_agent_workflow(
+    nodes: AgentNodes,
+    config: AgentConfig,
+    tools_enabled: Optional[bool] = None,
+) -> StateGraph:
+    """Builds the LangGraph workflow where critic validates only final agent answers."""
+    tools_enabled = bool(nodes.tools) and config.model_supports_tools if tools_enabled is None else tools_enabled
+
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("summarize", nodes.summarize_node)
+    workflow.add_node("agent", nodes.agent_node)
+    workflow.add_node("critic", nodes.critic_node)
+    workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
+
+    workflow.add_edge(START, "summarize")
+    workflow.add_edge("summarize", "update_step")
+    workflow.add_edge("update_step", "agent")
+
+    if tools_enabled:
+        workflow.add_node("tools", nodes.tools_node)
+
+    def route_after_agent(state: AgentState):
+        steps = state.get("steps", 0)
+
+        if steps >= config.max_loops:
+            logger.debug(f"🛑 Loop Guard: {steps} steps reached.")
+            return END
+
+        messages = state.get("messages") or []
+        if not messages:
+            logger.warning("Agent node returned no messages; routing to critic for a safe fallback.")
+            return "critic"
+
+        last_msg = messages[-1]
+
+        if tools_enabled and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+            return "tools"
+
+        return "critic"
+
+    def route_after_critic(state: AgentState):
+        if state.get("critic_status") == "FINISHED" and state.get("critic_source") == "agent":
+            return END
+        return "update_step"
+
+    if tools_enabled:
+        workflow.add_conditional_edges("agent", route_after_agent, ["tools", "critic", END])
+        workflow.add_edge("tools", "update_step")
+    else:
+        workflow.add_conditional_edges("agent", route_after_agent, ["critic", END])
+
+    workflow.add_conditional_edges("critic", route_after_critic, ["update_step", END])
+
+    return workflow
+
 async def build_agent_app(config: Optional[AgentConfig] = None) -> Tuple[Any, ToolRegistry]:
     """
     Builds the LangGraph application and returns it along with the tool registry.
@@ -91,47 +147,7 @@ async def build_agent_app(config: Optional[AgentConfig] = None) -> Tuple[Any, To
         tools=tools,
         llm_with_tools=llm_with_tools,
     )
-
-    # 4. Build Graph
-    workflow = StateGraph(AgentState)
-
-    workflow.add_node("summarize", nodes.summarize_node)
-    workflow.add_node("agent", nodes.agent_node)
-    workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
-
-    # Simple Linear Flow: Start -> Summarize -> Update Step -> Agent -> [Tools -> Agent] or End
-    workflow.add_edge(START, "summarize")
-    workflow.add_edge("summarize", "update_step")
-    workflow.add_edge("update_step", "agent")
-
-    def should_continue(state: AgentState):
-        steps = state.get("steps", 0)
-
-        if steps >= config.max_loops:
-            logger.debug(f"🛑 Loop Guard: {steps} steps reached.")
-            return END
-
-        messages = state.get("messages")
-        if not messages:
-            return "agent"
-
-        last_msg = messages[-1]
-
-        # Only go to tools if tools are actually enabled/bound
-        if tools and can_use_tools and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
-            return "tools"
-
-        return END
-
-    # Оптимизация графа: добавляем логику инструментов только если они включены
-    if tools and can_use_tools:
-        workflow.add_node("tools", nodes.tools_node)
-        workflow.add_conditional_edges("agent", should_continue, ["tools", END])
-        workflow.add_edge("tools", "update_step")
-    else:
-        # Граф без инструментов (Chat-only режим)
-        workflow.add_conditional_edges("agent", should_continue, [END])
-
+    workflow = create_agent_workflow(nodes, config, tools_enabled=bool(tools) and can_use_tools)
     return workflow.compile(checkpointer=MemorySaver()), tool_registry
 
 

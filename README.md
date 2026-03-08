@@ -1,6 +1,6 @@
 # Autonomous AI Agent (LangGraph + MCP + Rich UI)
 
-**v7.43b**
+**v0.46b**
 
 Автономный AI-агент на базе **LangGraph** и **MCP (Model Context Protocol)** с CLI-интерфейсом для Windows/Linux.
 

@@ -200,6 +200,10 @@ def format_exception_friendly(e: Exception) -> str:
     # 2. Auth Errors
     if "401" in err_str or "403" in err_str or "Authentication" in err_type:
         return "⚠ Authentication Failed. Check your API KEY in .env."
+
+    # 2.1 Billing / Balance
+    if "402" in err_str or "insufficient_balance" in err_str or "Insufficient account balance" in err_str:
+        return "⚠ Insufficient account balance (402). Top up the provider account or switch model/provider."
     
     # 3. Context Length
     if "context_length_exceeded" in err_str or "too many tokens" in err_str.lower():

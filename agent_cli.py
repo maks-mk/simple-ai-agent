@@ -160,7 +160,7 @@ async def main():
     grid.add_column(justify="center")
     grid.add_column(justify="right")
     grid.add_row(
-        "[bold cyan] > AI Agent[/] [gray]v7.43b[/]",
+        "[bold cyan] > AI Agent[/] [gray]v0.46b[/]",
         f"[gray]Tools: {len(tools)}[/]",
         f"[gray]{model_name}[/] [cyan]•[/]",
     )
@@ -214,10 +214,18 @@ async def main():
             repair_session_if_needed(agent_app, thread_id, console)
 
             # Initialize State & Config
-            initial_state = {"messages": [("user", user_input)], "steps": 0, "token_usage": {}}
-            # Worst-case graph path with tools is ~= 3 * max_loops + 1 node executions.
-            # Use 4x with a small floor for safety against framework recursion checks.
-            recursion_limit = max(8, temp_cfg.max_loops * 4)
+            initial_state = {
+                "messages": [("user", user_input)],
+                "steps": 0,
+                "token_usage": {},
+                "current_task": user_input,
+                "critic_status": "",
+                "critic_source": "",
+                "critic_feedback": "",
+            }
+            # Worst-case graph path now includes critic checks around each potential exit.
+            # Use 6x with a small floor for safety against framework recursion checks.
+            recursion_limit = max(12, temp_cfg.max_loops * 6)
             config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
 
             # Start Stream

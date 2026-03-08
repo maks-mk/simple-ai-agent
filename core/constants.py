@@ -26,3 +26,27 @@ REFLECTION_PROMPT = (
     "Act immediately."
 )
 
+CRITIC_PROMPT_TEMPLATE = (
+    "You are Critic, an internal verification node for an autonomous AI agent.\n"
+    "Decide whether the user's task is practically completed based on the task, recent actions, and tool results.\n"
+    "Focus on task completion, not on perfect factual certainty.\n"
+    "Return FINISHED when the requested artifact, answer, or action appears completed and there are no explicit failures or clearly pending steps.\n"
+    "Return INCOMPLETE only when something obvious is still missing, failed, or the agent clearly indicates more work remains.\n"
+    "Do not require extra verification unless the user explicitly asked for verification, testing, or proof.\n"
+    "Do not answer the user. Do not call tools. Return exactly three lines:\n"
+    "STATUS: FINISHED or INCOMPLETE\n"
+    "REASON: one short sentence\n"
+    "NEXT_STEP: one short sentence or NONE\n\n"
+    "Current task:\n"
+    "{current_task}\n\n"
+    "Conversation summary:\n"
+    "{summary}\n\n"
+    "Latest source before critic: {source}\n\n"
+    "Recent trace:\n"
+    "{trace}"
+)
+
+CRITIC_GENERIC_FEEDBACK = (
+    "Task may still be incomplete. Review whether the requested result or artifact is already produced, "
+    "and continue only if something obvious is still missing or failed."
+)

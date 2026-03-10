@@ -1,4 +1,5 @@
 import functools
+import re
 from pathlib import Path
 from typing import Literal, Optional, Union
 
@@ -10,6 +11,18 @@ from core.constants import BASE_DIR
 # --- Defaults ---
 DEFAULT_MAX_FILE_SIZE = 300 * 1024 * 1024  # 300 MB
 DEFAULT_READ_LIMIT = 2000
+_SIZE_WITH_UNIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?i?b)\s*$", re.IGNORECASE)
+_SIZE_MULTIPLIERS = {
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000 ** 2,
+    "gb": 1000 ** 3,
+    "tb": 1000 ** 4,
+    "kib": 1024,
+    "mib": 1024 ** 2,
+    "gib": 1024 ** 3,
+    "tib": 1024 ** 4,
+}
 
 
 class AgentConfig(BaseSettings):
@@ -71,7 +84,7 @@ class AgentConfig(BaseSettings):
     summary_threshold: int = Field(
         default=8000,
         alias="SESSION_SIZE",
-        description="Estimated input context tokens before summarizing (~chars/3)",
+        description="Estimated input context tokens before summarizing (~chars/2)",
     )
     summary_keep_last: int = Field(default=4, alias="SUMMARY_KEEP_LAST")
 
@@ -84,19 +97,33 @@ class AgentConfig(BaseSettings):
     @classmethod
     def parse_max_file_size(cls, v: Union[int, float, str]) -> int:
         """
-        Auto-convert MB to bytes if value is small (< 10000).
-        Assumes user meant MB if they enter '400' instead of '400000000'.
+        Parse byte limits strictly.
+        Plain numeric values are treated as bytes.
+        String values may optionally include explicit units, e.g. 4MB or 300MiB.
         """
-        try:
-            val = float(v)
-        except (ValueError, TypeError):
-            # Fallback to default if .env contains unparseable string like "300MB"
-            return DEFAULT_MAX_FILE_SIZE
+        if isinstance(v, (int, float)):
+            value = int(v)
+        elif isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                raise ValueError("MAX_FILE_SIZE cannot be empty.")
+            if raw.isdigit():
+                value = int(raw)
+            else:
+                match = _SIZE_WITH_UNIT_RE.match(raw)
+                if not match:
+                    raise ValueError(
+                        "Invalid MAX_FILE_SIZE format. Use bytes (e.g. 4096) or explicit units like 4MB / 300MiB."
+                    )
+                amount = float(match.group(1))
+                unit = match.group(2).lower()
+                value = int(amount * _SIZE_MULTIPLIERS[unit])
+        else:
+            raise ValueError("Invalid MAX_FILE_SIZE value.")
 
-        # Heuristic: If value is less than 10000, assume it's in MB.
-        if val < 10000:
-            return int(val * 1024 * 1024)
-        return int(val)
+        if value < 1:
+            raise ValueError("MAX_FILE_SIZE must be greater than 0.")
+        return value
 
     @field_validator("max_loops", mode="before")
     @classmethod

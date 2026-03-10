@@ -1,3 +1,4 @@
+import uuid
 import asyncio
 import logging
 from datetime import datetime
@@ -5,7 +6,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from rich import print as rprint
-from rich.panel import Panel
 
 from langchain_core.messages import (
     AIMessage,
@@ -21,10 +21,11 @@ from langchain_core.tools import BaseTool
 from core.state import AgentState
 from core.config import AgentConfig
 from core import constants
-from core.cli_utils import format_exception_friendly
 from core.validation import validate_tool_result
 from core.utils import truncate_output
 from core.errors import format_error, ErrorType
+from core.message_utils import compact_text, is_error_text, is_tool_message_error, stringify_content
+from core.text_utils import format_exception_friendly
 
 logger = logging.getLogger("agent")
 
@@ -88,7 +89,7 @@ class AgentNodes:
     # --- NODE: SUMMARIZE ---
 
     def _estimate_tokens(self, messages: List[BaseMessage]) -> int:
-        """Грубая оценка токенов входящего контекста: сумма символов / 3.
+        """Грубая оценка токенов входящего контекста: сумма символов / 2.
         Учитывает как текстовый контент, так и аргументы вызовов инструментов."""
         total_chars = 0
         for m in messages:
@@ -102,7 +103,7 @@ class AgentNodes:
             if hasattr(m, "tool_calls") and m.tool_calls:
                 total_chars += sum(len(str(tc)) for tc in m.tool_calls)
 
-        return total_chars // 3
+        return total_chars // 2
 
     async def summarize_node(self, state: AgentState):
         messages = state["messages"]
@@ -146,18 +147,7 @@ class AgentNodes:
             delete_msgs = [RemoveMessage(id=m.id) for m in to_summarize if m.id]
             logger.info(f"🧹 Summary: Removed {len(delete_msgs)} messages. Generated new summary.")
 
-            # --- КРАСИВОЕ УВЕДОМЛЕНИЕ ЧЕРЕЗ RICH ---
-            rprint(
-                Panel(
-                    f"[dim]Контекст превысил порог в {self.config.summary_threshold} токенов.\n"
-                    f"Старые сообщения ({len(delete_msgs)} шт.) успешно сжаты в память.[/dim]",
-                    title="[bold yellow]🧹 Авто-суммаризация памяти[/]",
-                    border_style="yellow",
-                    padding=(0, 2),
-                    expand=False,
-                )
-            )
-            # --------------------------------------
+            rprint("---- Автоматическое сжатие контекста ----")
 
             return {"summary": res.content, "messages": delete_msgs}
         except Exception as e:
@@ -176,18 +166,17 @@ class AgentNodes:
             for m in messages
         )
 
-    # --- NODE: AGENT ---
-
-    async def agent_node(self, state: AgentState):
-        messages = state["messages"]
-        summary = state.get("summary", "")
-        critic_feedback = (state.get("critic_feedback") or "").strip()
-        current_task = state.get("current_task") or self._derive_current_task(messages)
-
-        tools_available = bool(self.tools) and self.config.model_supports_tools
-        sys_msg = self._build_system_message(summary, tools_available=tools_available)
-        full_context: List[BaseMessage] = [sys_msg]
-
+    def _build_agent_context(
+        self,
+        messages: List[BaseMessage],
+        summary: str,
+        critic_feedback: str,
+        tools_available: bool,
+    ) -> List[BaseMessage]:
+        sanitized_messages = self._sanitize_messages_for_model(messages)
+        full_context: List[BaseMessage] = [
+            self._build_system_message(summary, tools_available=tools_available)
+        ]
         if critic_feedback:
             full_context.append(
                 SystemMessage(
@@ -198,18 +187,62 @@ class AgentNodes:
                     )
                 )
             )
+        full_context.extend(sanitized_messages)
+        if critic_feedback and sanitized_messages and isinstance(sanitized_messages[-1], AIMessage):
+            full_context.append(
+                HumanMessage(
+                    content=(
+                        "Continue the task from the latest incomplete assistant attempt. "
+                        "Use the critic feedback above, do not repeat the same incomplete answer, "
+                        "and only stop when the requested work is actually finished."
+                    )
+                )
+            )
+        return full_context
 
-        full_context.extend(messages)
+    def _sanitize_messages_for_model(self, messages: List[BaseMessage]) -> List[BaseMessage]:
+        sanitized: List[BaseMessage] = []
+        for message in messages:
+            if isinstance(message, HumanMessage):
+                content = stringify_content(message.content).strip()
+                if content == constants.REFLECTION_PROMPT:
+                    continue
+            sanitized.append(message)
+        return sanitized
 
-        response = await self._invoke_llm_with_retry(self.llm_with_tools, full_context)
-
+    def _build_agent_result(
+        self,
+        response: AIMessage,
+        current_task: str,
+        tools_available: bool,
+    ) -> Dict[str, Any]:
         token_usage_update = {}
-        if isinstance(response, AIMessage) and response.usage_metadata:
+        if getattr(response, "usage_metadata", None):
             token_usage_update = {"token_usage": response.usage_metadata}
 
-        has_tool_calls = bool(
-            tools_available and isinstance(response, AIMessage) and getattr(response, "tool_calls", None)
-        )
+        has_tool_calls = False
+        protocol_error = ""
+
+        if isinstance(response, AIMessage):
+            t_calls = list(getattr(response, "tool_calls", []))
+            invalid_calls = list(getattr(response, "invalid_tool_calls", []))
+
+            missing_fields = [
+                tc for tc in t_calls
+                if not tc.get("id") or not tc.get("name")
+            ]
+            if missing_fields or invalid_calls:
+                protocol_error = self._build_tool_protocol_error(missing_fields, invalid_calls)
+                response = AIMessage(
+                    content=self._merge_protocol_error_into_content(response.content, protocol_error),
+                    additional_kwargs=response.additional_kwargs,
+                    response_metadata=response.response_metadata,
+                    usage_metadata=response.usage_metadata,
+                    id=response.id,
+                )
+                t_calls = []
+
+            has_tool_calls = bool(tools_available and t_calls)
 
         return {
             "messages": [response],
@@ -219,6 +252,67 @@ class AgentNodes:
             "critic_source": "" if has_tool_calls else "agent",
             **token_usage_update,
         }
+
+    def _merge_protocol_error_into_content(self, content: Any, protocol_error: str) -> str:
+        base_text = stringify_content(content).strip()
+        if not protocol_error:
+            return base_text
+        if not base_text:
+            return protocol_error
+        return f"{base_text}\n\n{protocol_error}"
+
+    def _build_tool_protocol_error(
+        self,
+        missing_fields: List[Dict[str, Any]],
+        invalid_calls: List[Dict[str, Any]],
+    ) -> str:
+        details = []
+        if missing_fields:
+            details.append(
+                f"{len(missing_fields)} tool call(s) were missing required 'name' or 'id' fields"
+            )
+        if invalid_calls:
+            details.append(
+                f"{len(invalid_calls)} tool call(s) had invalid arguments and could not be parsed"
+            )
+        joined = "; ".join(details) if details else "Malformed tool call payload received."
+        return (
+            "INTERNAL TOOL PROTOCOL ERROR: "
+            f"{joined}. Do not invent tool names or IDs. "
+            "If tools are still needed, issue a fresh valid tool call."
+        )
+    
+    def _build_critic_feedback(
+        self,
+        status: str,
+        reason: str,
+        next_step: str,
+        critic_source: str,
+    ) -> str:
+        if status == "FINISHED":
+            if critic_source == "tools":
+                return (
+                    "Task appears complete based on the tool results. "
+                    "Provide a concise final answer to the user in Russian without calling more tools "
+                    "unless a final verification is still genuinely required."
+                )
+            return ""
+
+        next_step_line = next_step if next_step and next_step != "NONE" else "perform an explicit verification step"
+        return f"Task incomplete. Reason: {reason}. Next step: {next_step_line}."
+
+    # --- NODE: AGENT ---
+
+    async def agent_node(self, state: AgentState):
+        messages = state["messages"]
+        summary = state.get("summary", "")
+        critic_feedback = (state.get("critic_feedback") or "").strip()
+        current_task = state.get("current_task") or self._derive_current_task(messages)
+
+        tools_available = bool(self.tools) and self.config.model_supports_tools
+        full_context = self._build_agent_context(messages, summary, critic_feedback, tools_available)
+        response = await self._invoke_llm_with_retry(self.llm_with_tools, full_context)
+        return self._build_agent_result(response, current_task, tools_available)
 
     # --- NODE: CRITIC ---
 
@@ -247,22 +341,9 @@ class AgentNodes:
         else:
             status, reason, next_step = parsed
 
-        if status == "FINISHED":
-            if critic_source == "tools":
-                feedback = (
-                    "Task appears complete based on the tool results. "
-                    "Provide a concise final answer to the user in Russian without calling more tools "
-                    "unless a final verification is still genuinely required."
-                )
-            else:
-                feedback = ""
-        else:
-            next_step_line = next_step if next_step and next_step != "NONE" else "perform an explicit verification step"
-            feedback = f"Task incomplete. Reason: {reason}. Next step: {next_step_line}."
-
         return {
             "critic_status": status,
-            "critic_feedback": feedback,
+            "critic_feedback": self._build_critic_feedback(status, reason, next_step, critic_source),
             "current_task": current_task,
         }
 
@@ -304,11 +385,12 @@ class AgentNodes:
                 final_messages.append(tool_msg)
                 has_error = has_error or had_error
 
-        if has_error and not self.config.strict_mode:
-            reflection_msg = HumanMessage(content=constants.REFLECTION_PROMPT)
-            final_messages.append(reflection_msg)
-
-        return {"messages": final_messages, "critic_source": "tools"}
+        reflection_feedback = constants.REFLECTION_PROMPT if has_error and not self.config.strict_mode else ""
+        return {
+            "messages": final_messages,
+            "critic_source": "tools",
+            "critic_feedback": reflection_feedback,
+        }
 
     def _can_parallelize_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> bool:
         if len(tool_calls) < 2:
@@ -320,10 +402,15 @@ class AgentNodes:
     async def _process_tool_call(
         self, tool_call: Dict[str, Any], recent_calls: List[Dict[str, Any]]
     ) -> Tuple[ToolMessage, bool]:
-        t_name = tool_call["name"]
-        t_args = tool_call["args"]
-        t_id = tool_call["id"]
-
+        # Безопасное извлечение с фоллбеками
+        t_name = tool_call.get("name") or "unknown_tool"
+        t_args = tool_call.get("args") or {}
+    
+        # Генерируем фейковый ID, если LLM забыла его указать, чтобы Pydantic не упал
+        t_id = tool_call.get("id")
+        if not t_id:
+            t_id = f"call_missing_{uuid.uuid4().hex[:8]}"
+        
         had_error = False
 
         # Проверка на зацикливание
@@ -352,7 +439,7 @@ class AgentNodes:
             content = f"{content}\n\n{validation_error}"
             had_error = True
 
-        if "ERROR[" in content:
+        if is_error_text(content):
             had_error = True
 
         limit = self.config.safety.max_tool_output
@@ -386,7 +473,7 @@ class AgentNodes:
     def _derive_current_task(self, messages: List[BaseMessage]) -> str:
         for message in reversed(messages):
             if isinstance(message, HumanMessage):
-                content = self._stringify_content(message.content).strip()
+                content = stringify_content(message.content).strip()
                 if content and content != constants.REFLECTION_PROMPT:
                     return content
         return ""
@@ -403,8 +490,8 @@ class AgentNodes:
         return trace[:12000]
 
     def _format_message_for_critic(self, message: BaseMessage) -> str:
-        content = self._stringify_content(message.content)
-        content = self._compact_text(content, 1200)
+        content = stringify_content(message.content)
+        content = compact_text(content, 1200)
 
         if isinstance(message, ToolMessage):
             label = f"tool[{message.name or 'unknown'}]"
@@ -416,7 +503,7 @@ class AgentNodes:
                 parts.append(f"assistant: {content}")
             for tool_call in getattr(message, "tool_calls", []) or []:
                 name = tool_call.get("name", "unknown")
-                args = self._compact_text(str(tool_call.get("args", {})), 300)
+                args = compact_text(str(tool_call.get("args", {})), 300)
                 parts.append(f"assistant_tool_call[{name}]: {args}")
             return "\n".join(parts) if parts else "assistant: [empty response]"
 
@@ -426,24 +513,6 @@ class AgentNodes:
 
         return f"{message.type}: {content or '[empty message]'}"
 
-    def _stringify_content(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    parts.append(str(item.get("text", "")))
-                else:
-                    parts.append(str(item))
-            return "".join(parts)
-        return str(content)
-
-    def _compact_text(self, text: str, limit: int) -> str:
-        compact = " ".join(str(text).split())
-        if len(compact) <= limit:
-            return compact
-        return compact[: limit - 15] + "... [truncated]"
 
     def _parse_critic_response(self, text: str) -> Optional[Tuple[str, str, str]]:
         parsed: Dict[str, str] = {}
@@ -479,7 +548,7 @@ class AgentNodes:
     def _extract_reason_from_freeform_text(self, text: str, status: str) -> str:
         cleaned = " ".join(text.split()).strip(" -:")
         if cleaned:
-            return self._compact_text(cleaned, 180)
+            return compact_text(cleaned, 180)
         if status == "FINISHED":
             return "Task appears completed."
         return "Task appears incomplete."
@@ -490,17 +559,17 @@ class AgentNodes:
         last_ai = self._get_last_ai_message(messages)
         recent_tools = self._get_recent_tool_messages(messages)
 
-        if any(self._is_tool_error_message(msg) for msg in recent_tools):
+        if any(is_tool_message_error(msg) for msg in recent_tools):
             return "INCOMPLETE", "Recent tool execution reported an explicit error.", "fix the failed step"
 
-        if last_ai and self._message_indicates_incomplete(self._stringify_content(last_ai.content)):
+        if last_ai and self._message_indicates_incomplete(stringify_content(last_ai.content)):
             return "INCOMPLETE", "The latest assistant message suggests work is still pending.", "continue with the remaining step"
 
         if critic_source == "tools" and recent_tools:
             return "FINISHED", "Recent tool results indicate the requested action completed successfully.", "NONE"
 
         if last_ai and not getattr(last_ai, "tool_calls", None):
-            content = self._stringify_content(last_ai.content)
+            content = stringify_content(last_ai.content)
             if content.strip():
                 return "FINISHED", "The latest assistant response appears to deliver the requested result.", "NONE"
 
@@ -524,15 +593,6 @@ class AgentNodes:
         recent.reverse()
         return recent
 
-    def _is_tool_error_message(self, message: ToolMessage) -> bool:
-        content = self._stringify_content(message.content)
-        normalized = content.strip().lower()
-        return (
-            getattr(message, "status", "") == "error"
-            or normalized.startswith(("error", "ошибка", "error["))
-            or "error[" in normalized
-            or "traceback" in normalized
-        )
 
     def _message_indicates_incomplete(self, text: str) -> bool:
         normalized = " ".join(text.lower().split())
@@ -618,7 +678,8 @@ class AgentNodes:
         for attempt in range(max_attempts):
             try:
                 response = await current_llm.ainvoke(context)
-                if not response.content and not response.tool_calls:
+                invalid_calls = getattr(response, "invalid_tool_calls", None)
+                if not response.content and not response.tool_calls and not invalid_calls:
                     raise ValueError("Empty response from LLM")
                 return response
             except Exception as e:
@@ -669,5 +730,8 @@ class AgentNodes:
             "error code: 403",
         )
         return any(marker in err_str for marker in fatal_markers)
+
+
+
 
 

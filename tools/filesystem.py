@@ -9,10 +9,13 @@ Features:
 - Optimized os.scandir traversals
 """
 
+import asyncio
+import errno
 import os
 import re
 import json
 import difflib
+import shutil
 import aiofiles
 import itertools
 from functools import lru_cache
@@ -109,27 +112,111 @@ class FilesystemManager:
         except Exception:
              return 0
 
+    def _candidate_path_inputs(self, path_str: str) -> list[str]:
+        normalized = str(path_str).strip()
+        candidates: list[str] = []
+        for candidate in (
+            normalized,
+            normalized.strip("\"'"),
+            normalized.rstrip(",;").rstrip(),
+            normalized.strip("\"'").rstrip(",;").rstrip(),
+        ):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
     def _resolve_path(self, path_str: str) -> Path:
         """Resolves and validates paths strictly within the sandbox if virtual_mode is on."""
         if not path_str:
             raise ValueError("Path cannot be empty")
-            
-        clean_path = str(path_str).replace("\\", "/")
-        path_obj = Path(clean_path).expanduser()
-        
-        if self.virtual_mode:
-            if path_obj.is_absolute():
-                raise ValueError(f"ACCESS DENIED: Absolute paths not allowed in virtual mode: {path_str}")
-            
-            full_path = (self.cwd / path_obj).resolve()
-            
-            # Use native is_relative_to (Python 3.9+) for safe bounds checking
-            if not full_path.is_relative_to(self.cwd):
-                raise ValueError(f"ACCESS DENIED: Path traversal outside working directory: {full_path}")
-                
-            return full_path
 
-        return path_obj.resolve() if path_obj.is_absolute() else (self.cwd / path_obj).resolve()
+        resolved_candidates: list[tuple[str, Path]] = []
+        for candidate_input in self._candidate_path_inputs(path_str):
+            clean_path = candidate_input.replace("\\", "/")
+            path_obj = Path(clean_path).expanduser()
+
+            if self.virtual_mode:
+                if path_obj.is_absolute():
+                    raise ValueError(f"ACCESS DENIED: Absolute paths not allowed in virtual mode: {path_str}")
+
+                full_path = (self.cwd / path_obj).resolve()
+
+                if not full_path.is_relative_to(self.cwd):
+                    raise ValueError(f"ACCESS DENIED: Path traversal outside working directory: {full_path}")
+
+                resolved_candidates.append((candidate_input, full_path))
+            else:
+                full_path = path_obj.resolve() if path_obj.is_absolute() else (self.cwd / path_obj).resolve()
+                resolved_candidates.append((candidate_input, full_path))
+
+        original_input, original_path = resolved_candidates[0]
+        if original_path.exists():
+            return original_path
+
+        for candidate_input, candidate_path in resolved_candidates[1:]:
+            if candidate_path.exists():
+                logger.info(
+                    "Filesystem path auto-corrected from %r to %r",
+                    original_input,
+                    candidate_input,
+                )
+                return candidate_path
+
+        return original_path
+
+    def _tool_limit(self) -> int:
+        return self.safety_policy.max_tool_output if self.safety_policy else 5000
+
+    def _truncate(self, output: str, source: str = "filesystem") -> str:
+        return truncate_output(output, self._tool_limit(), source=source)
+
+    def _resolve_existing(self, path: str, expected: str) -> Path:
+        target = self._resolve_path(path)
+        if not target.exists():
+            raise FileNotFoundError(path)
+        if expected == "file" and not target.is_file():
+            raise IsADirectoryError(path)
+        if expected == "dir" and not target.is_dir():
+            raise NotADirectoryError(path)
+        return target
+
+    def delete_file(self, path: str) -> str:
+        try:
+            target = self._resolve_existing(path, "file")
+            target.unlink()
+            return f"Success: File {path} deleted."
+        except FileNotFoundError:
+            return format_error(ErrorType.NOT_FOUND, f"File not found: {path}")
+        except IsADirectoryError:
+            return format_error(ErrorType.VALIDATION, f"{path} is a directory. Use safe_delete_directory.")
+        except Exception as e:
+            return format_error(ErrorType.EXECUTION, str(e))
+
+    def delete_directory(self, path: str, recursive: bool = False) -> str:
+        try:
+            target = self._resolve_existing(path, "dir")
+            if recursive:
+                shutil.rmtree(target)
+                return f"Success: Directory {path} deleted recursively."
+            try:
+                next(target.iterdir())
+            except StopIteration:
+                pass
+            else:
+                return format_error(ErrorType.VALIDATION, "Directory is not empty. Set recursive=True to delete it.")
+            target.rmdir()
+            return f"Success: Empty directory {path} deleted."
+        except FileNotFoundError:
+            return format_error(ErrorType.NOT_FOUND, f"Directory not found: {path}")
+        except NotADirectoryError:
+            return format_error(ErrorType.VALIDATION, f"{path} is a file.")
+        except OSError as e:
+            if e.errno == errno.ENOTEMPTY:
+                return format_error(ErrorType.VALIDATION, "Directory is not empty. Set recursive=True to delete it.")
+            return format_error(ErrorType.EXECUTION, str(e))
+        except Exception as e:
+            return format_error(ErrorType.EXECUTION, str(e))
+
 
     def read_file(self, path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT, show_line_numbers: bool = True) -> str:
         try:
@@ -363,8 +450,7 @@ class FilesystemManager:
 
             results = "\n".join(f"{lineno:6}  {line}" for lineno, line in matches)
             output = f"Found {len(matches)} match(es) in '{path}':\n\n{results}"
-            limit = self.safety_policy.max_tool_output if self.safety_policy else 5000
-            return truncate_output(output, limit, source="filesystem")
+            return self._truncate(output)
 
         except Exception as e:
             return format_error(ErrorType.EXECUTION, f"Error searching in file: {e}")
@@ -505,8 +591,7 @@ class FilesystemManager:
                 header_lines.append(f"  Skipped {dirs_skipped_ignored} ignored directory branches.")
 
             output = "\n".join(header_lines) + "\n\n" + "\n".join(all_results)
-            limit = self.safety_policy.max_tool_output if self.safety_policy else 5000
-            return truncate_output(output, limit, source="filesystem")
+            return self._truncate(output)
 
         except Exception as e:
             return format_error(ErrorType.EXECUTION, f"Error searching in directory: {e}")
@@ -622,8 +707,7 @@ class FilesystemManager:
                 header += f" (Truncated to {max_results} max results)"
                 
             output = header + "\n\n" + "\n".join(all_results)
-            limit = self.safety_policy.max_tool_output if self.safety_policy else 5000
-            return truncate_output(output, limit, source="filesystem")
+            return self._truncate(output)
 
         except Exception as e:
             return format_error(ErrorType.EXECUTION, f"Error finding files: {e}")
@@ -655,8 +739,7 @@ class FilesystemManager:
             count = len(results)
             output = f"Directory '{path}':\n" + "\n".join(results) + f"\n\n(Total {count} items)"
             
-            limit = self.safety_policy.max_tool_output if self.safety_policy else 5000
-            return truncate_output(output, limit, source="filesystem")
+            return self._truncate(output)
 
         except Exception as e:
             return format_error(ErrorType.EXECUTION, f"Error listing directory: {e}")
@@ -737,49 +820,122 @@ def tail_file_tool(path: str, lines: int = 50, show_line_numbers: bool = True) -
     """
     return fs_manager.tail_file(path, lines, show_line_numbers)
 
+@tool("safe_delete_file")
+async def safe_delete_file(file_path: str) -> str:
+    """Deletes a file in the working directory.
+    Args:
+        file_path: Relative path to file.
+    """
+    return await asyncio.to_thread(fs_manager.delete_file, file_path)
+
+
+@tool("safe_delete_directory")
+async def safe_delete_directory(dir_path: str, recursive: bool = False) -> str:
+    """Deletes a directory in the working directory.
+    Args:
+        dir_path: Relative path to directory.
+        recursive: Delete non-empty directory recursively.
+    """
+    return await asyncio.to_thread(fs_manager.delete_directory, dir_path, recursive)
+
+_DOWNLOAD_HEADERS = {
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+
+
+def _cleanup_partial_download(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _format_download_http_error(exc: httpx.HTTPStatusError) -> str:
+    status_code = exc.response.status_code
+    reason = exc.response.reason_phrase or "Unknown error"
+    if status_code == 403:
+        return format_error(
+            ErrorType.ACCESS_DENIED,
+            "HTTP 403 - Forbidden. Remote host blocked the download or requires browser-only access.",
+        )
+    if status_code == 404:
+        return format_error(
+            ErrorType.NOT_FOUND,
+            "HTTP 404 - Not Found. Check that the URL points to the direct file, not a landing page.",
+        )
+    return format_error(ErrorType.NETWORK, f"HTTP {status_code} - {reason}")
+
+
+def _format_download_request_error(exc: httpx.RequestError) -> str:
+    detail = str(exc).strip() or type(exc).__name__
+    return format_error(ErrorType.NETWORK, f"Network request failed ({type(exc).__name__}): {detail}")
+
+
 @tool("download_file")
 async def download_file(url: str, filename: Optional[str] = None) -> str:
     """Downloads a file from a URL to the current working directory."""
+    temp_destination: Optional[Path] = None
     try:
         if not filename:
             filename = url.split("/")[-1] or "downloaded_file"
-        
+
         try:
             destination = fs_manager._resolve_path(filename)
         except ValueError as e:
             return format_error(ErrorType.VALIDATION, str(e))
-             
+
+        temp_destination = destination.with_name(destination.name + ".part")
+        _cleanup_partial_download(temp_destination)
+
         # Lazy import avoids loading system/network stack at agent startup.
         from tools.system_tools import get_net_client
 
         client = get_net_client()
         logger.info(f"⬇️ Downloading {url} to {destination}")
-        
+
         try:
-            async with client.client.stream("GET", url, follow_redirects=True) as response:
+            async with client.client.stream(
+                "GET",
+                url,
+                follow_redirects=True,
+                headers=_DOWNLOAD_HEADERS,
+            ) as response:
                 response.raise_for_status()
                 content_length = response.headers.get("content-length")
-                
-                max_size = fs_manager.safety_policy.max_file_size if fs_manager.safety_policy else DEFAULT_MAX_FILE_SIZE
-                if content_length and int(content_length) > max_size:
-                    return format_error(ErrorType.LIMIT_EXCEEDED, f"File too large (>{max_size} bytes). Download aborted.")
 
-                async with aiofiles.open(destination, "wb") as f:
+                max_size = fs_manager.safety_policy.max_file_size if fs_manager.safety_policy else DEFAULT_MAX_FILE_SIZE
+                if content_length:
+                    try:
+                        if int(content_length) > max_size:
+                            return format_error(ErrorType.LIMIT_EXCEEDED, f"File too large (>{max_size} bytes). Download aborted.")
+                    except ValueError:
+                        pass
+
+                async with aiofiles.open(temp_destination, "wb") as f:
                     downloaded = 0
                     async for chunk in response.aiter_bytes():
                         downloaded += len(chunk)
                         if downloaded > max_size:
+                            _cleanup_partial_download(temp_destination)
                             return format_error(ErrorType.LIMIT_EXCEEDED, f"File exceeded max size {max_size}. Aborted.")
                         await f.write(chunk)
-                        
+
+            temp_destination.replace(destination)
             return f"Success: File downloaded to {destination}"
         except httpx.HTTPStatusError as e:
-            return format_error(ErrorType.NETWORK, f"HTTP {e.response.status_code} - {e.response.reason_phrase}")
+            _cleanup_partial_download(temp_destination)
+            return _format_download_http_error(e)
         except httpx.RequestError as e:
-            return format_error(ErrorType.NETWORK, f"Network request failed: {e}")
+            _cleanup_partial_download(temp_destination)
+            return _format_download_request_error(e)
     except Exception as e:
+        if temp_destination is not None:
+            _cleanup_partial_download(temp_destination)
         return format_error(ErrorType.EXECUTION, f"Error downloading file: {e}")
-        
+
+
 @tool("find_file")
 def find_file_tool(name_pattern: str, path: str = ".", max_results: int = 200, max_depth: Optional[int] = None) -> str:
     """Finds files by their name pattern in a directory (recursive).
@@ -792,3 +948,5 @@ def find_file_tool(name_pattern: str, path: str = ".", max_results: int = 200, m
         max_depth: How deep to search (None for unlimited)
     """
     return fs_manager.find_files(path, name_pattern, max_results, max_depth)
+
+

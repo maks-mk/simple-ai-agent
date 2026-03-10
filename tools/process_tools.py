@@ -1,10 +1,16 @@
 import logging
 import subprocess
 import shlex
-import psutil
 import platform
 import atexit
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Union
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 from langchain_core.tools import tool
 
 from core.safety_policy import SafetyPolicy
@@ -18,10 +24,17 @@ _BACKGROUND_PROCESSES: Dict[int, subprocess.Popen] = {}
 
 # Global safety policy
 _SAFETY_POLICY: Optional[SafetyPolicy] = None
+_WORKSPACE_ROOT = Path.cwd().resolve()
+
+_SHELL_META_CHARS = ("&&", "||", "|", ";", ">", "<", "$(", "`")
 
 def set_safety_policy(policy: SafetyPolicy):
     global _SAFETY_POLICY
     _SAFETY_POLICY = policy
+
+def set_working_directory(cwd: str):
+    global _WORKSPACE_ROOT
+    _WORKSPACE_ROOT = Path(cwd).resolve()
 
 def _cleanup_zombies():
     """Removes finished processes from registry."""
@@ -43,15 +56,47 @@ def _shutdown_all():
 
 atexit.register(_shutdown_all)
 
+
+def _resolve_cwd(cwd: str) -> Path:
+    candidate = Path(cwd or ".")
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        resolved = (_WORKSPACE_ROOT / candidate).resolve()
+
+    if not resolved.is_relative_to(_WORKSPACE_ROOT):
+        raise ValueError(f"ACCESS DENIED: cwd must stay inside workspace root {_WORKSPACE_ROOT}")
+    return resolved
+
+
+def _normalize_command(command: Union[str, List[str]]) -> List[str]:
+    if isinstance(command, list):
+        parts = [str(part).strip() for part in command if str(part).strip()]
+        if not parts:
+            raise ValueError("Command list cannot be empty.")
+        return parts
+
+    raw_command = str(command or "").strip()
+    if not raw_command:
+        raise ValueError("Command cannot be empty.")
+    if any(token in raw_command for token in _SHELL_META_CHARS):
+        raise ValueError(
+            "Shell operators are not allowed in run_background_process. Pass an argument list or a simple command only."
+        )
+
+    parts = shlex.split(raw_command, posix=platform.system() != "Windows")
+    if not parts:
+        raise ValueError("Command cannot be empty.")
+    return parts
+
 @tool("run_background_process")
-def run_background_process(command: str, cwd: str = ".") -> str:
+def run_background_process(command: Union[str, List[str]], cwd: str = ".") -> str:
     """
-    Starts a process in the background. Returns PID.
-    Useful for starting servers, watchers, or long-running tasks.
-    
+    Starts a background process with a validated working directory and argv-like command.
+
     Args:
-        command: The shell command to execute.
-        cwd: Working directory (default ".").
+        command: Either a list of command arguments or a simple shell-free command string.
+        cwd: Working directory inside the current workspace (default ".").
     """
     # Clean up dead processes first
     _cleanup_zombies()
@@ -62,34 +107,29 @@ def run_background_process(command: str, cwd: str = ".") -> str:
         return format_error(ErrorType.LIMIT_EXCEEDED, f"Maximum background processes ({limit}) reached.")
 
     try:
-        # Split command safely
+        args = _normalize_command(command)
+        safe_cwd = _resolve_cwd(cwd)
+        popen_kwargs = {
+            "args": args,
+            "cwd": str(safe_cwd),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "shell": False,
+        }
         if platform.system() == "Windows":
-            # On Windows, we often need shell=True for complex commands, 
-            # but for simple executables, shlex might not be perfect.
-            # Using shell=True for flexibility in agent context.
-            process = subprocess.Popen(
-                command, 
-                shell=True, 
-                cwd=cwd, 
-                stdout=subprocess.DEVNULL, 
-                stderr=subprocess.DEVNULL
-            )
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
-            args = shlex.split(command)
-            process = subprocess.Popen(
-                args, 
-                cwd=cwd,
-                stdout=subprocess.DEVNULL, 
-                stderr=subprocess.DEVNULL,
-                start_new_session=True # Detach from parent
-            )
-        
+            popen_kwargs["start_new_session"] = True
+
+        process = subprocess.Popen(**popen_kwargs)
         pid = process.pid
         _BACKGROUND_PROCESSES[pid] = process
         
-        logger.info(f"Background process started: {command} (PID: {pid})")
+        logger.info("Background process started: %s (PID: %s) cwd=%s", args, pid, safe_cwd)
         return f"Success: Process started with PID {pid}."
         
+    except ValueError as e:
+        return format_error(ErrorType.VALIDATION, str(e))
     except Exception as e:
         return format_error(ErrorType.EXECUTION, f"Error starting process: {e}")
 
@@ -114,7 +154,7 @@ def stop_background_process(pid: int) -> str:
             return f"Success: Process {pid} stopped."
             
         # Try to kill by PID even if not in our registry (e.g. found via find_process)
-        if psutil.pid_exists(pid):
+        if psutil is not None and psutil.pid_exists(pid):
             try:
                 p = psutil.Process(pid)
                 p.terminate()
@@ -133,6 +173,8 @@ def find_process_by_port(port: int) -> str:
     Finds a process PID listening on a specific port.
     """
     try:
+        if psutil is None:
+            return format_error(ErrorType.CONFIG, "psutil is required for process inspection tools.")
         for proc in psutil.process_iter(['pid', 'name', 'connections']):
             try:
                 for conn in proc.connections(kind='inet'):

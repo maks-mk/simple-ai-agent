@@ -19,7 +19,7 @@
     "type": "remote",
     "url": "https://mcp.context7.com/mcp",
     "transport": "http",
-    "enabled": false
+    "enabled": true
   },
     "sequential-thinking": {
       "command": "npx",
@@ -37,6 +37,6 @@
       "./pdf_mcp/pdf_server.py"
     ],
     "transport": "stdio",
-    "enabled": true
+    "enabled": false
   }
 }

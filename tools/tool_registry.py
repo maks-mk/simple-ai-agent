@@ -1,15 +1,28 @@
 import asyncio
-import logging
-import json
-import os
+import importlib
 import inspect
-from typing import List, Any, Dict, Union
+import json
+import logging
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Sequence, Union
+
 from langchain_core.tools import BaseTool
 
 from core.config import AgentConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ToolLoaderSpec:
+    name: str
+    enabled: Callable[[AgentConfig], bool]
+    module_name: str
+    tool_names: Sequence[str]
+    configure: Callable[[Any, AgentConfig], None] | None = None
+    optional_tool_names: Sequence[str] = ()
 
 
 class ToolRegistry:
@@ -18,189 +31,119 @@ class ToolRegistry:
     def __init__(self, config: AgentConfig):
         self.config = config
         self.tools: List[BaseTool] = []
-        # Сохраняем список клиентов, чтобы соединения не разрывались GC
         self.mcp_clients = []
 
     async def load_all(self):
-        """Загружает все инструменты в зависимости от конфигурации."""
+        for spec in self._loader_specs():
+            if not spec.enabled(self.config):
+                continue
+            self._load_from_spec(spec)
 
-        # 1. Локальные файловые инструменты (Filesystem v2)
-        if self.config.enable_filesystem_tools:
-            self._load_filesystem_tools()
-        else:
-            # Fallback для старых (если включено OS_TOOLS, но FS выключено)
-            self._load_local_tools()
-
-        # 2. Поисковые инструменты
-        self._load_search_tools()
-
-        # 3. Системные инструменты (информация: IP, RAM, CPU)
-        if self.config.use_system_tools:
-            self._load_system_tools()
-
-        # 4. OS инструменты (активные действия: процессы)
-        if self.config.enable_process_tools:
-            self._load_process_tools()
-
-        # 5. Shell (CLI) инструмент (НОВОЕ)
-        # Требует добавления enable_shell_tool в Config
-        if getattr(self.config, "enable_shell_tool", False):
-            self._load_shell_tool()
-
-        # 6. MCP (Model Context Protocol) инструменты
         if self.config.mcp_config_path.exists():
             await self._load_mcp_tools()
 
-        # logger.info(f"✔ Tools loaded: {[t.name for t in self.tools]}")
+    def _loader_specs(self) -> List[ToolLoaderSpec]:
+        return [
+            ToolLoaderSpec(
+                name="filesystem",
+                enabled=lambda config: config.enable_filesystem_tools,
+                module_name="tools.filesystem",
+                tool_names=(
+                    "read_file_tool",
+                    "write_file_tool",
+                    "edit_file_tool",
+                    "list_directory_tool",
+                    "safe_delete_file",
+                    "safe_delete_directory",
+                    "download_file",
+                    "search_in_file_tool",
+                    "search_in_directory_tool",
+                    "tail_file_tool",
+                    "find_file_tool",
+                ),
+                configure=self._configure_safety,
+            ),
+            ToolLoaderSpec(
+                name="local_delete_fallback",
+                enabled=lambda config: not config.enable_filesystem_tools,
+                module_name="tools.delete_tools",
+                tool_names=("safe_delete_file", "safe_delete_directory"),
+            ),
+            ToolLoaderSpec(
+                name="search",
+                enabled=lambda config: config.enable_search_tools,
+                module_name="tools.search_tools",
+                tool_names=("web_search", "batch_web_search", "fetch_content"),
+                optional_tool_names=("crawl_site",),
+                configure=self._configure_search,
+            ),
+            ToolLoaderSpec(
+                name="system",
+                enabled=lambda config: config.use_system_tools,
+                module_name="tools.system_tools",
+                tool_names=("get_public_ip", "lookup_ip_info", "get_system_info", "get_local_network_info"),
+            ),
+            ToolLoaderSpec(
+                name="process",
+                enabled=lambda config: config.enable_process_tools,
+                module_name="tools.process_tools",
+                tool_names=("run_background_process", "stop_background_process", "find_process_by_port"),
+                configure=self._configure_safety,
+            ),
+            ToolLoaderSpec(
+                name="shell",
+                enabled=lambda config: getattr(config, "enable_shell_tool", False),
+                module_name="tools.local_shell",
+                tool_names=("cli_exec",),
+                configure=self._configure_shell,
+            ),
+        ]
 
-    def _load_filesystem_tools(self):
-        """Загрузка продвинутых инструментов файловой системы."""
+    def _load_from_spec(self, spec: ToolLoaderSpec) -> None:
         try:
-            from tools.filesystem import (
-                read_file_tool,
-                write_file_tool,
-                edit_file_tool,
-                list_directory_tool,
-                download_file,
-                search_in_file_tool,
-                search_in_directory_tool,
-                tail_file_tool,
-                find_file_tool,
-                set_safety_policy,
-            )
-            from tools.delete_tools import safe_delete_file, safe_delete_directory
+            module = importlib.import_module(spec.module_name)
+            if spec.configure:
+                spec.configure(module, self.config)
 
-            # Apply safety policy
-            set_safety_policy(self.config.safety)
-
-            fs_tools = [
-                read_file_tool,
-                write_file_tool,
-                edit_file_tool,
-                list_directory_tool,
-                safe_delete_file,
-                safe_delete_directory,
-                download_file,
-                search_in_file_tool,
-                search_in_directory_tool,
-                tail_file_tool,
-                find_file_tool,
-            ]
-            self.tools.extend(fs_tools)
+            names = list(spec.tool_names)
+            names.extend(name for name in spec.optional_tool_names if hasattr(module, name))
+            self.tools.extend(getattr(module, name) for name in names)
         except Exception as e:
-            logger.exception(f"Failed to load filesystem tools: {e}")
+            logger.exception("Failed to load %s tools: %s", spec.name, e)
 
-    def _load_process_tools(self):
-        """Загрузка инструментов управления процессами."""
-        try:
-            from tools.process_tools import (
-                run_background_process,
-                stop_background_process,
-                find_process_by_port,
-                set_safety_policy,
-            )
+    @staticmethod
+    def _configure_safety(module: Any, config: AgentConfig) -> None:
+        if hasattr(module, "set_safety_policy"):
+            module.set_safety_policy(config.safety)
+        if hasattr(module, "set_working_directory"):
+            module.set_working_directory(str(Path.cwd()))
 
-            set_safety_policy(self.config.safety)
+    @staticmethod
+    def _configure_search(module: Any, config: AgentConfig) -> None:
+        if hasattr(module, "set_safety_policy"):
+            module.set_safety_policy(config.safety)
+        if hasattr(module, "set_runtime_config"):
+            module.set_runtime_config(config)
 
-            proc_tools = [run_background_process, stop_background_process, find_process_by_port]
-            self.tools.extend(proc_tools)
-        except Exception as e:
-            logger.exception(f"Failed to load process tools: {e}")
-
-    def _load_shell_tool(self):
-        """Загрузка инструмента командной строки (cli_exec)."""
-        try:
-            from tools.local_shell import cli_exec, set_safety_policy, set_working_directory
-
-            set_safety_policy(self.config.safety)
-            set_working_directory(str(Path.cwd()))
-
-            self.tools.append(cli_exec)
-            logger.debug("✔ Shell tool (cli_exec) loaded")
-        except Exception as e:
-            logger.exception(f"Failed to load shell tool: {e}")
-
-    def _load_local_tools(self):
-        """Загрузка базовых локальных утилит (Fallback)."""
-        try:
-            from tools.delete_tools import safe_delete_file, safe_delete_directory
-
-            local_tools = [safe_delete_file, safe_delete_directory]
-            self.tools.extend(local_tools)
-
-        except Exception as e:
-            logger.exception(f"Failed to load local tools: {e}")
-
-    def _load_search_tools(self):
-        if not self.config.enable_search_tools:
-            logger.info("Search tools are disabled via config.")
-            return
-
-        try:
-            from tools.search_tools import (
-                web_search,
-                fetch_content,
-                batch_web_search,
-                set_safety_policy,
-                set_runtime_config,
-            )
-            try:
-                from tools.search_tools import crawl_site
-
-                has_crawl = True
-            except ImportError:
-                has_crawl = False
-
-            set_safety_policy(self.config.safety)
-            set_runtime_config(self.config)
-
-            search_tools = [web_search, batch_web_search, fetch_content]
-            if has_crawl:
-                search_tools.append(crawl_site)
-
-            self.tools.extend(search_tools)
-
-        except Exception as e:
-            logger.exception(f"Search tools dependencies missing or failed to load: {e}")
-
-    def _load_system_tools(self):
-        """Загрузка информационных утилит."""
-        try:
-            from tools.system_tools import (
-                get_public_ip,
-                lookup_ip_info,
-                get_system_info,
-                get_local_network_info,
-            )
-
-            system_tools = [get_public_ip, lookup_ip_info, get_system_info, get_local_network_info]
-            self.tools.extend(system_tools)
-        except Exception as e:
-            logger.exception(f"Failed to load system tools: {e}")
+    @staticmethod
+    def _configure_shell(module: Any, config: AgentConfig) -> None:
+        ToolRegistry._configure_safety(module, config)
 
     async def _load_mcp_tools(self):
         try:
-            try:
-                raw_cfg = json.loads(self.config.mcp_config_path.read_text("utf-8"))
-            except json.JSONDecodeError:
-                logger.error(f"❌ Invalid JSON in {self.config.mcp_config_path}")
-                return
-
-            if not isinstance(raw_cfg, dict):
-                logger.error(f"❌ MCP Config must be a dictionary, got {type(raw_cfg).__name__}")
-                return
-
-            raw_cfg = self._expand_env_vars(raw_cfg)
-
-            enabled_servers = []
+            raw_cfg = self._read_mcp_config()
+            enabled_servers = [
+                (name, cfg)
+                for name, cfg in raw_cfg.items()
+                if isinstance(cfg, dict) and cfg.get("enabled", True)
+            ]
             for name, cfg in raw_cfg.items():
                 if not isinstance(cfg, dict):
                     logger.warning(
-                        f"⚠ Skipping invalid config entry '{name}': Expected dict, got {type(cfg).__name__}"
+                        "⚠ Skipping invalid config entry '%s': Expected dict, got %s",
+                        name,
+                        type(cfg).__name__,
                     )
-                    continue
-                if cfg.get("enabled", True):
-                    enabled_servers.append((name, cfg))
 
             if not enabled_servers:
                 logger.debug("No enabled MCP servers in config.")
@@ -231,39 +174,40 @@ class ToolRegistry:
             async def _load_one_server(name: str, cfg: Dict[str, Any]):
                 async with semaphore:
                     try:
-                        server_config = {k: v for k, v in cfg.items() if k in valid_keys}
+                        server_config = {key: value for key, value in cfg.items() if key in valid_keys}
                         client = MultiServerMCPClient({name: server_config})
-                        mcp_tools = await client.get_tools()
-                        return name, client, mcp_tools, None
-                    except Exception as e:  # noqa: PERF203
+                        return name, client, await client.get_tools(), None
+                    except Exception as e:
                         return name, None, None, e
 
-            results = await asyncio.gather(
-                *(_load_one_server(name, cfg) for name, cfg in enabled_servers)
-            )
-
+            results = await asyncio.gather(*(_load_one_server(name, cfg) for name, cfg in enabled_servers))
             for name, client, mcp_tools, err in results:
                 if err is not None:
-                    logger.error(f"❌ MCP Server '{name}' Error: {err}")
+                    logger.error("❌ MCP Server '%s' Error: %s", name, err)
                     continue
 
-                # Keep client alive for tool session lifetime.
                 self.mcp_clients.append(client)
-
                 if mcp_tools:
                     self.tools.extend(mcp_tools)
-                    logger.info(f"✔ MCP Server '{name}': Loaded {len(mcp_tools)} tools")
+                    logger.info("✔ MCP Server '%s': Loaded %s tools", name, len(mcp_tools))
                 else:
-                    logger.warning(f"⚠ MCP Server '{name}': No tools found")
-
+                    logger.warning("⚠ MCP Server '%s': No tools found", name)
         except Exception as e:
             logger.exception(f"Failed to load MCP tools: {e}")
 
+    def _read_mcp_config(self) -> Dict[str, Any]:
+        try:
+            raw_cfg = json.loads(self.config.mcp_config_path.read_text("utf-8"))
+        except json.JSONDecodeError:
+            logger.error(f"❌ Invalid JSON in {self.config.mcp_config_path}")
+            return {}
+
+        if not isinstance(raw_cfg, dict):
+            logger.error(f"❌ MCP Config must be a dictionary, got {type(raw_cfg).__name__}")
+            return {}
+        return self._expand_env_vars(raw_cfg)
+
     def _expand_env_vars(self, data: Union[Dict[str, Any], List[Any], str]) -> Any:
-        """
-        Рекурсивно проходит по структуре (dict/list/str) и подставляет ENV vars.
-        Поддерживает синтаксис ${VAR} или $VAR.
-        """
         if isinstance(data, dict):
             return {k: self._expand_env_vars(v) for k, v in data.items()}
         if isinstance(data, list):
@@ -273,26 +217,22 @@ class ToolRegistry:
         return data
 
     async def cleanup(self):
-        """Cleanup resources (close MCP connections)."""
         for client in self.mcp_clients:
             try:
-                # Пытаемся вызвать close(), если он существует
-                if hasattr(client, "close") and callable(client.close):
-                    if inspect.iscoroutinefunction(client.close):
-                        await client.close()
+                close_method = getattr(client, "aclose", None) or getattr(client, "close", None)
+                if callable(close_method):
+                    if inspect.iscoroutinefunction(close_method):
+                        await close_method()
                     else:
-                        client.close()
-                # Или закрываем через асинхронный контекстный менеджер
+                        close_method()
                 elif hasattr(client, "__aexit__"):
                     try:
                         await client.__aexit__(None, None, None)
                     except Exception as e:
-                        if "MultiServerMCPClient cannot be used as a context manager" in str(e):
-                            pass
-                        else:
-                            raise e
+                        if "MultiServerMCPClient cannot be used as a context manager" not in str(e):
+                            raise
             except Exception as e:
-                logger.error(f"Error closing MCP client: {e}")
+                logger.error("Error closing MCP client: %s", e)
 
         self.mcp_clients.clear()
         logger.info("ToolRegistry cleanup completed.")

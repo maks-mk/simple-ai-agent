@@ -309,6 +309,60 @@ class PDFGenerator:
         ]))
         return t
 
+    def _flush_table_buffer(self, story: List[Flowable], table_buf: List[str]) -> None:
+        if not table_buf:
+            return
+        table = self._create_table(table_buf)
+        if table:
+            story.append(table)
+            story.append(Spacer(1, 10))
+        table_buf.clear()
+
+    def _handle_heading(
+        self,
+        story: List[Flowable],
+        stripped: str,
+        title_norm: str,
+        title_deduped: bool,
+    ) -> tuple[bool, bool]:
+        inline = self._inline
+        styles = self.styles
+        for prefix, style_key, skip in HEADING_RULES:
+            if not stripped.startswith(prefix):
+                continue
+
+            heading_text = stripped[skip:].strip()
+            heading_norm = self._normalize_for_compare(heading_text)
+            if prefix == "# " and not title_deduped and self._is_title_duplicate(title_norm, heading_norm):
+                return True, True
+
+            story.append(Paragraph(inline(heading_text), styles[style_key]))
+            return True, title_deduped
+        return False, title_deduped
+
+    def _handle_special_line(self, story: List[Flowable], stripped: str) -> bool:
+        styles = self.styles
+        inline = self._inline
+
+        if HORIZONTAL_RULE_RE.match(stripped):
+            story.append(SeparatorLine())
+            return True
+
+        img_match = MARKDOWN_IMAGE_RE.match(stripped)
+        if img_match:
+            alt, image_path_str = img_match.groups()
+            self._append_image_block(story, alt, Path(image_path_str).resolve())
+            return True
+
+        if stripped.startswith("> "):
+            story.append(Paragraph(inline(stripped[2:]), styles["quote"]))
+            return True
+
+        if stripped.startswith(("- ", "* ")):
+            story.append(Paragraph(f"• {inline(stripped[2:])}", styles["bullet"]))
+            return True
+
+        return False
     def create_pdf(self, output_path: Path, title: str, content: str) -> str:
         """Generates a PDF file from markdown content."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -316,20 +370,9 @@ class PDFGenerator:
         styles = self.styles
         inline = self._inline
         story: List[Flowable] = [Paragraph(inline(title), styles["title"]), Spacer(1, 10)]
-
         in_code = False
         code_lines: List[str] = []
         table_buf: List[str] = []
-
-        def flush_table_buffer() -> None:
-            if not table_buf:
-                return
-            table = self._create_table(table_buf)
-            if table:
-                story.append(table)
-                story.append(Spacer(1, 10))
-            table_buf.clear()
-
         title_norm = self._normalize_for_compare(title)
         title_deduped = False
 
@@ -342,7 +385,7 @@ class PDFGenerator:
                     code_lines.clear()
                     in_code = False
                 else:
-                    flush_table_buffer()
+                    self._flush_table_buffer(story, table_buf)
                     in_code = True
                 continue
 
@@ -353,51 +396,20 @@ class PDFGenerator:
             if stripped.startswith("|"):
                 table_buf.append(stripped)
                 continue
-            flush_table_buffer()
 
+            self._flush_table_buffer(story, table_buf)
             if not stripped:
                 continue
-
-            if HORIZONTAL_RULE_RE.match(stripped):
-                story.append(SeparatorLine())
+            if self._handle_special_line(story, stripped):
                 continue
 
-            img_match = MARKDOWN_IMAGE_RE.match(stripped)
-            if img_match:
-                alt, image_path_str = img_match.groups()
-                self._append_image_block(story, alt, Path(image_path_str).resolve())
-                continue
-
-            matched_heading = False
-            for prefix, style_key, skip in HEADING_RULES:
-                if not stripped.startswith(prefix):
-                    continue
-
-                heading_text = stripped[skip:].strip()
-                heading_norm = self._normalize_for_compare(heading_text)
-                if prefix == "# " and not title_deduped and self._is_title_duplicate(title_norm, heading_norm):
-                    title_deduped = True
-                    matched_heading = True
-                    break
-
-                story.append(Paragraph(inline(heading_text), styles[style_key]))
-                matched_heading = True
-                break
-
+            matched_heading, title_deduped = self._handle_heading(story, stripped, title_norm, title_deduped)
             if matched_heading:
-                continue
-
-            if stripped.startswith("> "):
-                story.append(Paragraph(inline(stripped[2:]), styles["quote"]))
-                continue
-
-            if stripped.startswith(("- ", "* ")):
-                story.append(Paragraph(f"• {inline(stripped[2:])}", styles["bullet"]))
                 continue
 
             story.append(Paragraph(inline(stripped), styles["body"]))
 
-        flush_table_buffer()
+        self._flush_table_buffer(story, table_buf)
 
         SimpleDocTemplate(
             str(output_path),
@@ -879,94 +891,107 @@ def _run_tool(
         raise PDFProcessingError(f"{error_prefix}: {e}")
 
 
-@mcp.tool()
-def pdf_extract_text(pdf_path: str, page_start: int = 1, page_end: Optional[int] = None, sort: bool = True) -> str:
-    """[PDF ONLY] Extracts text from a .pdf file."""
-    return _run_tool(PDFProcessor.extract_text, "Extraction failed", pdf_path, page_start, page_end, sort)
+def _register_mcp_tool(name: str, doc: str, runner: Callable[..., str]) -> None:
+    runner.__name__ = name
+    runner.__doc__ = doc
+    mcp.tool()(runner)
 
 
-@mcp.tool()
-def pdf_create(output_path: str, title: str, content: str) -> str:
-    """[PDF ONLY] Creates a new .pdf file from Markdown text."""
-    def _create() -> str:
-        generator = PDFGenerator()
-        return generator.create_pdf(Path(output_path).resolve(), title, content)
+def _register_pdf_tools() -> None:
+    tool_specs = [
+        (
+            "pdf_extract_text",
+            "[PDF ONLY] Extracts text from a .pdf file.",
+            lambda pdf_path, page_start=1, page_end=None, sort=True: _run_tool(
+                PDFProcessor.extract_text,
+                "Extraction failed",
+                pdf_path,
+                page_start,
+                page_end,
+                sort,
+            ),
+        ),
+        (
+            "pdf_create",
+            "[PDF ONLY] Creates a new .pdf file from Markdown text.",
+            lambda output_path, title, content: _run_tool(
+                lambda: PDFGenerator().create_pdf(Path(output_path).resolve(), title, content),
+                "Failed to create PDF",
+                log_error=True,
+            ),
+        ),
+        (
+            "pdf_search",
+            "[PDF ONLY] Searches for text. Returns page number, occurrence, rect, context.",
+            lambda pdf_path, query, case_sensitive=False: _run_tool(
+                PDFProcessor.search_text,
+                "Search failed",
+                pdf_path,
+                query,
+                case_sensitive,
+            ),
+        ),
+        (
+            "pdf_edit_text",
+            "[PDF ONLY] Replaces or deletes EXISTING text on a specific page.",
+            lambda pdf_path, page_num, old_text, new_text, output_path=None, occurrence=0: _run_tool(
+                PDFProcessor.edit_text,
+                "Edit failed",
+                pdf_path,
+                page_num,
+                old_text,
+                new_text,
+                output_path,
+                occurrence,
+            ),
+        ),
+        (
+            "pdf_add_text",
+            "[PDF ONLY] Adds NEW text at a specific position on a page.",
+            lambda pdf_path, page_num, text, x=56.0, y=None, fontsize=10.0, output_path=None: _run_tool(
+                PDFProcessor.add_text,
+                "Add text failed",
+                pdf_path,
+                page_num,
+                text,
+                x,
+                y,
+                fontsize,
+                output_path,
+            ),
+        ),
+        (
+            "pdf_merge",
+            "[PDF ONLY] Merges multiple .pdf files.",
+            lambda pdf_paths, output_path: _run_tool(PDFProcessor.merge_pdfs, "Merge failed", pdf_paths, output_path),
+        ),
+        (
+            "pdf_split",
+            "[PDF ONLY] Splits PDF by ranges (e.g. [\"1-3\", \"5\"]).",
+            lambda pdf_path, ranges, output_dir: _run_tool(PDFProcessor.split_pdf, "Split failed", pdf_path, ranges, output_dir),
+        ),
+        (
+            "pdf_rotate_pages",
+            "[PDF ONLY] Rotates pages by 90/180/270.",
+            lambda pdf_path, rotation, pages=None: _run_tool(PDFProcessor.rotate_pages, "Rotation failed", pdf_path, rotation, pages),
+        ),
+        (
+            "pdf_extract_images",
+            "[PDF ONLY] Extracts images to ZIP.",
+            lambda pdf_path: _run_tool(PDFProcessor.extract_images, "Image extraction failed", pdf_path),
+        ),
+        (
+            "pdf_from_images",
+            "[PDF ONLY] Creates PDF from images.",
+            lambda image_paths, output_path: _run_tool(PDFProcessor.images_to_pdf, "Conversion failed", image_paths, output_path),
+        ),
+    ]
 
-    return _run_tool(_create, "Failed to create PDF", log_error=True)
+    for name, doc, runner in tool_specs:
+        _register_mcp_tool(name, doc, runner)
 
 
-@mcp.tool()
-def pdf_search(pdf_path: str, query: str, case_sensitive: bool = False) -> str:
-    """[PDF ONLY] Searches for text. Returns page number, occurrence, rect, context."""
-    return _run_tool(PDFProcessor.search_text, "Search failed", pdf_path, query, case_sensitive)
-
-
-@mcp.tool()
-def pdf_edit_text(
-    pdf_path: str,
-    page_num: int,
-    old_text: str,
-    new_text: str,
-    output_path: Optional[str] = None,
-    occurrence: int = 0,
-) -> str:
-    """
-    [PDF ONLY] Replaces or deletes EXISTING text on a specific page.
-    """
-    return _run_tool(
-        PDFProcessor.edit_text,
-        "Edit failed",
-        pdf_path,
-        page_num,
-        old_text,
-        new_text,
-        output_path,
-        occurrence,
-    )
-
-
-@mcp.tool()
-def pdf_add_text(
-    pdf_path: str,
-    page_num: int,
-    text: str,
-    x: float = 56.0,
-    y: Optional[float] = None,
-    fontsize: float = 10.0,
-    output_path: Optional[str] = None,
-) -> str:
-    """[PDF ONLY] Adds NEW text at a specific position on a page."""
-    return _run_tool(PDFProcessor.add_text, "Add text failed", pdf_path, page_num, text, x, y, fontsize, output_path)
-
-
-@mcp.tool()
-def pdf_merge(pdf_paths: List[str], output_path: str) -> str:
-    """[PDF ONLY] Merges multiple .pdf files."""
-    return _run_tool(PDFProcessor.merge_pdfs, "Merge failed", pdf_paths, output_path)
-
-
-@mcp.tool()
-def pdf_split(pdf_path: str, ranges: List[str], output_dir: str) -> str:
-    """[PDF ONLY] Splits PDF by ranges (e.g. ["1-3", "5"])."""
-    return _run_tool(PDFProcessor.split_pdf, "Split failed", pdf_path, ranges, output_dir)
-
-
-@mcp.tool()
-def pdf_rotate_pages(pdf_path: str, rotation: int, pages: Optional[List[int]] = None) -> str:
-    """[PDF ONLY] Rotates pages by 90/180/270."""
-    return _run_tool(PDFProcessor.rotate_pages, "Rotation failed", pdf_path, rotation, pages)
-
-
-@mcp.tool()
-def pdf_extract_images(pdf_path: str) -> str:
-    """[PDF ONLY] Extracts images to ZIP."""
-    return _run_tool(PDFProcessor.extract_images, "Image extraction failed", pdf_path)
-
-
-@mcp.tool()
-def pdf_from_images(image_paths: List[str], output_path: str) -> str:
-    """[PDF ONLY] Creates PDF from images."""
-    return _run_tool(PDFProcessor.images_to_pdf, "Conversion failed", image_paths, output_path)
+_register_pdf_tools()
 
 
 if __name__ == "__main__":
@@ -993,4 +1018,6 @@ if __name__ == "__main__":
         # Перехватываем нажатие Ctrl+C
         logger.info("Received shutdown signal (Ctrl+C). Shutting down gracefully...")
         sys.exit(0)
+
+
 

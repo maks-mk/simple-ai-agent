@@ -1,6 +1,10 @@
+import logging
 from typing import Any
 from rich.console import Console
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+
+logger = logging.getLogger("agent")
+
 
 def repair_session_if_needed(agent_app: Any, thread_id: str, console: Console):
     """
@@ -40,7 +44,11 @@ def repair_session_if_needed(agent_app: Any, thread_id: str, console: Console):
             # Identify missing responses
             missing_tool_calls = []
             for tc in last_ai_msg.tool_calls:
-                if tc["id"] not in existing_tool_outputs:
+                tool_call_id = tc.get("id")
+                if not tool_call_id:
+                    logger.warning("Session repair skipped malformed tool call without id in thread %s", thread_id)
+                    continue
+                if tool_call_id not in existing_tool_outputs:
                     missing_tool_calls.append(tc)
             
             if missing_tool_calls:
@@ -58,5 +66,4 @@ def repair_session_if_needed(agent_app: Any, thread_id: str, console: Console):
                 console.print("[dim]✔ History repaired (filled gaps). Ready for new input.[/]")
                 
     except Exception as e:
-        # Silently fail or log debug if state repair fails, to not block the user
-        pass
+        logger.debug("Session repair skipped due to error: %s", e)

@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.messages import HumanMessage
 
 from agent import create_agent_workflow
@@ -311,7 +311,7 @@ class CriticGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("INTERNAL TOOL PROTOCOL ERROR", str(response.content))
         self.assertEqual(result["critic_source"], "agent")
 
-    async def test_tool_errors_use_critic_feedback_instead_of_fake_user_message(self):
+    async def test_tool_errors_no_longer_store_fake_critic_feedback(self):
         config = self._make_config(model_supports_tools=True)
         failing_tool = FakeTool("demo_tool", "ERROR[EXECUTION]: boom")
         nodes = AgentNodes(
@@ -332,7 +332,67 @@ class CriticGraphTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result["messages"]), 1)
         self.assertEqual(result["messages"][0].name, "demo_tool")
-        self.assertEqual(result["critic_feedback"], "SYSTEM HINT: The previous tool execution failed. Review the error, correct your arguments, or use a different tool. Act immediately.")
+        self.assertEqual(result["critic_feedback"], "")
+
+    async def test_agent_context_includes_unresolved_tool_failure_system_message(self):
+        config = self._make_config(model_supports_tools=True)
+        failing_tool = FakeTool("demo_tool", "ERROR[EXECUTION]: boom")
+        agent_llm = FakeLLM([AIMessage(content="Не удалось завершить задачу из-за ошибки инструмента.")])
+        nodes = AgentNodes(
+            config=config,
+            llm=FakeLLM([]),
+            tools=[failing_tool],
+            llm_with_tools=agent_llm,
+        )
+
+        await nodes.agent_node(
+            {
+                **self._initial_state("Почини ошибку"),
+                "messages": [
+                    HumanMessage(content="Почини ошибку"),
+                    AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "x"}, "id": "tc-10"}]),
+                    ToolMessage(content="ERROR[EXECUTION]: boom", tool_call_id="tc-10", name="demo_tool"),
+                ],
+            }
+        )
+
+        unresolved_messages = [
+            str(message.content)
+            for message in agent_llm.invocations[0]
+            if isinstance(message, SystemMessage) and "UNRESOLVED TOOL FAILURE" in str(message.content)
+        ]
+        self.assertTrue(unresolved_messages)
+
+    async def test_unresolved_tool_error_blocks_fake_success_until_agent_reports_blocker(self):
+        failing_tool = FakeTool("demo_tool", "ERROR[EXECUTION]: boom")
+        app, agent_llm, critic_llm = self._build_app(
+            agent_responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "demo_tool", "args": {"action": "x"}, "id": "tc-11"}],
+                ),
+                AIMessage(content="Файл успешно обработан и всё готово."),
+                AIMessage(content="Не удалось завершить задачу: инструмент завершился с ошибкой."),
+            ],
+            critic_responses=[
+                AIMessage(content="STATUS: FINISHED\nREASON: Looks complete.\nNEXT_STEP: NONE"),
+                AIMessage(content="STATUS: FINISHED\nREASON: Honest blocker report delivered.\nNEXT_STEP: NONE"),
+            ],
+            tools=[failing_tool],
+        )
+
+        result = await app.ainvoke(self._initial_state("Обработай файл"), config={"recursion_limit": 36})
+
+        self.assertEqual(result["messages"][-1].content, "Не удалось завершить задачу: инструмент завершился с ошибкой.")
+        self.assertEqual(result["critic_status"], "FINISHED")
+        self.assertEqual(len(agent_llm.invocations), 3)
+        self.assertEqual(len(critic_llm.invocations), 2)
+        final_hint_messages = [
+            str(message.content)
+            for message in agent_llm.invocations[2]
+            if isinstance(message, SystemMessage) and "UNRESOLVED TOOL FAILURE" in str(message.content)
+        ]
+        self.assertTrue(final_hint_messages)
 
 
 if __name__ == "__main__":

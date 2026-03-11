@@ -172,11 +172,20 @@ class AgentNodes:
         summary: str,
         critic_feedback: str,
         tools_available: bool,
+        unresolved_tool_error: str,
     ) -> List[BaseMessage]:
         sanitized_messages = self._sanitize_messages_for_model(messages)
         full_context: List[BaseMessage] = [
             self._build_system_message(summary, tools_available=tools_available)
         ]
+        if unresolved_tool_error:
+            full_context.append(
+                SystemMessage(
+                    content=constants.UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE.format(
+                        error_summary=unresolved_tool_error
+                    )
+                )
+            )
         if critic_feedback:
             full_context.append(
                 SystemMessage(
@@ -308,9 +317,16 @@ class AgentNodes:
         summary = state.get("summary", "")
         critic_feedback = (state.get("critic_feedback") or "").strip()
         current_task = state.get("current_task") or self._derive_current_task(messages)
+        unresolved_tool_error = self._get_unresolved_tool_error(messages)
 
         tools_available = bool(self.tools) and self.config.model_supports_tools
-        full_context = self._build_agent_context(messages, summary, critic_feedback, tools_available)
+        full_context = self._build_agent_context(
+            messages,
+            summary,
+            critic_feedback,
+            tools_available,
+            unresolved_tool_error,
+        )
         response = await self._invoke_llm_with_retry(self.llm_with_tools, full_context)
         return self._build_agent_result(response, current_task, tools_available)
 
@@ -322,10 +338,12 @@ class AgentNodes:
         summary = state.get("summary", "")
         critic_source = (state.get("critic_source") or "agent").strip().lower()
         trace = self._format_trace_for_critic(messages)
+        unresolved_tool_error = self._get_unresolved_tool_error(messages) or "None."
 
         prompt = constants.CRITIC_PROMPT_TEMPLATE.format(
             current_task=current_task or "No explicit task provided.",
             summary=summary or "No prior summary.",
+            unresolved_tool_error=unresolved_tool_error,
             source=critic_source or "agent",
             trace=trace,
         )
@@ -340,6 +358,13 @@ class AgentNodes:
             )
         else:
             status, reason, next_step = parsed
+
+        status, reason, next_step = self._apply_unresolved_tool_error_guard(
+            status,
+            reason,
+            next_step,
+            messages,
+        )
 
         return {
             "critic_status": status,
@@ -385,11 +410,10 @@ class AgentNodes:
                 final_messages.append(tool_msg)
                 has_error = has_error or had_error
 
-        reflection_feedback = constants.REFLECTION_PROMPT if has_error and not self.config.strict_mode else ""
         return {
             "messages": final_messages,
             "critic_source": "tools",
-            "critic_feedback": reflection_feedback,
+            "critic_feedback": "",
         }
 
     def _can_parallelize_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> bool:
@@ -453,6 +477,95 @@ class AgentNodes:
         steps = state.get("steps", 0)
         if steps < 0:
             logger.error(f"INVARIANT VIOLATION: steps ({steps}) < 0")
+
+    def _get_unresolved_tool_error(self, messages: List[BaseMessage]) -> str:
+        last_error_index = -1
+        for index, message in enumerate(messages):
+            if isinstance(message, ToolMessage) and is_tool_message_error(message):
+                last_error_index = index
+
+        if last_error_index == -1:
+            return ""
+
+        for message in messages[last_error_index + 1 :]:
+            if isinstance(message, ToolMessage) and not is_tool_message_error(message):
+                return ""
+
+        block_start = last_error_index
+        while block_start > 0 and isinstance(messages[block_start - 1], ToolMessage):
+            block_start -= 1
+
+        error_lines: List[str] = []
+        for message in messages[block_start:]:
+            if not isinstance(message, ToolMessage):
+                break
+            if not is_tool_message_error(message):
+                continue
+            label = f"tool[{message.name or 'unknown'}]"
+            error_lines.append(f"{label}: {compact_text(stringify_content(message.content), 320)}")
+
+        return "\n".join(error_lines[:3]).strip()
+
+    def _assistant_acknowledges_unresolved_tool_error(self, text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        if not normalized:
+            return False
+
+        failure_markers = (
+            "не удалось",
+            "не смог",
+            "не могу",
+            "не получилось",
+            "ошибка",
+            "сбой",
+            "не завершил",
+            "не завершена",
+            "не выполнен",
+            "не выполнена",
+            "не удалось проверить",
+            "не удалось подтвердить",
+            "cannot",
+            "can't",
+            "could not",
+            "unable",
+            "failed",
+            "error",
+            "blocker",
+        )
+        return any(marker in normalized for marker in failure_markers)
+
+    def _apply_unresolved_tool_error_guard(
+        self,
+        status: str,
+        reason: str,
+        next_step: str,
+        messages: List[BaseMessage],
+    ) -> Tuple[str, str, str]:
+        unresolved_tool_error = self._get_unresolved_tool_error(messages)
+        if not unresolved_tool_error:
+            return status, reason, next_step
+
+        last_ai = self._get_last_ai_message(messages)
+        if not last_ai:
+            return (
+                "INCOMPLETE",
+                "An unresolved tool failure remains without any assistant follow-up.",
+                "address the failed tool step or explain the blocker honestly",
+            )
+
+        last_text = stringify_content(last_ai.content)
+        if self._assistant_acknowledges_unresolved_tool_error(last_text):
+            return (
+                "FINISHED",
+                "The assistant explicitly reported the unresolved tool failure to the user.",
+                "NONE",
+            )
+
+        return (
+            "INCOMPLETE",
+            "An unresolved tool failure was not addressed in the latest assistant response.",
+            "fix the failed tool step or clearly report the blocker to the user",
+        )
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         # Быстрый поиск за O(1)

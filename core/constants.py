@@ -26,12 +26,22 @@ REFLECTION_PROMPT = (
     "Act immediately."
 )
 
+UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE = (
+    "UNRESOLVED TOOL FAILURE:\n"
+    "{error_summary}\n\n"
+    "Do not claim success, completion, or verified characteristics unless you have actually resolved this "
+    "with later successful tool results. Either retry with corrected arguments, use another tool, "
+    "or clearly explain the blocker to the user."
+)
+
 CRITIC_PROMPT_TEMPLATE = (
     "You are Critic, an internal verification node for an autonomous AI agent.\n"
     "Decide whether the user's task is practically completed based on the task, recent actions, and tool results.\n"
     "Focus on task completion, not on perfect factual certainty.\n"
     "Return FINISHED when the requested artifact, answer, or action appears completed and there are no explicit failures or clearly pending steps.\n"
     "Return INCOMPLETE only when something obvious is still missing, failed, or the agent clearly indicates more work remains.\n"
+    "Never return FINISHED for an unresolved tool failure unless the assistant explicitly explains the blocker honestly "
+    "or later successful tool results have resolved it.\n"
     "Do not require extra verification unless the user explicitly asked for verification, testing, or proof.\n"
     "Do not answer the user. Do not call tools. Return exactly three lines:\n"
     "STATUS: FINISHED or INCOMPLETE\n"
@@ -41,6 +51,8 @@ CRITIC_PROMPT_TEMPLATE = (
     "{current_task}\n\n"
     "Conversation summary:\n"
     "{summary}\n\n"
+    "Unresolved tool error summary:\n"
+    "{unresolved_tool_error}\n\n"
     "Latest source before critic: {source}\n\n"
     "Recent trace:\n"
     "{trace}"

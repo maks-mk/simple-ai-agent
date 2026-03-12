@@ -5,8 +5,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from rich import print as rprint
-
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -17,10 +15,14 @@ from langchain_core.messages import (
 )
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langgraph.types import interrupt
 
 from core.state import AgentState
 from core.config import AgentConfig
 from core import constants
+from core.run_logger import JsonlRunLogger
+from core.tool_policy import ToolMetadata, default_tool_metadata
+from core.tool_results import parse_tool_execution_result
 from core.validation import validate_tool_result
 from core.utils import truncate_output
 from core.errors import format_error, ErrorType
@@ -31,7 +33,16 @@ logger = logging.getLogger("agent")
 
 
 class AgentNodes:
-    __slots__ = ("config", "llm", "tools", "llm_with_tools", "tools_map", "_cached_base_prompt")
+    __slots__ = (
+        "config",
+        "llm",
+        "tools",
+        "llm_with_tools",
+        "tools_map",
+        "tool_metadata",
+        "run_logger",
+        "_cached_base_prompt",
+    )
 
     # Only these tools are allowed to run in parallel in a single tool-call batch.
     # Any unknown or mutating tool keeps sequential execution for safety.
@@ -74,6 +85,8 @@ class AgentNodes:
         llm: BaseChatModel,
         tools: List[BaseTool],
         llm_with_tools: Optional[BaseChatModel] = None,
+        tool_metadata: Optional[Dict[str, ToolMetadata]] = None,
+        run_logger: Optional[JsonlRunLogger] = None,
     ):
         self.config = config
         self.llm = llm
@@ -82,9 +95,33 @@ class AgentNodes:
 
         # Оптимизация: O(1) доступ к инструментам вместо O(N) перебора списка
         self.tools_map = {t.name: t for t in tools}
+        self.tool_metadata = tool_metadata or {}
+        self.run_logger = run_logger
 
         # Оптимизация: кэширование базового промпта (чтобы не читать с диска на каждый шаг)
         self._cached_base_prompt: Optional[str] = None
+
+    def _log_run_event(self, state: AgentState | None, event_type: str, **payload: Any) -> None:
+        if not self.run_logger:
+            return
+        session_id = None if state is None else state.get("session_id")
+        self.run_logger.log_event(session_id, event_type, **payload)
+
+    def _metadata_for_tool(self, tool_name: str) -> ToolMetadata:
+        return self.tool_metadata.get(tool_name, default_tool_metadata(tool_name))
+
+    def _tool_is_read_only(self, tool_name: str) -> bool:
+        metadata = self._metadata_for_tool(tool_name)
+        return metadata.read_only and not metadata.mutating and not metadata.destructive
+
+    def _tool_requires_approval(self, tool_name: str) -> bool:
+        if not self.config.enable_approvals:
+            return False
+        metadata = self._metadata_for_tool(tool_name)
+        return metadata.requires_approval or metadata.destructive or metadata.mutating
+
+    def tool_calls_require_approval(self, tool_calls: List[Dict[str, Any]]) -> bool:
+        return any(self._tool_requires_approval((tool_call.get("name") or "unknown_tool")) for tool_call in tool_calls)
 
     # --- NODE: SUMMARIZE ---
 
@@ -146,8 +183,13 @@ class AgentNodes:
 
             delete_msgs = [RemoveMessage(id=m.id) for m in to_summarize if m.id]
             logger.info(f"🧹 Summary: Removed {len(delete_msgs)} messages. Generated new summary.")
-
-            rprint("---- Автоматическое сжатие контекста ----")
+            self._log_run_event(
+                state,
+                "summary_compacted",
+                estimated_tokens=estimated_tokens,
+                removed_messages=len(delete_msgs),
+                summarized_messages=len(to_summarize),
+            )
 
             return {"summary": res.content, "messages": delete_msgs}
         except Exception as e:
@@ -178,6 +220,9 @@ class AgentNodes:
         full_context: List[BaseMessage] = [
             self._build_system_message(summary, tools_available=tools_available)
         ]
+        safety_overlay = self._build_safety_overlay(tools_available=tools_available)
+        if safety_overlay:
+            full_context.append(SystemMessage(content=safety_overlay))
         if unresolved_tool_error:
             full_context.append(
                 SystemMessage(
@@ -219,6 +264,20 @@ class AgentNodes:
             sanitized.append(message)
         return sanitized
 
+    def _build_safety_overlay(self, tools_available: bool) -> str:
+        if not tools_available:
+            return ""
+        overlay_lines: List[str] = []
+        if self.config.enable_approvals:
+            overlay_lines.append(
+                "SAFETY POLICY: Mutating or destructive tools may require explicit user approval before execution."
+            )
+        if self.config.enable_shell_tool:
+            overlay_lines.append(
+                "SAFETY POLICY: Shell execution is high risk. Prefer safer project-local tools whenever possible."
+            )
+        return "\n".join(overlay_lines).strip()
+
     def _build_agent_result(
         self,
         response: AIMessage,
@@ -259,6 +318,9 @@ class AgentNodes:
             "critic_feedback": "",
             "critic_status": "",
             "critic_source": "" if has_tool_calls else "agent",
+            "pending_approval": None,
+            "last_tool_error": "",
+            "last_tool_result": "",
             **token_usage_update,
         }
 
@@ -318,6 +380,13 @@ class AgentNodes:
         critic_feedback = (state.get("critic_feedback") or "").strip()
         current_task = state.get("current_task") or self._derive_current_task(messages)
         unresolved_tool_error = self._get_unresolved_tool_error(messages)
+        self._log_run_event(
+            state,
+            "agent_node_start",
+            run_id=state.get("run_id", ""),
+            step=state.get("steps", 0),
+            current_task=current_task,
+        )
 
         tools_available = bool(self.tools) and self.config.model_supports_tools
         full_context = self._build_agent_context(
@@ -327,8 +396,21 @@ class AgentNodes:
             tools_available,
             unresolved_tool_error,
         )
-        response = await self._invoke_llm_with_retry(self.llm_with_tools, full_context)
-        return self._build_agent_result(response, current_task, tools_available)
+        response = await self._invoke_llm_with_retry(
+            self.llm_with_tools,
+            full_context,
+            state=state,
+            node_name="agent",
+        )
+        result = self._build_agent_result(response, current_task, tools_available)
+        self._log_run_event(
+            state,
+            "agent_node_end",
+            run_id=state.get("run_id", ""),
+            tool_calls=len(getattr(response, "tool_calls", []) or []),
+            content_preview=compact_text(stringify_content(response.content), 240),
+        )
+        return result
 
     # --- NODE: CRITIC ---
 
@@ -348,7 +430,12 @@ class AgentNodes:
             trace=trace,
         )
 
-        response = await self._invoke_llm_with_retry(self.llm, [SystemMessage(content=prompt)])
+        response = await self._invoke_llm_with_retry(
+            self.llm,
+            [SystemMessage(content=prompt)],
+            state=state,
+            node_name="critic",
+        )
         parsed = self._parse_critic_response(str(response.content))
 
         if not parsed:
@@ -365,12 +452,88 @@ class AgentNodes:
             next_step,
             messages,
         )
+        self._log_run_event(
+            state,
+            "critic_verdict",
+            run_id=state.get("run_id", ""),
+            status=status,
+            reason=reason,
+            next_step=next_step,
+            source=critic_source,
+        )
 
         return {
             "critic_status": status,
             "critic_feedback": self._build_critic_feedback(status, reason, next_step, critic_source),
             "current_task": current_task,
         }
+
+    async def approval_node(self, state: AgentState):
+        messages = state.get("messages", [])
+        if not messages:
+            return {"pending_approval": None}
+
+        last_msg = messages[-1]
+        if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
+            return {"pending_approval": None}
+
+        protected_calls = []
+        for tool_call in last_msg.tool_calls:
+            tool_name = tool_call.get("name") or "unknown_tool"
+            if not self._tool_requires_approval(tool_name):
+                continue
+            metadata = self._metadata_for_tool(tool_name)
+            protected_calls.append(
+                {
+                    "id": tool_call.get("id") or "",
+                    "name": tool_name,
+                    "args": tool_call.get("args") or {},
+                    "policy": metadata.to_dict(),
+                }
+            )
+
+        if not protected_calls:
+            return {"pending_approval": None}
+
+        payload = {
+            "kind": "tool_approval",
+            "message": "Approve protected tool execution?",
+            "tools": protected_calls,
+            "run_id": state.get("run_id", ""),
+            "session_id": state.get("session_id", ""),
+        }
+        self._log_run_event(
+            state,
+            "approval_requested",
+            run_id=state.get("run_id", ""),
+            tool_names=[tool["name"] for tool in protected_calls],
+        )
+        decision = interrupt(payload)
+        approved = self._approval_decision_is_approved(decision)
+        approval_state = {
+            "approved": approved,
+            "decision": decision,
+            "tool_call_ids": [tool["id"] for tool in protected_calls if tool["id"]],
+            "tool_names": [tool["name"] for tool in protected_calls],
+        }
+        self._log_run_event(
+            state,
+            "approval_resolved",
+            run_id=state.get("run_id", ""),
+            approved=approved,
+            tool_names=approval_state["tool_names"],
+        )
+        return {"pending_approval": approval_state}
+
+    def _approval_decision_is_approved(self, decision: Any) -> bool:
+        if isinstance(decision, bool):
+            return decision
+        if isinstance(decision, dict):
+            if "approved" in decision:
+                return bool(decision.get("approved"))
+            action = str(decision.get("action", "")).strip().lower()
+            return action in {"approve", "approved", "yes", "y"}
+        return bool(decision)
 
     # --- NODE: TOOLS ---
 
@@ -385,6 +548,9 @@ class AgentNodes:
 
         final_messages: List[ToolMessage] = []
         has_error = False
+        last_error = ""
+        last_result = ""
+        approval_state = state.get("pending_approval") or {}
 
         # Оптимизация: собираем историю вызовов один раз, а не для каждого инструмента.
         # ВАЖНО: исключаем последний AI message, чтобы текущий вызов не считался "повтором".
@@ -399,32 +565,48 @@ class AgentNodes:
 
         if self._can_parallelize_tool_calls(tool_calls):
             processed = await asyncio.gather(
-                *(self._process_tool_call(tool_call, recent_calls) for tool_call in tool_calls)
+                *(self._process_tool_call(tool_call, recent_calls, state, approval_state) for tool_call in tool_calls)
             )
             for tool_msg, had_error in processed:
                 final_messages.append(tool_msg)
                 has_error = has_error or had_error
+                parsed = parse_tool_execution_result(tool_msg.content)
+                if parsed.ok:
+                    last_result = parsed.message
+                else:
+                    last_error = parsed.message
         else:
             for tool_call in tool_calls:
-                tool_msg, had_error = await self._process_tool_call(tool_call, recent_calls)
+                tool_msg, had_error = await self._process_tool_call(tool_call, recent_calls, state, approval_state)
                 final_messages.append(tool_msg)
                 has_error = has_error or had_error
+                parsed = parse_tool_execution_result(tool_msg.content)
+                if parsed.ok:
+                    last_result = parsed.message
+                else:
+                    last_error = parsed.message
 
         return {
             "messages": final_messages,
             "critic_source": "tools",
             "critic_feedback": "",
+            "pending_approval": None,
+            "last_tool_error": last_error,
+            "last_tool_result": last_result,
         }
 
     def _can_parallelize_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> bool:
         if len(tool_calls) < 2:
             return False
 
-        # Unknown tools are treated as potentially state-changing.
-        return all(tc.get("name") in self.PARALLEL_SAFE_TOOL_NAMES for tc in tool_calls)
+        return all(self._tool_is_read_only(tc.get("name") or "unknown_tool") for tc in tool_calls)
 
     async def _process_tool_call(
-        self, tool_call: Dict[str, Any], recent_calls: List[Dict[str, Any]]
+        self,
+        tool_call: Dict[str, Any],
+        recent_calls: List[Dict[str, Any]],
+        state: AgentState,
+        approval_state: Dict[str, Any],
     ) -> Tuple[ToolMessage, bool]:
         # Безопасное извлечение с фоллбеками
         t_name = tool_call.get("name") or "unknown_tool"
@@ -434,8 +616,25 @@ class AgentNodes:
         t_id = tool_call.get("id")
         if not t_id:
             t_id = f"call_missing_{uuid.uuid4().hex[:8]}"
-        
+
         had_error = False
+        metadata = self._metadata_for_tool(t_name)
+
+        if self._tool_requires_approval(t_name) and not self._tool_call_is_approved(t_id, approval_state):
+            content = format_error(
+                ErrorType.ACCESS_DENIED,
+                f"Execution of '{t_name}' was cancelled by approval policy.",
+            )
+            self._log_run_event(
+                state,
+                "tool_call_denied",
+                run_id=state.get("run_id", ""),
+                tool_name=t_name,
+                tool_args=t_args,
+                policy=metadata.to_dict(),
+            )
+            limit = self.config.safety.max_tool_output
+            return ToolMessage(content=truncate_output(content, limit, source=t_name), tool_call_id=t_id, name=t_name), True
 
         # Проверка на зацикливание
         loop_count = sum(
@@ -455,6 +654,14 @@ class AgentNodes:
             )
             had_error = True
         else:
+            self._log_run_event(
+                state,
+                "tool_call_start",
+                run_id=state.get("run_id", ""),
+                tool_name=t_name,
+                tool_args=t_args,
+                policy=metadata.to_dict(),
+            )
             content = await self._execute_tool(t_name, t_args)
 
         # Post-Tool Validation Layer
@@ -468,8 +675,27 @@ class AgentNodes:
 
         limit = self.config.safety.max_tool_output
         content = truncate_output(content, limit, source=t_name)
+        parsed_result = parse_tool_execution_result(content)
+        self._log_run_event(
+            state,
+            "tool_call_end",
+            run_id=state.get("run_id", ""),
+            tool_name=t_name,
+            tool_args=t_args,
+            result=parsed_result.to_event_payload(),
+        )
 
         return ToolMessage(content=content, tool_call_id=t_id, name=t_name), had_error
+
+    def _tool_call_is_approved(self, tool_call_id: str, approval_state: Dict[str, Any]) -> bool:
+        if not self.config.enable_approvals:
+            return True
+        if not approval_state:
+            return False
+        if not approval_state.get("approved"):
+            return False
+        approved_ids = set(approval_state.get("tool_call_ids") or [])
+        return not approved_ids or tool_call_id in approved_ids
 
     def _check_invariants(self, state: AgentState):
         if not self.config.debug:
@@ -756,9 +982,24 @@ class AgentNodes:
     def _get_base_prompt(self) -> str:
         """Ленивая загрузка и кэширование промпта для устранения дискового I/O"""
         if self._cached_base_prompt is None:
+            prompt_path = self.config.prompt_path.absolute()
             if self.config.prompt_path.exists():
-                self._cached_base_prompt = self.config.prompt_path.read_text("utf-8")
+                try:
+                    self._cached_base_prompt = self.config.prompt_path.read_text("utf-8")
+                    logger.info("Loaded prompt from file: %s", prompt_path)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to read prompt file %s: %s. Using built-in prompt.",
+                        prompt_path,
+                        e,
+                    )
+                    self._cached_base_prompt = (
+                        "You are an autonomous AI agent.\n"
+                        "Reason in English, Reply in Russian.\n"
+                        "Date: {{current_date}}"
+                    )
             else:
+                logger.info("Prompt file not found at %s. Using built-in prompt.", prompt_path)
                 self._cached_base_prompt = (
                     "You are an autonomous AI agent.\n"
                     "Reason in English, Reply in Russian.\n"
@@ -783,7 +1024,13 @@ class AgentNodes:
 
         return SystemMessage(content=prompt)
 
-    async def _invoke_llm_with_retry(self, llm, context: List[BaseMessage]) -> AIMessage:
+    async def _invoke_llm_with_retry(
+        self,
+        llm,
+        context: List[BaseMessage],
+        state: AgentState | None = None,
+        node_name: str = "",
+    ) -> AIMessage:
         current_llm = llm
         max_attempts = max(1, self.config.max_retries)
         retry_delay = max(0, self.config.retry_delay)
@@ -813,6 +1060,15 @@ class AgentNodes:
 
                 is_fatal = self._is_fatal_llm_error(e)
                 logger.warning(f"LLM Error (Attempt {attempt+1}/{max_attempts}): {e}")
+                self._log_run_event(
+                    state,
+                    "llm_retry",
+                    node=node_name,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    fatal=is_fatal,
+                    error=str(e),
+                )
 
                 if is_fatal:
                     logger.error(f"Fatal LLM error detected. Aborting request: {e}")

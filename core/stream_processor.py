@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
 
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, RemoveMessage, ToolMessage
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -22,6 +24,13 @@ from core.cli_utils import (
 from core.message_utils import is_tool_message_error, stringify_content
 
 DIFF_REGEX = re.compile(r"```diff\r?\n(.*?)```", re.DOTALL)
+logger = logging.getLogger("agent")
+
+
+@dataclass
+class StreamProcessResult:
+    stats: Optional[str]
+    interrupt: Optional[Dict[str, Any]] = None
 
 
 class StreamProcessor:
@@ -36,6 +45,7 @@ class StreamProcessor:
         'tool_buffer',
         'status_text',
         'start_time',
+        'pending_interrupt',
     )
 
     def __init__(self, console: Console):
@@ -49,6 +59,7 @@ class StreamProcessor:
         self.tool_buffer: Dict[str, Dict[str, Any]] = {}
         self.status_text = "Thinking..."
         self.start_time = time.time()
+        self.pending_interrupt: Optional[Dict[str, Any]] = None
 
     async def process_stream(self, stream):
         """Consumes the agent event stream and updates the UI."""
@@ -62,13 +73,19 @@ class StreamProcessor:
                 async for mode, payload in stream:
                     self._handle_stream_event(mode, payload)
                     self._update_live_display(live)
+                    if self.pending_interrupt is not None:
+                        break
         except (KeyboardInterrupt, asyncio.CancelledError):
             self.console.print("\n[bold red]🛑 Stopped by user[/]")
-            return
+            return StreamProcessResult(stats=None)
 
         self._commit_printed_text()
+        if self.pending_interrupt is not None:
+            interrupt_payload = self.pending_interrupt
+            self.pending_interrupt = None
+            return StreamProcessResult(stats=None, interrupt=interrupt_payload)
         duration = time.time() - self.start_time
-        return self.tracker.render(duration)
+        return StreamProcessResult(stats=self.tracker.render(duration))
 
     def _handle_stream_event(self, mode: str, payload: Any) -> None:
         if mode == "updates":
@@ -88,8 +105,21 @@ class StreamProcessor:
             self.has_thought = False
 
     def _handle_updates(self, payload: Dict) -> None:
+        if "__interrupt__" in payload:
+            interrupt_entries = payload.get("__interrupt__") or []
+            if interrupt_entries:
+                interrupt_value = getattr(interrupt_entries[0], "value", interrupt_entries[0])
+                if isinstance(interrupt_value, dict):
+                    self.pending_interrupt = interrupt_value
+                else:
+                    self.pending_interrupt = {"value": interrupt_value}
+            return
         self.tracker.update_from_node_update(payload)
         self._commit_printed_text()
+
+        summarize_payload = payload.get("summarize") or {}
+        if summarize_payload:
+            self._handle_summarize_update(summarize_payload)
 
         agent_payload = payload.get("agent") or {}
         messages = agent_payload.get("messages", [])
@@ -101,6 +131,20 @@ class StreamProcessor:
             for tool_call in last_msg.tool_calls:
                 self._remember_tool_call(tool_call)
                 self._render_tool_call(tool_call)
+
+    def _handle_summarize_update(self, payload: Dict[str, Any]) -> None:
+        summary_text = payload.get("summary")
+        removed_messages = payload.get("messages") or []
+        remove_count = sum(1 for item in removed_messages if isinstance(item, RemoveMessage))
+        if not summary_text:
+            return
+        rendered_count = remove_count if remove_count > 0 else len(removed_messages)
+        self.console.print(
+            Padding(
+                f"[dim]Context compressed automatically ({rendered_count} message(s) summarized).[/]",
+                (0, 0, 0, 2),
+            )
+        )
 
     def _handle_messages(self, payload: tuple) -> None:
         msg, metadata = payload
@@ -129,9 +173,12 @@ class StreamProcessor:
         return ""
 
     def _remember_tool_call(self, tool_call: Dict[str, Any]) -> None:
-        self.tool_buffer[tool_call["id"]] = {
-            "name": tool_call["name"],
-            "args": tool_call["args"],
+        tool_id = tool_call.get("id")
+        if not tool_id:
+            return
+        self.tool_buffer[tool_id] = {
+            "name": tool_call.get("name", "unknown_tool"),
+            "args": tool_call.get("args", {}),
         }
 
     def _render_tool_call(self, tool_call: Dict[str, Any]) -> None:
@@ -232,8 +279,8 @@ class StreamProcessor:
                 grid.add_row(self._spinner_row())
 
             live.update(grid)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Live display update failed: %s", e)
 
 
 

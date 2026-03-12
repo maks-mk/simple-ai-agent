@@ -51,7 +51,7 @@ def _shutdown_all():
         try:
             proc.terminate()
             proc.wait(timeout=1)
-        except:
+        except Exception:
             proc.kill()
 
 atexit.register(_shutdown_all)
@@ -153,8 +153,13 @@ def stop_background_process(pid: int) -> str:
                 del _BACKGROUND_PROCESSES[pid]
             return f"Success: Process {pid} stopped."
             
-        # Try to kill by PID even if not in our registry (e.g. found via find_process)
+        # Try to kill by PID even if not in our registry only when explicitly allowed.
         if psutil is not None and psutil.pid_exists(pid):
+            if not (_SAFETY_POLICY and _SAFETY_POLICY.allow_external_process_control):
+                return format_error(
+                    ErrorType.ACCESS_DENIED,
+                    "Stopping external processes is disabled by SafetyPolicy.",
+                )
             try:
                 p = psutil.Process(pid)
                 p.terminate()

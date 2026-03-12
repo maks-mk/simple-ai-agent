@@ -6,7 +6,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 logger = logging.getLogger("agent")
 
 
-def repair_session_if_needed(agent_app: Any, thread_id: str, console: Console):
+async def repair_session_if_needed(agent_app: Any, thread_id: str, console: Console):
     """
     Checks for interrupted tool calls in the session history and repairs them
     by inserting error messages for uncompleted calls.
@@ -14,7 +14,11 @@ def repair_session_if_needed(agent_app: Any, thread_id: str, console: Console):
     """
     try:
         config = {"configurable": {"thread_id": thread_id}}
-        current_state = agent_app.get_state(config)
+        async_get_state = getattr(agent_app, "aget_state", None)
+        if callable(async_get_state):
+            current_state = await async_get_state(config)
+        else:
+            current_state = agent_app.get_state(config)
         
         if not current_state or not current_state.values:
             return
@@ -61,8 +65,11 @@ def repair_session_if_needed(agent_app: Any, thread_id: str, console: Console):
                         name=tc["name"]
                     ))
                 
-                # update_state returns a dict, not awaitable in some versions
-                agent_app.update_state(config, {"messages": tool_msgs}, as_node="tools")
+                async_update_state = getattr(agent_app, "aupdate_state", None)
+                if callable(async_update_state):
+                    await async_update_state(config, {"messages": tool_msgs}, as_node="tools")
+                else:
+                    agent_app.update_state(config, {"messages": tool_msgs}, as_node="tools")
                 console.print("[dim]✔ History repaired (filled gaps). Ready for new input.[/]")
                 
     except Exception as e:

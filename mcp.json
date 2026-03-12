@@ -28,7 +28,7 @@
         "@modelcontextprotocol/server-sequential-thinking"
       ],
       "transport": "stdio",
-      "enabled": false
+      "enabled": true
     },
   "pdf-tools": {
     "command": "uv",

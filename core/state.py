@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated, List, NotRequired
+from typing import TypedDict, Annotated, List, NotRequired, Dict, Any
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
@@ -25,3 +25,11 @@ class AgentState(TypedDict):
     critic_status: NotRequired[str]
     critic_source: NotRequired[str]
     critic_feedback: NotRequired[str]
+
+    # Durable runtime/session info
+    session_id: NotRequired[str]
+    run_id: NotRequired[str]
+    pending_approval: NotRequired[Dict[str, Any] | None]
+    last_tool_error: NotRequired[str]
+    last_tool_result: NotRequired[str]
+    safety_mode: NotRequired[str]

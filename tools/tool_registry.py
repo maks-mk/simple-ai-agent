@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Sequence, Union
 from langchain_core.tools import BaseTool
 
 from core.config import AgentConfig
+from core.tool_policy import ToolMetadata, default_tool_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -23,15 +24,31 @@ class ToolLoaderSpec:
     tool_names: Sequence[str]
     configure: Callable[[Any, AgentConfig], None] | None = None
     optional_tool_names: Sequence[str] = ()
+    metadata: Dict[str, ToolMetadata] | None = None
+    optional_metadata: Dict[str, ToolMetadata] | None = None
 
 
 class ToolRegistry:
-    __slots__ = ("config", "tools", "mcp_clients")
+    __slots__ = (
+        "config",
+        "tools",
+        "tool_metadata",
+        "mcp_clients",
+        "loader_status",
+        "mcp_server_status",
+        "checkpoint_info",
+        "_cleanup_callbacks",
+    )
 
     def __init__(self, config: AgentConfig):
         self.config = config
         self.tools: List[BaseTool] = []
+        self.tool_metadata: Dict[str, ToolMetadata] = {}
         self.mcp_clients = []
+        self.loader_status: List[Dict[str, Any]] = []
+        self.mcp_server_status: List[Dict[str, Any]] = []
+        self.checkpoint_info: Dict[str, Any] = {}
+        self._cleanup_callbacks: List[Callable[[], Any]] = []
 
     async def load_all(self):
         for spec in self._loader_specs():
@@ -62,12 +79,60 @@ class ToolRegistry:
                     "find_file_tool",
                 ),
                 configure=self._configure_safety,
+                metadata={
+                    "read_file_tool": ToolMetadata(name="read_file", read_only=True),
+                    "write_file_tool": ToolMetadata(
+                        name="write_file", mutating=True, requires_approval=True
+                    ),
+                    "edit_file_tool": ToolMetadata(
+                        name="edit_file", mutating=True, requires_approval=True
+                    ),
+                    "list_directory_tool": ToolMetadata(name="list_directory", read_only=True),
+                    "safe_delete_file": ToolMetadata(
+                        name="safe_delete_file",
+                        mutating=True,
+                        destructive=True,
+                        requires_approval=True,
+                    ),
+                    "safe_delete_directory": ToolMetadata(
+                        name="safe_delete_directory",
+                        mutating=True,
+                        destructive=True,
+                        requires_approval=True,
+                    ),
+                    "download_file": ToolMetadata(
+                        name="download_file",
+                        mutating=True,
+                        requires_approval=True,
+                        networked=True,
+                    ),
+                    "search_in_file_tool": ToolMetadata(name="search_in_file", read_only=True),
+                    "search_in_directory_tool": ToolMetadata(
+                        name="search_in_directory", read_only=True
+                    ),
+                    "tail_file_tool": ToolMetadata(name="tail_file", read_only=True),
+                    "find_file_tool": ToolMetadata(name="find_file", read_only=True),
+                },
             ),
             ToolLoaderSpec(
                 name="local_delete_fallback",
                 enabled=lambda config: not config.enable_filesystem_tools,
                 module_name="tools.delete_tools",
                 tool_names=("safe_delete_file", "safe_delete_directory"),
+                metadata={
+                    "safe_delete_file": ToolMetadata(
+                        name="safe_delete_file",
+                        mutating=True,
+                        destructive=True,
+                        requires_approval=True,
+                    ),
+                    "safe_delete_directory": ToolMetadata(
+                        name="safe_delete_directory",
+                        mutating=True,
+                        destructive=True,
+                        requires_approval=True,
+                    ),
+                },
             ),
             ToolLoaderSpec(
                 name="search",
@@ -76,12 +141,36 @@ class ToolRegistry:
                 tool_names=("web_search", "batch_web_search", "fetch_content"),
                 optional_tool_names=("crawl_site",),
                 configure=self._configure_search,
+                metadata={
+                    "web_search": ToolMetadata(name="web_search", read_only=True, networked=True),
+                    "batch_web_search": ToolMetadata(
+                        name="batch_web_search", read_only=True, networked=True
+                    ),
+                    "fetch_content": ToolMetadata(
+                        name="fetch_content", read_only=True, networked=True
+                    ),
+                },
+                optional_metadata={
+                    "crawl_site": ToolMetadata(name="crawl_site", read_only=True, networked=True)
+                },
             ),
             ToolLoaderSpec(
                 name="system",
                 enabled=lambda config: config.use_system_tools,
                 module_name="tools.system_tools",
                 tool_names=("get_public_ip", "lookup_ip_info", "get_system_info", "get_local_network_info"),
+                metadata={
+                    "get_public_ip": ToolMetadata(
+                        name="get_public_ip", read_only=True, networked=True
+                    ),
+                    "lookup_ip_info": ToolMetadata(
+                        name="lookup_ip_info", read_only=True, networked=True
+                    ),
+                    "get_system_info": ToolMetadata(name="get_system_info", read_only=True),
+                    "get_local_network_info": ToolMetadata(
+                        name="get_local_network_info", read_only=True
+                    ),
+                },
             ),
             ToolLoaderSpec(
                 name="process",
@@ -89,6 +178,22 @@ class ToolRegistry:
                 module_name="tools.process_tools",
                 tool_names=("run_background_process", "stop_background_process", "find_process_by_port"),
                 configure=self._configure_safety,
+                metadata={
+                    "run_background_process": ToolMetadata(
+                        name="run_background_process",
+                        mutating=True,
+                        requires_approval=True,
+                    ),
+                    "stop_background_process": ToolMetadata(
+                        name="stop_background_process",
+                        mutating=True,
+                        destructive=True,
+                        requires_approval=True,
+                    ),
+                    "find_process_by_port": ToolMetadata(
+                        name="find_process_by_port", read_only=True
+                    ),
+                },
             ),
             ToolLoaderSpec(
                 name="shell",
@@ -96,6 +201,14 @@ class ToolRegistry:
                 module_name="tools.local_shell",
                 tool_names=("cli_exec",),
                 configure=self._configure_shell,
+                metadata={
+                    "cli_exec": ToolMetadata(
+                        name="cli_exec",
+                        mutating=True,
+                        destructive=True,
+                        requires_approval=True,
+                    )
+                },
             ),
         ]
 
@@ -107,9 +220,44 @@ class ToolRegistry:
 
             names = list(spec.tool_names)
             names.extend(name for name in spec.optional_tool_names if hasattr(module, name))
-            self.tools.extend(getattr(module, name) for name in names)
+            loaded_tools = [getattr(module, name) for name in names]
+            self.tools.extend(loaded_tools)
+            for tool in loaded_tools:
+                metadata = self._metadata_for_loaded_tool(spec, tool.name)
+                self.tool_metadata[tool.name] = metadata
+            self.loader_status.append(
+                {
+                    "loader": spec.name,
+                    "module": spec.module_name,
+                    "loaded_tools": [tool.name for tool in loaded_tools],
+                    "error": "",
+                }
+            )
         except Exception as e:
+            self.loader_status.append(
+                {
+                    "loader": spec.name,
+                    "module": spec.module_name,
+                    "loaded_tools": [],
+                    "error": str(e),
+                }
+            )
             logger.exception("Failed to load %s tools: %s", spec.name, e)
+
+    @staticmethod
+    def _metadata_key_by_tool_name(spec: ToolLoaderSpec, tool_name: str) -> str | None:
+        for mapping in (spec.metadata or {}, spec.optional_metadata or {}):
+            for key, metadata in mapping.items():
+                if metadata.name == tool_name:
+                    return key
+        return None
+
+    def _metadata_for_loaded_tool(self, spec: ToolLoaderSpec, tool_name: str) -> ToolMetadata:
+        for mapping in (spec.metadata or {}, spec.optional_metadata or {}):
+            for metadata in mapping.values():
+                if metadata.name == tool_name:
+                    return metadata
+        return default_tool_metadata(tool_name)
 
     @staticmethod
     def _configure_safety(module: Any, config: AgentConfig) -> None:
@@ -183,17 +331,59 @@ class ToolRegistry:
             results = await asyncio.gather(*(_load_one_server(name, cfg) for name, cfg in enabled_servers))
             for name, client, mcp_tools, err in results:
                 if err is not None:
+                    self.mcp_server_status.append({"server": name, "loaded_tools": [], "error": str(err)})
                     logger.error("❌ MCP Server '%s' Error: %s", name, err)
                     continue
 
                 self.mcp_clients.append(client)
                 if mcp_tools:
                     self.tools.extend(mcp_tools)
+                    for tool in mcp_tools:
+                        self.tool_metadata[tool.name] = default_tool_metadata(tool.name, source="mcp")
+                    self.mcp_server_status.append(
+                        {
+                            "server": name,
+                            "loaded_tools": [tool.name for tool in mcp_tools],
+                            "error": "",
+                        }
+                    )
                     logger.info("✔ MCP Server '%s': Loaded %s tools", name, len(mcp_tools))
                 else:
+                    self.mcp_server_status.append({"server": name, "loaded_tools": [], "error": "No tools found"})
                     logger.warning("⚠ MCP Server '%s': No tools found", name)
         except Exception as e:
             logger.exception(f"Failed to load MCP tools: {e}")
+
+    def register_cleanup_callback(self, callback: Callable[[], Any]) -> None:
+        self._cleanup_callbacks.append(callback)
+
+    def get_runtime_status(self) -> Dict[str, Any]:
+        return {
+            "checkpoint": self.checkpoint_info,
+            "loaders": list(self.loader_status),
+            "mcp_servers": list(self.mcp_server_status),
+        }
+
+    def get_runtime_status_lines(self) -> List[str]:
+        lines: List[str] = []
+        checkpoint = self.checkpoint_info or {}
+        if checkpoint:
+            lines.append(
+                f"Checkpoint: requested={checkpoint.get('backend')} active={checkpoint.get('resolved_backend')} target={checkpoint.get('target')}"
+            )
+            for warning in checkpoint.get("warnings", []):
+                lines.append(f"Checkpoint warning: {warning}")
+        for status in self.loader_status:
+            if status["error"]:
+                lines.append(f"Loader {status['loader']}: ERROR {status['error']}")
+        for status in self.mcp_server_status:
+            if status["error"]:
+                lines.append(f"MCP {status['server']}: ERROR {status['error']}")
+            else:
+                lines.append(
+                    f"MCP {status['server']}: loaded {len(status['loaded_tools'])} tool(s)"
+                )
+        return lines
 
     def _read_mcp_config(self) -> Dict[str, Any]:
         try:
@@ -233,6 +423,14 @@ class ToolRegistry:
                             raise
             except Exception as e:
                 logger.error("Error closing MCP client: %s", e)
+
+        for callback in self._cleanup_callbacks:
+            try:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.error("Error during runtime cleanup: %s", e)
 
         self.mcp_clients.clear()
         logger.info("ToolRegistry cleanup completed.")

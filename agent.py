@@ -4,12 +4,13 @@ from typing import Any, Optional, Tuple
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from core.checkpointing import create_checkpoint_runtime
 from core.config import AgentConfig
 from core.logging_config import setup_logging
 from core.nodes import AgentNodes
+from core.run_logger import JsonlRunLogger
 from core.state import AgentState
 from tools.tool_registry import ToolRegistry
 
@@ -74,6 +75,7 @@ def create_agent_workflow(
     workflow.add_edge("update_step", "agent")
 
     if tools_enabled:
+        workflow.add_node("approval", nodes.approval_node)
         workflow.add_node("tools", nodes.tools_node)
 
     def route_after_agent(state: AgentState):
@@ -91,6 +93,8 @@ def create_agent_workflow(
         last_msg = messages[-1]
 
         if tools_enabled and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+            if nodes.tool_calls_require_approval(last_msg.tool_calls):
+                return "approval"
             return "tools"
 
         return "critic"
@@ -101,7 +105,8 @@ def create_agent_workflow(
         return "update_step"
 
     if tools_enabled:
-        workflow.add_conditional_edges("agent", route_after_agent, ["tools", "critic", END])
+        workflow.add_conditional_edges("agent", route_after_agent, ["approval", "tools", "critic", END])
+        workflow.add_edge("approval", "tools")
         workflow.add_edge("tools", "update_step")
     else:
         workflow.add_conditional_edges("agent", route_after_agent, ["critic", END])
@@ -118,12 +123,15 @@ async def build_agent_app(config: Optional[AgentConfig] = None) -> Tuple[Any, To
     config = config or AgentConfig()
 
     logger.info(f"Initializing agent: [bold cyan]{config.provider}[/]", extra={"markup": True})
-    logger.debug(f"Prompt Path: {config.prompt_path.absolute()}")
 
     # 1. Initialize Resources
     llm = create_llm(config)
     tool_registry = ToolRegistry(config)
     await tool_registry.load_all()
+    checkpoint_runtime = await create_checkpoint_runtime(config)
+    run_logger = JsonlRunLogger(config.run_log_dir)
+    tool_registry.checkpoint_info = checkpoint_runtime.to_dict()
+    tool_registry.register_cleanup_callback(checkpoint_runtime.aclose)
 
     # 2. Bind Tools
     tools = tool_registry.tools
@@ -146,9 +154,11 @@ async def build_agent_app(config: Optional[AgentConfig] = None) -> Tuple[Any, To
         llm=llm,
         tools=tools,
         llm_with_tools=llm_with_tools,
+        tool_metadata=tool_registry.tool_metadata,
+        run_logger=run_logger,
     )
     workflow = create_agent_workflow(nodes, config, tools_enabled=bool(tools) and can_use_tools)
-    return workflow.compile(checkpointer=MemorySaver()), tool_registry
+    return workflow.compile(checkpointer=checkpoint_runtime.checkpointer), tool_registry
 
 
 if __name__ == "__main__":

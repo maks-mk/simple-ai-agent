@@ -1,5 +1,6 @@
 import functools
 import re
+import sys
 from pathlib import Path
 from typing import Literal, Optional, Union
 
@@ -25,16 +26,62 @@ _SIZE_MULTIPLIERS = {
 }
 
 
+def _candidate_runtime_dirs() -> list[Path]:
+    if getattr(sys, "frozen", False):
+        return [BASE_DIR]
+
+    dirs: list[Path] = [BASE_DIR]
+    cwd = Path.cwd()
+    if cwd not in dirs:
+        dirs.append(cwd)
+    return dirs
+
+
+def _existing_path_or_default(filename: str, default_dir: Path = BASE_DIR) -> Path:
+    for directory in _candidate_runtime_dirs():
+        candidate = directory / filename
+        if candidate.exists():
+            return candidate
+    return default_dir / filename
+
+
+def _env_file_candidates() -> tuple[Path, ...]:
+    seen: list[Path] = []
+    for directory in _candidate_runtime_dirs():
+        candidate = directory / ".env"
+        if candidate not in seen:
+            seen.append(candidate)
+    return tuple(seen)
+
+
 class AgentConfig(BaseSettings):
     """
     Конфигурация агента, загружаемая из переменных окружения и .env файла.
     """
 
-    model_config = SettingsConfigDict(env_file=BASE_DIR / ".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=_env_file_candidates(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # Paths
-    prompt_path: Path = Field(default=BASE_DIR / "prompt.txt", alias="PROMPT_PATH")
-    mcp_config_path: Path = Field(default=BASE_DIR / "mcp.json", alias="MCP_CONFIG_PATH")
+    prompt_path: Path = Field(default_factory=lambda: _existing_path_or_default("prompt.txt"), alias="PROMPT_PATH")
+    mcp_config_path: Path = Field(default_factory=lambda: _existing_path_or_default("mcp.json"), alias="MCP_CONFIG_PATH")
+    checkpoint_backend: Literal["sqlite", "memory", "postgres"] = Field(
+        default="sqlite",
+        alias="CHECKPOINT_BACKEND",
+    )
+    checkpoint_sqlite_path: Path = Field(
+        default=BASE_DIR / ".agent_state" / "checkpoints.sqlite",
+        alias="CHECKPOINT_SQLITE_PATH",
+    )
+    checkpoint_postgres_url: Optional[str] = Field(default=None, alias="CHECKPOINT_POSTGRES_URL")
+    session_state_path: Path = Field(
+        default=BASE_DIR / ".agent_state" / "session.json",
+        alias="SESSION_STATE_PATH",
+    )
+    run_log_dir: Path = Field(default=BASE_DIR / "logs" / "runs", alias="RUN_LOG_DIR")
 
     # Provider Settings
     provider: Literal["gemini", "openai"] = Field(default="gemini", alias="PROVIDER")
@@ -65,6 +112,8 @@ class AgentConfig(BaseSettings):
     enable_filesystem_tools: bool = Field(default=True, alias="ENABLE_FILESYSTEM_TOOLS")
     enable_process_tools: bool = Field(default=False, alias="ENABLE_PROCESS_TOOLS")
     enable_shell_tool: bool = Field(default=False, alias="ENABLE_SHELL_TOOL")
+    enable_approvals: bool = Field(default=True, alias="ENABLE_APPROVALS")
+    allow_external_process_control: bool = Field(default=False, alias="ALLOW_EXTERNAL_PROCESS_CONTROL")
 
     # Tools Limits
     max_tool_output_length: int = Field(default=4000, alias="MAX_TOOL_OUTPUT")
@@ -143,6 +192,14 @@ class AgentConfig(BaseSettings):
             return 10000
         return value
 
+    @field_validator("checkpoint_backend", mode="before")
+    @classmethod
+    def normalize_checkpoint_backend(cls, v: str) -> str:
+        value = str(v or "sqlite").strip().lower()
+        if value not in {"sqlite", "memory", "postgres"}:
+            return "sqlite"
+        return value
+
     @field_validator(
         "tool_loop_window",
         "tool_loop_limit_mutating",
@@ -202,6 +259,7 @@ class AgentConfig(BaseSettings):
             max_search_chars=self.max_search_chars,
             max_read_lines=self.max_read_lines,
             allow_shell=self.enable_shell_tool,
+            allow_external_process_control=self.allow_external_process_control,
         )
 
     @model_validator(mode="after")

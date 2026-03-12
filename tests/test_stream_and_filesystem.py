@@ -5,7 +5,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import RemoveMessage, ToolMessage
 from rich.console import Console
 
 from core.cli_utils import prepare_markdown_for_render
@@ -75,6 +75,24 @@ class StreamAndFilesystemTests(unittest.TestCase):
         self.assertIn("edit_file", output)
         self.assertIn("foo", output)
         self.assertIn("boom", output)
+
+    def test_stream_processor_renders_summarization_notice(self):
+        capture = io.StringIO()
+        console = Console(record=True, file=capture, width=120, force_terminal=False)
+        processor = StreamProcessor(console)
+
+        processor._handle_updates(
+            {
+                "summarize": {
+                    "summary": "compressed summary",
+                    "messages": [RemoveMessage(id="1"), RemoveMessage(id="2")],
+                }
+            }
+        )
+
+        output = console.export_text()
+        self.assertIn("Context compressed automatically", output)
+        self.assertIn("2 message(s)", output)
 
     def test_filesystem_delete_uses_virtual_mode_path_guard(self):
         tmp = self._workspace_tempdir()

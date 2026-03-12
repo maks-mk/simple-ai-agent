@@ -1,42 +1,55 @@
 # Autonomous AI Agent
 
-**v0.47b**
+**v0.5b**
 
-Автономный CLI-агент на базе LangGraph с локальными инструментами, MCP-интеграцией, внутренним critic-узлом и более строгими safety-контрактами для файлов, tool-calling и фоновых процессов.
+Автономный CLI-агент на базе LangGraph с durable checkpointing, session resume, policy-driven tool execution, approval gate для опасных действий, MCP-интеграцией и встроенным `critic`-узлом для проверки завершённости задачи.
 
 ---
 
-## Что изменилось в `0.47b`
+## Что нового в `0.48b`
 
-- Обновлена структура `core/`: pure text/helpers вынесены из CLI-зависимого слоя.
-- Ошибочные `tool_calls` больше не превращаются в синтетический `unknown_tool`, а обрабатываются как protocol error.
-- Reflection/retry больше не ломают порядок ролей в истории сообщений после `tool`.
-- `MAX_FILE_SIZE` теперь парсится строго: число без суффикса трактуется как байты, для крупных лимитов нужны явные единицы (`300MiB`, `4MB`).
-- `run_background_process` ужесточен: запрещены shell-операторы, рабочая директория валидируется внутри workspace.
+- Добавлен настраиваемый checkpoint backend: `sqlite`, `memory`, `postgres`.
+- Локальный CLI по умолчанию использует `sqlite`, поэтому сессии реально переживают перезапуск приложения.
+- Появился `SessionStore`: активная сессия автоматически восстанавливается при следующем запуске.
+- Для mutating/destructive tools добавлен approval flow на базе LangGraph `interrupt`.
+- Реестр инструментов теперь хранит metadata/policy для каждого tool: `read_only`, `mutating`, `destructive`, `requires_approval`, `networked`.
+- Добавлено локальное JSONL-логирование рантайма: tool calls, critic verdicts, retries, approvals, ошибки.
+- `stop_background_process` по умолчанию не завершает внешние процессы, которые агент не запускал сам.
+- `context7` включён в `mcp.json` как рекомендуемый MCP для документации и setup-задач.
 
 ---
 
 ## Возможности
 
-### Интерфейс
+### CLI и UX
 - Потоковый вывод ответов и статусов инструментов.
 - CLI на `rich` + `prompt_toolkit`.
 - Fuzzy autocomplete для команд и путей.
-- Восстановление сессии после прерванных запусков.
+- Автовосстановление последней активной сессии.
+- Команда `/session` для просмотра текущего session/thread/checkpoint backend.
 
 ### Граф агента
-- Основной поток: `summarize -> update_step -> agent -> tools/critic`.
-- Внутренний `critic` не дает завершить задачу, если ответ формально есть, а действие не доведено до конца.
+- Основной поток: `summarize -> update_step -> agent -> approval/tools/critic`.
+- `critic` не даёт агенту преждевременно объявить задачу завершённой.
 - Автосжатие контекста по `SESSION_SIZE` с сохранением последних сообщений.
 - Loop guard на уровне графа и на уровне повторяющихся tool-вызовов.
+- Interrupt-driven approval для опасных действий без ручной перестройки графа.
 
-### Инструменты
-- Filesystem tools для чтения, записи, редактирования и поиска по проекту.
+### Инструменты и политика безопасности
+- Filesystem tools для чтения, записи, редактирования, поиска и удаления файлов.
 - Search tools через Tavily.
-- System tools для системной и сетевой диагностики.
-- Process tools для фоновых процессов с дополнительными ограничениями.
-- Опциональный shell tool.
-- MCP tools, подключаемые из `mcp.json`.
+- System tools для диагностики ОС и сети.
+- Process tools для фоновых процессов с ограничениями на `cwd` и внешний PID control.
+- Опциональный shell tool с approval gate.
+- MCP tools из `mcp.json`, включая `context7` и `sequential-thinking`.
+- Policy metadata для каждого инструмента: read-only tools могут выполняться без approval, destructive tools требуют явного подтверждения.
+
+### Надёжность и observability
+- Durable checkpoints через SQLite/Postgres backend.
+- Session snapshot в отдельном JSON-файле.
+- JSONL run logs по сессиям.
+- Явный runtime status по backend и MCP-серверам.
+- Обработка malformed tool calls и protocol errors без краша CLI.
 
 ---
 
@@ -45,6 +58,7 @@
 ```text
 .
 ├── core/
+│   ├── checkpointing.py
 │   ├── cli_utils.py
 │   ├── config.py
 │   ├── constants.py
@@ -53,11 +67,15 @@
 │   ├── logging_config.py
 │   ├── message_utils.py
 │   ├── nodes.py
+│   ├── run_logger.py
 │   ├── safety_policy.py
+│   ├── session_store.py
 │   ├── session_utils.py
 │   ├── state.py
 │   ├── stream_processor.py
 │   ├── text_utils.py
+│   ├── tool_policy.py
+│   ├── tool_results.py
 │   ├── ui_theme.py
 │   ├── utils.py
 │   └── validation.py
@@ -84,20 +102,24 @@
 ## Назначение ключевых модулей
 
 ### `core/`
-- `config.py` загружает `.env`, парсит лимиты и флаги, включая строгий `MAX_FILE_SIZE`.
-- `nodes.py` содержит LangGraph-узлы, retry/reflection-логику и обработку protocol errors.
-- `state.py` описывает состояние графа.
-- `message_utils.py` и `text_utils.py` содержат dependency-free helper-функции для текста и сообщений.
-- `cli_utils.py`, `ui_theme.py`, `fuzzy_completer.py`, `stream_processor.py` отвечают за CLI-слой.
-- `session_utils.py`, `validation.py`, `errors.py`, `safety_policy.py` отвечают за ремонт сессии, валидацию, типизацию ошибок и ограничения безопасности.
+- `checkpointing.py` создаёт runtime checkpointer и выбирает backend (`sqlite`, `memory`, `postgres`).
+- `config.py` загружает `.env`, парсит feature flags, лимиты, backend persistence и approval settings.
+- `nodes.py` содержит LangGraph-узлы: `agent`, `approval`, `tools`, `critic`, summarize и runtime overlays.
+- `state.py` описывает расширенное состояние графа, включая `session_id`, `run_id`, `pending_approval`, `last_tool_error`, `last_tool_result`.
+- `session_store.py` хранит snapshot активной сессии для auto-resume.
+- `run_logger.py` пишет JSONL events по сессиям.
+- `tool_policy.py` описывает policy metadata для tool layer.
+- `tool_results.py` нормализует tool output во внутренний structured shape для логирования и анализа.
+- `stream_processor.py` обрабатывает поток LangGraph событий, tool results и interrupts.
+- `session_utils.py`, `validation.py`, `errors.py`, `safety_policy.py` отвечают за repair, post-tool validation и security contracts.
 
 ### `tools/`
-- `filesystem.py` реализует чтение/запись/редактирование/поиск по файлам с path guards и аккуратным repair для очевидных опечаток в путях.
-- `search_tools.py` подключает Tavily search/fetch API.
-- `system_tools.py` отдает системную и сетевую информацию.
-- `process_tools.py` управляет фоновыми процессами без `shell=True` и с проверкой `cwd`.
-- `local_shell.py` содержит опциональный shell tool.
-- `tool_registry.py` собирает локальные и MCP-инструменты в единый registry.
+- `filesystem.py` реализует filesystem-инструменты с path guards, virtual mode и диффами для edit.
+- `search_tools.py` даёт web search/fetch через Tavily.
+- `system_tools.py` отдаёт системную и сетевую информацию.
+- `process_tools.py` управляет фоновыми процессами и не позволяет по умолчанию убивать произвольные внешние PID.
+- `local_shell.py` содержит shell tool с общими лимитами и approval-политикой.
+- `tool_registry.py` собирает локальные и MCP-инструменты, назначает им metadata и формирует runtime status.
 
 ---
 
@@ -112,6 +134,16 @@
 | `GEMINI_MODEL` / `OPENAI_MODEL` | имя модели |
 | `OPENAI_BASE_URL` | base URL для OpenAI-совместимых API |
 
+### Runtime и persistence
+
+| Параметр | Значение по умолчанию | Назначение |
+| :--- | :--- | :--- |
+| `CHECKPOINT_BACKEND` | `sqlite` | backend для checkpoint saver |
+| `CHECKPOINT_SQLITE_PATH` | `.agent_state/checkpoints.sqlite` | локальная SQLite БД для state persistence |
+| `CHECKPOINT_POSTGRES_URL` | пусто | строка подключения к Postgres backend |
+| `SESSION_STATE_PATH` | `.agent_state/session.json` | snapshot активной сессии |
+| `RUN_LOG_DIR` | `logs/runs` | директория JSONL run logs |
+
 ### Поведение агента
 
 | Параметр | Значение по умолчанию |
@@ -121,6 +153,7 @@
 | `PROMPT_PATH` | `prompt.txt` |
 | `MODEL_SUPPORTS_TOOLS` | `true` |
 | `DEBUG` | `false` |
+| `STRICT_MODE` | `false` |
 
 ### Включение подсистем
 
@@ -131,6 +164,8 @@
 | `ENABLE_SYSTEM_TOOLS` | `true` |
 | `ENABLE_PROCESS_TOOLS` | `false` |
 | `ENABLE_SHELL_TOOL` | `false` |
+| `ENABLE_APPROVALS` | `true` |
+| `ALLOW_EXTERNAL_PROCESS_CONTROL` | `false` |
 
 ### Лимиты и безопасность
 
@@ -142,7 +177,7 @@
 | `MAX_READ_LINES` | `2000` | лимит строк при чтении |
 | `MAX_BACKGROUND_PROCESSES` | `5` | лимит фоновых задач |
 
-Для `MAX_FILE_SIZE` используйте явные единицы: `4MB`, `300MiB`, `1GiB`. Значение `300` теперь означает именно `300 bytes`, а не `300 MB`.
+Для `MAX_FILE_SIZE` используйте явные единицы: `4MB`, `300MiB`, `1GiB`. Значение `300` означает `300 bytes`, а не `300 MB`.
 
 ---
 
@@ -150,7 +185,10 @@
 
 - Конфигурация серверов находится в `mcp.json`.
 - Подключаются только записи с `"enabled": true`.
-- MCP tools регистрируются вместе с локальными инструментами и доступны агенту наравне с ними.
+- MCP tools регистрируются вместе с локальными инструментами и получают runtime status-report.
+- По умолчанию в конфиге включены:
+  - `context7` для документации, setup и API reference.
+  - `sequential-thinking` для сложных reasoning-задач.
 
 ---
 
@@ -174,6 +212,10 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
+`requirements.txt` включает:
+- `langgraph-checkpoint-sqlite` для локального durable runtime;
+- `langgraph-checkpoint-postgres` и `psycopg` для production-like backend.
+
 ### 3. Настройка `.env`
 
 ```powershell
@@ -183,14 +225,20 @@ Copy-Item env_example.txt .env
 После этого:
 - укажите ключи модели;
 - при необходимости добавьте `TAVILY_API_KEY`;
-- включите нужные tool-подсистемы;
-- при необходимости активируйте MCP-серверы в `mcp.json`.
+- выберите checkpoint backend;
+- при необходимости включите process/shell tools;
+- при необходимости настройте MCP-серверы в `mcp.json`.
 
 ### 4. Запуск
 
 ```bash
 python agent_cli.py
 ```
+
+При старте CLI:
+- поднимет последнюю активную сессию из `SESSION_STATE_PATH`;
+- покажет текущий checkpoint backend;
+- выведет runtime status по MCP и backend’ам.
 
 ---
 
@@ -200,12 +248,32 @@ python agent_cli.py
 .\venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
+Покрываются:
+- critic/graph flow;
+- filesystem и stream processor;
+- checkpoint runtime и SQLite persistence;
+- approval interrupts и resume flow;
+- session store;
+- JSONL run logging;
+- safer process control.
+
 ---
 
 ## Команды в CLI
 
 - `/help` — краткая справка
 - `/tools` — список доступных инструментов
-- `clear` / `reset` — сброс текущей сессии
+- `/session` — текущая сессия, thread и checkpoint backend
+- `clear` / `reset` — создать новую сессию
 - `exit` / `quit` — выход
 - `Alt+Enter` — многострочный ввод
+
+---
+
+## Примечания по безопасности
+
+- Read-only tools могут выполняться автономно.
+- Mutating/destructive tools по умолчанию требуют approval.
+- `cli_exec` отключён по умолчанию и считается high-risk инструментом.
+- `stop_background_process` не завершает внешние процессы без `ALLOW_EXTERNAL_PROCESS_CONTROL=true`.
+- Для production-режима предпочтителен `postgres` backend; для локального CLI — `sqlite`.

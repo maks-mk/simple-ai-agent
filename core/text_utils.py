@@ -11,6 +11,41 @@ _CRAWL_DEPTH_RE = re.compile(r"max_depth: (\d+)")
 _FENCED_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _FILE_EXT_RE = re.compile(r"\.([a-z0-9]+)\b", re.IGNORECASE)
 
+# Matches Markdown links whose href is a local file path (not http/https/ftp/mailto).
+# Rich URL-encodes non-ASCII hrefs, which breaks Cyrillic filenames in output.
+# Capture groups: 1=link text, 2=href
+_LOCAL_LINK_RE = re.compile(
+    r"\[([^\]]+)\]\((?!https?://|ftp://|mailto:)([^)]+)\)",
+    re.IGNORECASE,
+)
+
+
+def _rewrite_local_file_links(text: str) -> str:
+    """Convert Markdown local-file links to inline code to prevent Rich URL-encoding.
+
+    [имя.md](имя.md)          →  `имя.md`
+    [label](path/to/file.py)  →  `path/to/file.py` (label)
+    """
+    def _replace(m: re.Match) -> str:
+        label: str = m.group(1).strip()
+        href: str = m.group(2).strip()
+        # If the href itself is the label (auto-link), just emit inline code
+        if label == href or label.lower() == href.lower():
+            return f"`{href}`"
+        # Otherwise emit: `href` (label)
+        return f"`{href}` ({label})"
+
+    # Only rewrite outside fenced code blocks
+    parts: list[str] = []
+    last = 0
+    for block in _FENCED_BLOCK_RE.finditer(text):
+        segment = text[last:block.start()]
+        parts.append(_LOCAL_LINK_RE.sub(_replace, segment))
+        parts.append(block.group(0))
+        last = block.end()
+    parts.append(_LOCAL_LINK_RE.sub(_replace, text[last:]))
+    return "".join(parts)
+
 _LANG_BY_EXTENSION = {
     "py": "python",
     "js": "javascript",
@@ -290,6 +325,7 @@ def normalize_markdown_code_blocks(text: str) -> str:
 
 
 def prepare_markdown_for_render(text: str) -> str:
+    text = _rewrite_local_file_links(text)
     return normalize_markdown_code_blocks(clean_markdown_text(text))
 
 

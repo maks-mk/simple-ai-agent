@@ -1,6 +1,9 @@
 import sys
 from pathlib import Path
 
+# Agent version (single source of truth)
+AGENT_VERSION = "0.6b"
+
 # Определение корневой директории проекта
 if getattr(sys, 'frozen', False):
     # Если запущено как exe, используем директорию исполняемого файла для конфигов,

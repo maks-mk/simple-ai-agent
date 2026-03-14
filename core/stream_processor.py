@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
 
 from langchain_core.messages import AIMessage, AIMessageChunk, RemoveMessage, ToolMessage
-from rich.console import Console
+from rich.console import Console, Group as RichGroup
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.padding import Padding
@@ -43,9 +43,11 @@ class StreamProcessor:
         'printed_len',
         'printed_tool_ids',
         'tool_buffer',
+        'tool_start_times',
         'status_text',
         'start_time',
         'pending_interrupt',
+        'active_node',
     )
 
     def __init__(self, console: Console):
@@ -57,9 +59,11 @@ class StreamProcessor:
         self.printed_len = 0
         self.printed_tool_ids: Set[str] = set()
         self.tool_buffer: Dict[str, Dict[str, Any]] = {}
+        self.tool_start_times: Dict[str, float] = {}
         self.status_text = "Thinking..."
         self.start_time = time.time()
         self.pending_interrupt: Optional[Dict[str, Any]] = None
+        self.active_node: str = "agent"
 
     async def process_stream(self, stream):
         """Consumes the agent event stream and updates the UI."""
@@ -151,6 +155,9 @@ class StreamProcessor:
         node = metadata.get("langgraph_node")
         self.tracker.update_from_message(msg)
 
+        if node:
+            self.active_node = node
+
         if node == "agent" and isinstance(msg, (AIMessage, AIMessageChunk)):
             self._handle_agent_message(msg)
         elif node == "tools" and isinstance(msg, ToolMessage):
@@ -186,6 +193,9 @@ class StreamProcessor:
         if tool_id in self.printed_tool_ids:
             return
 
+        # Record start time for duration tracking
+        self.tool_start_times[tool_id] = time.time()
+
         display_str = format_tool_display(tool_call["name"], tool_call["args"])
         if "(" in display_str:
             name_part, args_part = display_str.split("(", 1)
@@ -194,7 +204,7 @@ class StreamProcessor:
         else:
             display_styled = f"[tool.name]{display_str}[/]"
 
-        self.console.print(Padding(f"›  {display_styled}", (0, 0, 0, 2)))
+        self.console.print(Padding(f"[tool.badge]▶[/] {display_styled}", (0, 0, 0, 2)))
         self.printed_tool_ids.add(tool_id)
         self.status_text = f"Running {tool_call['name']}..."
 
@@ -208,7 +218,15 @@ class StreamProcessor:
         summary = format_tool_output(msg.name, content_str, is_error)
         style = "tool.error" if is_error else "tool.result"
         icon = "[tool.error]✖ [/]" if is_error else "[tool.result]✔ [/]"
-        self.console.print(Padding(f"  {icon}[{style}]{summary}[/]", (0, 0, 0, 4)))
+
+        # Compute and show tool execution duration
+        elapsed_str = ""
+        start_t = self.tool_start_times.pop(tool_id, None)
+        if start_t is not None:
+            elapsed = time.time() - start_t
+            elapsed_str = f" [tool.timing]{elapsed:.1f}s[/]"
+
+        self.console.print(Padding(f"  {icon}[{style}]{summary}[/]{elapsed_str}", (0, 0, 0, 4)))
 
         if not is_error:
             self._render_diff_preview(content_str)
@@ -259,8 +277,24 @@ class StreamProcessor:
             render_text += "\n```"
         return prepare_markdown_for_render(render_text)
 
+    def _elapsed(self) -> str:
+        """Returns formatted elapsed time since stream start."""
+        return f"{time.time() - self.start_time:.0f}s"
+
     def _spinner_row(self):
-        return Spinner("dots", text=self.status_text, style="status.spinner")
+        node_labels = {
+            "agent":    "Thinking",
+            "critic":   "Verifying",
+            "tools":    "Running",
+            "summarize": "Compressing",
+            "approval": "Waiting",
+        }
+        base = node_labels.get(self.active_node, "Working")
+        if self.has_thought:
+            label = f"[agent.thought]{base}...[/] [tool.timing]{self._elapsed()}[/]"
+        else:
+            label = f"{base}... [tool.timing]{self._elapsed()}[/]"
+        return Spinner("dots", text=label, style="status.spinner")
 
     def _update_live_display(self, live: Live) -> None:
         try:
@@ -269,16 +303,22 @@ class StreamProcessor:
             elif self.status_text == "[agent.thought]Thinking...[/]":
                 self.status_text = "Thinking..."
 
-            grid = Table.grid(expand=True, padding=(0, 1))
-            grid.add_column(justify="left", ratio=1)
+            renderables = []
 
+            # Always show any pending partial text ABOVE the spinner
             pending_markdown = self._current_pending_markdown()
             if pending_markdown:
-                grid.add_row(Padding(Markdown(pending_markdown, code_theme="dracula", hyperlinks=False), (0, 0, 0, 2)))
-            else:
-                grid.add_row(self._spinner_row())
+                renderables.append(
+                    Padding(
+                        Markdown(pending_markdown, code_theme="dracula", hyperlinks=False),
+                        (0, 0, 0, 2),
+                    )
+                )
 
-            live.update(grid)
+            # Spinner is always visible so the user sees the agent is still working
+            renderables.append(self._spinner_row())
+
+            live.update(RichGroup(*renderables))
         except Exception as e:
             logger.debug("Live display update failed: %s", e)
 

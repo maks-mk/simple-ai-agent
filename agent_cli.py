@@ -18,11 +18,13 @@ from pygments.lexers.markup import MarkdownLexer
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
+from rich.text import Text
 
 from core.cli_utils import format_exception_friendly, get_key_bindings
 from core.config import AgentConfig
-from core.constants import BASE_DIR
+from core.constants import AGENT_VERSION, BASE_DIR
 from core.fuzzy_completer import FuzzyPathCompleter
 from core.logging_config import setup_logging
 from core.session_store import SessionSnapshot, SessionStore
@@ -69,48 +71,66 @@ def get_prompt_message() -> HTML:
     )
 
 
-def get_bottom_toolbar() -> HTML:
-    return HTML(" <b>ALT+ENTER</b> Multiline | <b>/tools</b> List | <b>/session</b> Session | <b>exit</b> Quit ")
+def get_bottom_toolbar(model_name: str = "", tools_count: int = 0) -> HTML:
+    model_part = f" │ <b>{model_name}</b>" if model_name else ""
+    tools_part = f" │ tools: {tools_count}" if tools_count else ""
+    return HTML(
+        f" <b>ALT+ENTER</b> multiline"
+        f" | <b>/help</b> · <b>/tools</b> · <b>/session</b>"
+        f" | <b>exit</b> quit"
+        f"{tools_part}{model_part} "
+    )
 
 
 def render_tools(tools) -> None:
-    table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
-    table.add_column("Tool")
-    table.add_column("Description")
-    for tool in tools:
-        table.add_row(tool.name, (tool.description[:60] + "...") if tool.description else "No description")
-    console.print(Panel(table, title="[bold blue]Available Tools[/]"))
+    table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", expand=False)
+    table.add_column("#", style="dim", width=3, justify="right")
+    table.add_column("Tool", style="tool.name")
+    table.add_column("Description", ratio=1)
+    table.add_column("Flags", style="dim", no_wrap=True)
+    for i, tool in enumerate(tools, 1):
+        desc = tool.description or "No description"
+        desc = (desc[:72] + "…") if len(desc) > 72 else desc
+        # Detect MCP tools by naming convention (they carry a namespace separator)
+        source_flag = "[dim]mcp[/]" if ":" in tool.name or hasattr(tool, "_is_mcp") else ""
+        table.add_row(str(i), tool.name, desc, source_flag)
+    count_str = f"{len(tools)} tool{'s' if len(tools) != 1 else ''}"
+    console.print(Panel(table, title=f"[panel.title]Available Tools[/] [dim]({count_str})[/]", border_style="panel.border"))
 
 
 def render_help() -> None:
-    grid = Table.grid(expand=True, padding=(0, 2))
-    grid.add_column(justify="left", style="bold cyan")
-    grid.add_column(justify="left")
-    grid.add_row("Command", "Description")
-    grid.add_row("-------", "-----------")
-    grid.add_row("/tools", "List all available tools")
-    grid.add_row("/session", "Show active session and persistence backend")
-    grid.add_row("/help", "Show this help message")
-    grid.add_row("clear/reset", "Create a new session")
-    grid.add_row("exit", "Exit the application")
-    grid.add_row("", "")
-    grid.add_row("Keyboard Shortcuts", "")
-    grid.add_row("------------------", "")
-    grid.add_row("Alt+Enter", "Multiline input")
-    grid.add_row("Ctrl+C", "Cancel generation")
-    console.print(Panel(grid, title="[bold blue]Help & Usage[/]", border_style="blue"))
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2), expand=False)
+    table.add_column(justify="right", style="bold cyan", no_wrap=True)
+    table.add_column(justify="left", style="dim")
+
+    table.add_row("── Commands ──", "")
+    table.add_row("/tools",   "List available tools")
+    table.add_row("/session", "Show session · thread · backend")
+    table.add_row("/help",    "This message")
+    table.add_row("clear",    "Start a fresh session")
+    table.add_row("exit",     "Quit")
+    table.add_row("", "")
+    table.add_row("── Keys ──", "")
+    table.add_row("Alt+Enter", "Multiline input")
+    table.add_row("Ctrl+C",   "Cancel generation")
+    table.add_row("↑↓",         "History navigation")
+    console.print(Panel(table, title="[panel.title]Help[/]", border_style="panel.border", padding=(0, 1)))
 
 
 def render_session_info(snapshot: SessionSnapshot, checkpoint_info: dict) -> None:
-    table = Table(box=box.ROUNDED, show_header=False)
-    table.add_column("Field", style="bold cyan")
-    table.add_column("Value")
-    table.add_row("Session ID", snapshot.session_id)
-    table.add_row("Thread ID", snapshot.thread_id)
-    table.add_row("Checkpoint", f"{checkpoint_info.get('resolved_backend', 'unknown')}")
-    table.add_row("Target", checkpoint_info.get("target", "unknown"))
-    table.add_row("Updated", _format_timestamp_local(snapshot.updated_at))
-    console.print(Panel(table, title="[bold blue]Session[/]"))
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1), expand=False)
+    table.add_column(justify="right", style="dim", no_wrap=True)
+    table.add_column(justify="left")
+
+    backend = checkpoint_info.get("resolved_backend", "unknown")
+    backend_icon = {"sqlite": "▣", "postgres": "○", "memory": "◦"}.get(backend, "□")
+
+    table.add_row("session",  f"[cyan]{snapshot.session_id[:16]}…[/]")
+    table.add_row("thread",   f"[dim]{snapshot.thread_id[:16]}…[/]")
+    table.add_row("backend",  f"{backend_icon} [bold]{backend}[/]")
+    table.add_row("target",   f"[dim]{checkpoint_info.get('target', 'unknown')}[/]")
+    table.add_row("updated",  f"[dim]{_format_timestamp_local(snapshot.updated_at)}[/]")
+    console.print(Panel(table, title="[panel.title]Session[/]", border_style="panel.border", padding=(0, 1)))
 
 
 def _format_timestamp_local(value: str) -> str:
@@ -125,8 +145,18 @@ def render_runtime_status(tool_registry) -> None:
     lines = tool_registry.get_runtime_status_lines()
     if not lines:
         return
-    body = "\n".join(f"- {line}" for line in lines)
-    console.print(Panel(body, title="[bold blue]Runtime Status[/]", border_style="blue"))
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1), expand=False)
+    table.add_column(no_wrap=True)
+    for line in lines:
+        # Color lines that indicate errors/warnings vs. successes
+        line_lower = line.lower()
+        if any(kw in line_lower for kw in ("error", "failed", "unavailable")):
+            table.add_row(f"[status.error]✖[/] [dim]{line}[/]")
+        elif any(kw in line_lower for kw in ("warn", "disabled", "skip")):
+            table.add_row(f"[status.warning]⚠[/] [dim]{line}[/]")
+        else:
+            table.add_row(f"[status.success]✔[/] [dim]{line}[/]")
+    console.print(Panel(table, title="[panel.title]Runtime[/]", border_style="panel.border", padding=(0, 1)))
 
 
 def setup_runtime() -> AgentConfig:
@@ -140,25 +170,34 @@ def setup_runtime() -> AgentConfig:
 
 
 async def initialize_agent(config: AgentConfig):
-    with console.status("[bold green]Initializing system...[/]"):
-        return await build_agent_app(config)
+    provider_label = config.provider.capitalize()
+    model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
+    with console.status(
+        f"[init.step]▶[/] [dim]Loading {provider_label} · {model_name}...[/]",
+        spinner="dots",
+    ):
+        result = await build_agent_app(config)
+    console.print(f"[init.step]✔[/] [dim]Agent ready[/]")
+    return result
 
 
 def render_header(config: AgentConfig, tools) -> None:
     clear_screen()
     model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
+    provider_icon = "[cyan]◆[/]" if config.provider == "gemini" else "[green]◆[/]"
+    tools_str = f"[dim]{len(tools)} tools[/]" if tools else "[dim]no tools[/]"
     grid = Table.grid(expand=True)
     grid.add_column(justify="left")
     grid.add_column(justify="center")
     grid.add_column(justify="right")
     grid.add_row(
-        "[bold cyan] > AI Agent[/] [gray]v0.5b[/]",
-        f"[gray]Tools: {len(tools)}[/]",
-        f"[gray]{model_name}[/] [cyan]•[/]",
+        f"[bold cyan]AI Agent[/] [dim]v{AGENT_VERSION}[/]",
+        tools_str,
+        f"[dim]{model_name}[/] {provider_icon}",
     )
     console.print(Panel(grid, style="panel.border", padding=(0, 1)))
     if config.debug:
-        console.print("[yellow]Debug mode enabled[/]")
+        console.print(Panel("[yellow]Debug mode active[/]", border_style="panel.warning", padding=(0, 1)))
 
 
 def create_session() -> PromptSession:
@@ -217,36 +256,59 @@ def try_handle_command(
     return False
 
 
+def _format_policy_flags(policy: dict) -> str:
+    """Returns colored Rich markup string for tool policy flags."""
+    parts = []
+    if policy.get("destructive"):
+        parts.append("[approval.danger]destructive[/]")
+    if policy.get("mutating"):
+        parts.append("[approval.mutating]mutating[/]")
+    if policy.get("networked"):
+        parts.append("[approval.networked]networked[/]")
+    return "  ".join(parts) if parts else "[dim]protected[/]"
+
+
 async def prompt_for_interrupt(session: PromptSession, interrupt_payload: dict) -> dict:
     if interrupt_payload.get("kind") != "tool_approval":
         return {"approved": False}
 
-    tools = interrupt_payload.get("tools", [])
-    table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
-    table.add_column("Tool")
-    table.add_column("Args")
-    table.add_column("Policy")
-    for tool in tools:
+    req_tools = interrupt_payload.get("tools", [])
+    table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", expand=False)
+    table.add_column("Tool", style="tool.name", no_wrap=True)
+    table.add_column("Args", style="tool.args")
+    table.add_column("Flags", no_wrap=True)
+    for tool in req_tools:
         policy = tool.get("policy") or {}
-        flags = []
-        if policy.get("mutating"):
-            flags.append("mutating")
-        if policy.get("destructive"):
-            flags.append("destructive")
-        if policy.get("networked"):
-            flags.append("networked")
+        args_str = str(tool.get("args", {}))
+        args_str = (args_str[:80] + "…") if len(args_str) > 80 else args_str
         table.add_row(
             tool.get("name", "unknown_tool"),
-            str(tool.get("args", {})),
-            ", ".join(flags) or "protected",
+            args_str,
+            _format_policy_flags(policy),
         )
-    console.print(Panel(table, title="[bold yellow]Approval Required[/]", border_style="yellow"))
-    answer = (
-        await session.prompt_async(
-            HTML('<style fg="#ansiyellow">Approve tool execution? [y/N]: </style>')
+    console.print(
+        Panel(
+            table,
+            title="[approval.border]⚠  Approval Required[/]",
+            border_style="approval.border",
+            padding=(0, 1),
         )
-    ).strip().lower()
-    return {"approved": answer in {"y", "yes"}}
+    )
+    _valid = {"", "y", "yes", "n", "no"}
+    while True:
+        answer = (
+            await session.prompt_async(
+                HTML('<style fg="#e0af68"> Approve? [Y/n] </style><style fg="#565f89">(enter = approve) </style><style fg="#e0af68">❯</style> ')
+            )
+        ).strip().lower()
+        if answer in _valid:
+            break
+        console.print(f"  [status.warning]⚠[/] [dim]Enter y / n / or press Enter[/]")
+
+    approved = answer in {"", "y", "yes"}
+    status = "[status.success]approved[/]" if approved else "[status.error]denied[/]"
+    console.print(f"  └ {status}")
+    return {"approved": approved}
 
 
 async def run_user_request(
@@ -294,7 +356,9 @@ async def main():
     try:
         config = setup_runtime()
     except Exception as e:
-        console.print(f"[bold red]Config Error:[/] {e}")
+        console.print(
+            Panel(f"[status.error]Config error:[/] {e}", border_style="panel.error", padding=(0, 1))
+        )
         return
 
     store = SessionStore(config.session_state_path)
@@ -303,7 +367,9 @@ async def main():
     try:
         agent_app, tool_registry = await initialize_agent(config)
     except Exception as e:
-        console.print(f"[bold red]Init Error:[/] {e}")
+        console.print(
+            Panel(f"[status.error]Init error:[/] {e}", border_style="panel.error", padding=(0, 1))
+        )
         return
 
     checkpoint_info = tool_registry.checkpoint_info
@@ -336,19 +402,31 @@ async def main():
     def show_session() -> None:
         render_session_info(current_session, checkpoint_info)
 
+    model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
+
+    def _toolbar():
+        return get_bottom_toolbar(model_name=model_name, tools_count=len(tools))
+
+    turn_count = 0
+
     while True:
         try:
             if last_stats:
                 console.print(last_stats, justify="right")
                 last_stats = None
 
-            user_input = (await session.prompt_async(get_prompt_message(), bottom_toolbar=get_bottom_toolbar())).strip()
+            user_input = (await session.prompt_async(get_prompt_message(), bottom_toolbar=_toolbar)).strip()
             if not user_input:
                 continue
             if user_input.lower() in ["exit", "quit"]:
                 break
             if try_handle_command(user_input, tools, reset_session, show_session):
                 continue
+
+            # Print a subtle turn separator after the first message
+            if turn_count > 0:
+                console.print(Rule(style="turn.separator"))
+            turn_count += 1
 
             last_stats = await run_user_request(
                 agent_app,
@@ -361,9 +439,17 @@ async def main():
             )
             store.save_active_session(current_session)
         except (KeyboardInterrupt, asyncio.CancelledError):
+            console.print("[dim]  ✕ cancelled[/]")
             continue
         except Exception as e:
-            console.print(f"[bold red]{format_exception_friendly(e)}[/]")
+            friendly = format_exception_friendly(e)
+            console.print(
+                Panel(
+                    f"[status.error]{friendly}[/]",
+                    border_style="panel.error",
+                    padding=(0, 1),
+                )
+            )
 
     await close_runtime_resources(tool_registry)
 

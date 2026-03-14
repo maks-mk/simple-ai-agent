@@ -224,13 +224,27 @@ class AgentNodes:
         if safety_overlay:
             full_context.append(SystemMessage(content=safety_overlay))
         if unresolved_tool_error:
-            full_context.append(
-                SystemMessage(
-                    content=constants.UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE.format(
-                        error_summary=unresolved_tool_error
+            if "ACCESS_DENIED" in unresolved_tool_error:
+                full_context.append(
+                    SystemMessage(
+                        content=(
+                            "TOOL EXECUTION DENIED BY USER:\n"
+                            f"{unresolved_tool_error}\n\n"
+                            "The user explicitly rejected this tool call. "
+                            "You MUST NOT simulate, emulate, fabricate, or invent any output for the denied tool. "
+                            "Do NOT describe what the tool would have done. "
+                            "Inform the user that the action was denied and ask what they would like to do instead."
+                        )
                     )
                 )
-            )
+            else:
+                full_context.append(
+                    SystemMessage(
+                        content=constants.UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE.format(
+                            error_summary=unresolved_tool_error
+                        )
+                    )
+                )
         if critic_feedback:
             full_context.append(
                 SystemMessage(
@@ -750,6 +764,9 @@ class AgentNodes:
             "не выполнена",
             "не удалось проверить",
             "не удалось подтвердить",
+            "отказан",
+            "отклонён",
+            "не разрешен",
             "cannot",
             "can't",
             "could not",
@@ -757,6 +774,11 @@ class AgentNodes:
             "failed",
             "error",
             "blocker",
+            "denied",
+            "access denied",
+            "access_denied",
+            "cancelled by",
+            "was cancelled",
         )
         return any(marker in normalized for marker in failure_markers)
 

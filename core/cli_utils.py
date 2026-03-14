@@ -21,8 +21,10 @@ def get_key_bindings():
     @kb.add('enter')
     def _(event):
         buf = event.current_buffer
-        if not buf.text.strip():
-            return
+        # Allow empty Enter through so callers that treat "" as a default
+        # (e.g. approval prompt with default-yes) work correctly.
+        # Only suppress bare Enter in the *main* chat loop — that's handled
+        # by the `if not user_input: continue` guard in agent_cli.py.
         buf.validate_and_handle()
 
     @kb.add('escape', 'enter')

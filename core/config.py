@@ -54,6 +54,13 @@ def _env_file_candidates() -> tuple[Path, ...]:
     return tuple(seen)
 
 
+def _resolve_runtime_path(value: Union[str, Path], *, base_dir: Path = BASE_DIR) -> Path:
+    path = value if isinstance(value, Path) else Path(value)
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
 class AgentConfig(BaseSettings):
     """
     Конфигурация агента, загружаемая из переменных окружения и .env файла.
@@ -173,6 +180,18 @@ class AgentConfig(BaseSettings):
         if value < 1:
             raise ValueError("MAX_FILE_SIZE must be greater than 0.")
         return value
+
+    @field_validator(
+        "prompt_path",
+        "mcp_config_path",
+        "checkpoint_sqlite_path",
+        "session_state_path",
+        "run_log_dir",
+        mode="before",
+    )
+    @classmethod
+    def resolve_path_fields(cls, v: Union[str, Path]) -> Path:
+        return _resolve_runtime_path(v)
 
     @field_validator("max_loops", mode="before")
     @classmethod

@@ -1,6 +1,6 @@
 # Autonomous AI Agent
 
-**v0.5b**
+**v0.6b**
 
 Автономный CLI-агент на базе LangGraph с durable checkpointing, session resume, policy-driven tool execution, approval gate для опасных действий, MCP-интеграцией и встроенным `critic`-узлом для проверки завершённости задачи.
 
@@ -19,16 +19,55 @@
 - Read-only инструменты запускаются параллельно через `asyncio.gather` — ускоряет батчевые операции чтения/поиска.
 - Детектор зацикливания с раздельными лимитами для read-only и mutating инструментов.
 
+## UI/UX улучшения (patch)
+
+**`core/constants.py`**
+- `AGENT_VERSION` вынесен как единый источник истины; хардкод версии из `agent_cli.py` удалён.
+
+**`core/ui_theme.py`**
+- Добавлено 15 новых именованных стилей: `tool.timing`, `tool.badge`, `agent.node`, `approval.border/danger/mutating/networked`, `turn.separator`, `stats.text/time/tokens`, `init.step/info`, `panel.error/warning`.
+
+**`core/stream_processor.py`**
+- Исправлен главный UX-баг: спиннер и частичный текст теперь отображаются одновременно через `RichGroup` — пользователь всегда видит, что агент работает.
+- Спиннер показывает контекстный лейбл по активному узлу: `Thinking`, `Verifying`, `Compressing`, `Running`, с elapsed time.
+- Отслеживание активного узла графа через поле `active_node`.
+- Тайминг каждого tool-вызова: `▶ tool_name(...)` при старте, `✔ summary 1.4s` при завершении.
+- Иконка запуска инструмента заменена с `›` на `▶` (`tool.badge`).
+
+**`core/text_utils.py`**
+- `_rewrite_local_file_links()`: локальные Markdown-ссылки `[имя.md](имя.md)` автоматически конвертируются в инлайн-код `` `имя.md` `` до передачи в Rich — устраняет URL-кодирование кириллицы в именах файлов (`%D0%BC%D0%BE%D0%B4...`).
+
+**`core/nodes.py`**
+- При `ACCESS_DENIED` агент получает жёсткий системный оверлей вместо общего `UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE` — запрещает симулировать, эмулировать или выдумывать результат отклонённого вызова.
+- Расширен список `failure_markers` в `_assistant_acknowledges_unresolved_tool_error`: добавлены `denied`, `access_denied`, `cancelled by`, `was cancelled`, `отказан`, `отклонён` — critic теперь правильно завершает цикл после явного отказа пользователя.
+
+**`agent_cli.py`**
+- `render_header`: версия из `AGENT_VERSION`, цветной иконочный индикатор провайдера (`◆`).
+- `get_bottom_toolbar`: динамический — показывает имя модели и количество инструментов.
+- `render_tools`: добавлены колонки `#` и `Flags` (MCP-метка), описание обрезается до 72 символов с `…`.
+- `render_help`: переверстан с выравниванием по правому краю, убраны псевдоразделители из дефисов.
+- `render_session_info`: компактная таблица с иконками backend (`▣` sqlite, `○` postgres, `◦` memory), ID обрезаются до 16 символов.
+- `render_runtime_status`: каждая строка окрашена: `✔` зелёный / `⚠` жёлтый / `✖` красный по ключевым словам.
+- `initialize_agent`: прогресс-статус с именем провайдера и модели, `✔ Agent ready` после загрузки.
+- `prompt_for_interrupt`: цветные флаги политики (`destructive`/`mutating`/`networked`), валидация ввода в цикле — принимает только `y/n/Enter`, на любой другой ввод выводит подсказку и переспрашивает. По умолчанию Enter = approve (`[Y/n]`). После выбора явное подтверждение `approved` / `denied`.
+- Главный цикл: тонкий `Rule()` между поворотами разговора, `✕ cancelled` при `Ctrl+C`, ошибки оборачиваются в `Panel(border_style="panel.error")`.
+- Ошибки инициализации (`Config error`, `Init error`) тоже в styled Panel.
+- `_format_policy_flags()` вынесена в отдельную функцию.
+- `cli_utils.py`: убран guard `if not buf.text.strip(): return` из обработчика `enter` — пустой Enter теперь проходит через `validate_and_handle()` (нужно для дефолтного ответа в approval-промпте). Главный цикл по-прежнему игнорирует пустой ввод через `if not user_input: continue`.
+
 ---
 
 ## Возможности
 
 ### CLI и UX
-- Потоковый вывод ответов и статусов инструментов.
-- CLI на `rich` + `prompt_toolkit`.
-- Fuzzy autocomplete для команд и путей.
+- Потоковый вывод ответов: спиннер и накапливающийся текст отображаются одновременно — пользователь всегда видит прогресс.
+- Контекстный спиннер по активному узлу графа: `Thinking` / `Verifying` / `Compressing` / `Running` с elapsed time.
+- Тайминг каждого tool-вызова: `▶ имя(...)` при старте, `✔ summary 1.4s` при завершении.
+- Approval-промпт с цветными флагами политики, валидацией ввода и дефолтом по Enter (`[Y/n]`).
+- Динамический bottom toolbar: имя модели и количество инструментов.
+- CLI на `rich` + `prompt_toolkit`; fuzzy autocomplete для команд и путей.
 - Автовосстановление последней активной сессии.
-- Команда `/session` для просмотра текущего session/thread/checkpoint backend.
+- Команды `/help`, `/tools`, `/session` для быстрого доступа к справке и состоянию.
 
 ### Граф агента
 - Основной поток: `summarize -> update_step -> agent -> approval/tools/critic`.
@@ -277,6 +316,7 @@ python agent_cli.py
 
 - Read-only tools могут выполняться автономно.
 - Mutating/destructive tools по умолчанию требуют approval.
+- При отказе пользователя (`ACCESS_DENIED`) агент не симулирует и не выдумывает результат — явно сообщает об отказе и спрашивает что делать дальше.
 - `cli_exec` отключён по умолчанию и считается high-risk инструментом.
 - `stop_background_process` не завершает внешние процессы без `ALLOW_EXTERNAL_PROCESS_CONTROL=true`.
 - Для production-режима предпочтителен `postgres` backend; для локального CLI — `sqlite`.

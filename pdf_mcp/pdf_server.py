@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 import sys
 from functools import lru_cache
@@ -50,8 +52,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pdf_server")
 
-MAX_PDF_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB (Adjusted for better capacity)
+MAX_PDF_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 FONTS_DIR_NAME = "fonts"
+
+# Download destination for Roboto fallback
+ROBOTO_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "mcp_fonts_roboto"
+
+# System font candidates: (display_name, regular, bold, italic, bold_italic)
+# italic/bold_italic may duplicate regular/bold if no dedicated variant exists
+_SYSTEM_FONT_CANDIDATES: Tuple[Tuple[str, str, str, str, str], ...] = (
+    # Windows
+    ("Arial",
+     r"C:\Windows\Fonts\arial.ttf",
+     r"C:\Windows\Fonts\arialbd.ttf",
+     r"C:\Windows\Fonts\ariali.ttf",
+     r"C:\Windows\Fonts\arialbi.ttf"),
+    ("Verdana",
+     r"C:\Windows\Fonts\verdana.ttf",
+     r"C:\Windows\Fonts\verdanab.ttf",
+     r"C:\Windows\Fonts\verdanai.ttf",
+     r"C:\Windows\Fonts\verdanaz.ttf"),
+    ("Tahoma",
+     r"C:\Windows\Fonts\tahoma.ttf",
+     r"C:\Windows\Fonts\tahomabd.ttf",
+     r"C:\Windows\Fonts\tahoma.ttf",
+     r"C:\Windows\Fonts\tahomabd.ttf"),
+    ("SegoeUI",
+     r"C:\Windows\Fonts\segoeui.ttf",
+     r"C:\Windows\Fonts\segoeuib.ttf",
+     r"C:\Windows\Fonts\segoeuii.ttf",
+     r"C:\Windows\Fonts\segoeuiz.ttf"),
+    # Linux
+    ("DejaVuSans",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf"),
+    ("LiberationSans",
+     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf"),
+    ("FreeSans",
+     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+     "/usr/share/fonts/truetype/freefont/FreeSansOblique.ttf",
+     "/usr/share/fonts/truetype/freefont/FreeSansBoldOblique.ttf"),
+)
+
+# Roboto download URLs (Google Fonts GitHub mirror)
+_ROBOTO_URLS: Dict[str, str] = {
+    "Roboto-Regular":    "https://github.com/googlefonts/roboto-2/raw/main/src/hinted/Roboto-Regular.ttf",
+    "Roboto-Bold":       "https://github.com/googlefonts/roboto-2/raw/main/src/hinted/Roboto-Bold.ttf",
+    "Roboto-Italic":     "https://github.com/googlefonts/roboto-2/raw/main/src/hinted/Roboto-Italic.ttf",
+    "Roboto-BoldItalic": "https://github.com/googlefonts/roboto-2/raw/main/src/hinted/Roboto-BoldItalic.ttf",
+}
 
 # Character replacements for unsupported PDF encodings
 CHAR_REPLACEMENTS = str.maketrans({
@@ -80,7 +135,6 @@ HEADING_RULES: Tuple[Tuple[str, str, int], ...] = (
 
 DEFAULT_DOC_MARGIN = 50
 DEFAULT_IMAGE_MAX_WIDTH = 6 * inch
-DEFAULT_FONT_NAME = "Roboto-Regular"
 DEFAULT_EDIT_SUFFIX = "_edited.pdf"
 DEFAULT_ROTATE_SUFFIX = "_rot.pdf"
 LINE_GROUP_TOLERANCE = 5.0
@@ -98,8 +152,15 @@ class PDFProcessingError(Exception):
 # ---------------------------------------------------------------------------
 
 class FontManager:
-    """Handles font registration and path management."""
-    
+    """
+    Handles font registration with a three-level fallback chain:
+    1. Local ./fonts directory (Roboto TTF files placed manually)
+    2. System fonts with Cyrillic support (Windows: Arial/Verdana/Tahoma/Segoe UI,
+       Linux: DejaVu Sans / Liberation Sans / Free Sans)
+    3. Auto-download Roboto from Google Fonts GitHub mirror into a temp directory
+       (requires internet access, only on first run)
+    """
+
     _fonts_cache: Optional[Dict[str, str]] = None
 
     @classmethod
@@ -109,22 +170,39 @@ class FontManager:
     @classmethod
     def ensure_fonts(cls) -> Dict[str, str]:
         """
-        Registers Roboto fonts from the local './fonts' directory.
-        Call once; results are cached for the process lifetime.
+        Returns a font dict with keys: regular, bold, italic, mono, path_regular.
+        Results are cached for the process lifetime.
         """
         if cls._fonts_cache is not None:
             return cls._fonts_cache
 
+        # Strategy 1: local ./fonts directory
+        result = cls._try_local_fonts()
+        if result:
+            logger.info("Fonts loaded from local directory: %s", cls.get_fonts_dir())
+            cls._fonts_cache = result
+            return result
+
+        # Strategy 2: system fonts
+        result = cls._try_system_fonts()
+        if result:
+            cls._fonts_cache = result
+            return result
+
+        # Strategy 3: download Roboto
+        logger.info(
+            "No local or system fonts found. Downloading Roboto to %s (internet required)...",
+            ROBOTO_DOWNLOAD_DIR,
+        )
+        result = cls._download_roboto()
+        cls._fonts_cache = result
+        return result
+
+    @classmethod
+    def _try_local_fonts(cls) -> Optional[Dict[str, str]]:
         fonts_dir = cls.get_fonts_dir()
         if not fonts_dir.exists():
-            # Fallback to system fonts or warning if critical
-            # For now, we raise error as per requirements, but in prod we might fallback
-            raise PDFProcessingError(
-                f"Fonts directory not found: {fonts_dir}\n"
-                f"Create a '{FONTS_DIR_NAME}' folder next to the script and place "
-                f"Roboto-Regular.ttf, Roboto-Bold.ttf, Roboto-Italic.ttf, "
-                f"Roboto-BoldItalic.ttf inside it."
-            )
+            return None
 
         variants = {
             "Roboto-Regular":    "Roboto-Regular.ttf",
@@ -132,38 +210,122 @@ class FontManager:
             "Roboto-Italic":     "Roboto-Italic.ttf",
             "Roboto-BoldItalic": "Roboto-BoldItalic.ttf",
         }
-
         paths: Dict[str, str] = {}
         for font_name, filename in variants.items():
             file_path = fonts_dir / filename
             if not file_path.exists():
-                raise PDFProcessingError(
-                    f"Required font file missing: {filename}\n"
-                    f"Expected location: {file_path}"
-                )
-            
+                logger.debug("Local font missing: %s", file_path)
+                return None
             if font_name not in pdfmetrics.getRegisteredFontNames():
                 pdfmetrics.registerFont(TTFont(font_name, str(file_path)))
             paths[font_name] = str(file_path)
 
-        # Register family mapping so <b> and <i> tags work in ReportLab paragraphs
+        cls._register_roboto_family_mapping()
+        return {
+            "regular":      "Roboto-Regular",
+            "bold":         "Roboto-Bold",
+            "italic":       "Roboto-Italic",
+            "mono":         "Roboto-Regular",
+            "path_regular": paths["Roboto-Regular"],
+        }
+
+    @classmethod
+    def _try_system_fonts(cls) -> Optional[Dict[str, str]]:
+        for display_name, regular, bold, italic, bold_italic in _SYSTEM_FONT_CANDIDATES:
+            reg_path = Path(regular)
+            bold_path = Path(bold)
+            if not reg_path.exists() or not bold_path.exists():
+                continue
+
+            ital_path = Path(italic)
+            bi_path = Path(bold_italic)
+            # Gracefully degrade if italic variants are missing
+            if not ital_path.exists():
+                ital_path = reg_path
+            if not bi_path.exists():
+                bi_path = bold_path
+
+            reg_name  = f"{display_name}-Regular"
+            bold_name = f"{display_name}-Bold"
+            ital_name = f"{display_name}-Italic"
+            bi_name   = f"{display_name}-BoldItalic"
+
+            try:
+                for font_name, path in (
+                    (reg_name,  reg_path),
+                    (bold_name, bold_path),
+                    (ital_name, ital_path),
+                    (bi_name,   bi_path),
+                ):
+                    if font_name not in pdfmetrics.getRegisteredFontNames():
+                        pdfmetrics.registerFont(TTFont(font_name, str(path)))
+
+                try:
+                    addMapping(reg_name, 0, 0, reg_name)
+                    addMapping(reg_name, 1, 0, bold_name)
+                    addMapping(reg_name, 0, 1, ital_name)
+                    addMapping(reg_name, 1, 1, bi_name)
+                except Exception as e:
+                    logger.warning("Font mapping for %s failed: %s", display_name, e)
+
+                logger.info("Using system font: %s (%s)", display_name, reg_path)
+                return {
+                    "regular":      reg_name,
+                    "bold":         bold_name,
+                    "italic":       ital_name,
+                    "mono":         reg_name,
+                    "path_regular": str(reg_path),
+                }
+            except Exception as e:
+                logger.debug("System font %s failed to register: %s", display_name, e)
+                continue
+
+        return None
+
+    @classmethod
+    def _download_roboto(cls) -> Dict[str, str]:
+        ROBOTO_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        paths: Dict[str, str] = {}
+
+        for font_name, url in _ROBOTO_URLS.items():
+            dest = ROBOTO_DOWNLOAD_DIR / f"{font_name}.ttf"
+            if not dest.exists():
+                try:
+                    urllib.request.urlretrieve(url, str(dest))
+                    logger.info("Downloaded %s", font_name)
+                except urllib.error.URLError as e:
+                    raise PDFProcessingError(
+                        f"Failed to download font '{font_name}': {e}\n"
+                        f"Options:\n"
+                        f"  1. Create a '{FONTS_DIR_NAME}' folder next to the script and place "
+                        f"Roboto TTF files inside it.\n"
+                        f"  2. Ensure internet access for automatic download.\n"
+                        f"  3. Install a supported system font (Windows: Arial/Verdana/Tahoma/Segoe UI; "
+                        f"Linux: DejaVu Sans / Liberation Sans)."
+                    )
+            if font_name not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont(font_name, str(dest)))
+            paths[font_name] = str(dest)
+
+        cls._register_roboto_family_mapping()
+        logger.info("Roboto fonts ready at %s", ROBOTO_DOWNLOAD_DIR)
+        return {
+            "regular":      "Roboto-Regular",
+            "bold":         "Roboto-Bold",
+            "italic":       "Roboto-Italic",
+            "mono":         "Roboto-Regular",
+            "path_regular": paths["Roboto-Regular"],
+        }
+
+    @staticmethod
+    def _register_roboto_family_mapping() -> None:
         try:
             addMapping("Roboto-Regular", 0, 0, "Roboto-Regular")
             addMapping("Roboto-Regular", 1, 0, "Roboto-Bold")
             addMapping("Roboto-Regular", 0, 1, "Roboto-Italic")
             addMapping("Roboto-Regular", 1, 1, "Roboto-BoldItalic")
         except Exception as e:
-            logger.warning(f"Font mapping registration failed: {e}")
-
-        cls._fonts_cache = {
-            "regular":      "Roboto-Regular",
-            "bold":         "Roboto-Bold",
-            "italic":       "Roboto-Italic",
-            "mono":         "Roboto-Regular",  # Fallback to Roboto-Regular for Cyrillic support
-            "path_regular": paths["Roboto-Regular"],
-        }
-        #logger.info(f"Fonts registered from {fonts_dir}")
-        return cls._fonts_cache
+            logger.warning("Roboto family mapping failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # ReportLab Components
@@ -171,7 +333,7 @@ class FontManager:
 
 class SeparatorLine(Flowable):
     """Draws a horizontal separator line."""
-    
+
     def __init__(self, width_percent=100, thickness=0.5, color=colors.grey, space_after=10):
         super().__init__()
         self.width_percent = width_percent
@@ -229,16 +391,12 @@ class PDFGenerator:
         """Parses inline Markdown and converts to ReportLab XML tags."""
         if not text:
             return ""
-
-        # markdown() handles escaping — do NOT unescape &amp; afterwards
         html = md_lib.markdown(text)
         for old, new in MARKDOWN_TAG_REPLACEMENTS:
             html = html.replace(old, new)
-
         return html.strip()
 
     def _inline(self, text: str) -> str:
-        """Helper to clean and convert text for inline display."""
         return self._markdown_to_reportlab(self._clean_text(text))
 
     def _normalize_for_compare(self, text: str) -> str:
@@ -264,7 +422,6 @@ class PDFGenerator:
         if not image_path.exists():
             story.append(Paragraph(f"[Image not found: {image_path.name}]", styles["body"]))
             return
-
         try:
             img = RLImage(str(image_path))
             if img.drawWidth > DEFAULT_IMAGE_MAX_WIDTH:
@@ -278,23 +435,18 @@ class PDFGenerator:
             story.append(Paragraph(f"[Error loading image: {image_path.name}]", styles["body"]))
 
     def _create_table(self, buf: List[str]) -> Optional[Table]:
-        """Creates a ReportLab Table from a buffer of markdown table rows."""
         if not buf:
             return None
-
         rows = []
         body_style = self.styles["body"]
         inline = self._inline
         for row_str in buf:
             cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
-            # Skip separator lines like |---|---|
             if cells and all(TABLE_SEPARATOR_CELL_RE.match(c) for c in cells if c):
                 continue
             rows.append([Paragraph(inline(c), body_style) for c in cells])
-
         if not rows:
             return None
-
         t = Table(rows, hAlign="LEFT")
         t.setStyle(TableStyle([
             ("BACKGROUND",    (0, 0), (-1, 0),  colors.HexColor("#ecf0f1")),
@@ -330,12 +482,10 @@ class PDFGenerator:
         for prefix, style_key, skip in HEADING_RULES:
             if not stripped.startswith(prefix):
                 continue
-
             heading_text = stripped[skip:].strip()
             heading_norm = self._normalize_for_compare(heading_text)
             if prefix == "# " and not title_deduped and self._is_title_duplicate(title_norm, heading_norm):
                 return True, True
-
             story.append(Paragraph(inline(heading_text), styles[style_key]))
             return True, title_deduped
         return False, title_deduped
@@ -343,30 +493,25 @@ class PDFGenerator:
     def _handle_special_line(self, story: List[Flowable], stripped: str) -> bool:
         styles = self.styles
         inline = self._inline
-
         if HORIZONTAL_RULE_RE.match(stripped):
             story.append(SeparatorLine())
             return True
-
         img_match = MARKDOWN_IMAGE_RE.match(stripped)
         if img_match:
             alt, image_path_str = img_match.groups()
             self._append_image_block(story, alt, Path(image_path_str).resolve())
             return True
-
         if stripped.startswith("> "):
             story.append(Paragraph(inline(stripped[2:]), styles["quote"]))
             return True
-
         if stripped.startswith(("- ", "* ")):
             story.append(Paragraph(f"• {inline(stripped[2:])}", styles["bullet"]))
             return True
-
         return False
+
     def create_pdf(self, output_path: Path, title: str, content: str) -> str:
         """Generates a PDF file from markdown content."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
         styles = self.styles
         inline = self._inline
         story: List[Flowable] = [Paragraph(inline(title), styles["title"]), Spacer(1, 10)]
@@ -378,7 +523,6 @@ class PDFGenerator:
 
         for line in content.splitlines():
             stripped = line.strip()
-
             if stripped.startswith("```"):
                 if in_code:
                     story.append(Paragraph(self._render_code_block(code_lines), styles["code"]))
@@ -388,29 +532,23 @@ class PDFGenerator:
                     self._flush_table_buffer(story, table_buf)
                     in_code = True
                 continue
-
             if in_code:
                 code_lines.append(line)
                 continue
-
             if stripped.startswith("|"):
                 table_buf.append(stripped)
                 continue
-
             self._flush_table_buffer(story, table_buf)
             if not stripped:
                 continue
             if self._handle_special_line(story, stripped):
                 continue
-
             matched_heading, title_deduped = self._handle_heading(story, stripped, title_norm, title_deduped)
             if matched_heading:
                 continue
-
             story.append(Paragraph(inline(stripped), styles["body"]))
 
         self._flush_table_buffer(story, table_buf)
-
         SimpleDocTemplate(
             str(output_path),
             pagesize=A4,
@@ -419,7 +557,6 @@ class PDFGenerator:
             topMargin=DEFAULT_DOC_MARGIN,
             bottomMargin=DEFAULT_DOC_MARGIN,
         ).build(story)
-
         return f"PDF created: {output_path} (Font: {self.fonts['regular']})"
 
 # ---------------------------------------------------------------------------
@@ -432,16 +569,12 @@ class PDFProcessor:
     @staticmethod
     def validate_file(pdf_path: str) -> Path:
         """Validates existence, extension and size of a PDF file."""
-        # Performance: Use resolve() directly which handles both absolute and relative paths
-        # relative to CWD. Avoid iterating multiple base paths if possible.
         try:
             path = Path(pdf_path).resolve(strict=True)
         except (FileNotFoundError, OSError):
-            # Fallback for some edge cases where CWD isn't implicit (rare)
             path = (Path(os.getcwd()) / pdf_path).resolve()
             if not path.exists():
                 raise PDFProcessingError(f"PDF file not found: {pdf_path}")
-
         if not path.is_file():
             raise PDFProcessingError(f"Path is not a file: {path}")
         if path.suffix.lower() != ".pdf":
@@ -462,7 +595,6 @@ class PDFProcessor:
     def _collect_search_hits(page: fitz.Page, query: str, case_sensitive: bool) -> List[fitz.Rect]:
         if case_sensitive:
             return page.search_for(query)
-
         hits: List[fitz.Rect] = []
         seen = set()
         variants = tuple(dict.fromkeys((query, query.lower(), query.upper(), query.title())))
@@ -509,7 +641,7 @@ class PDFProcessor:
     def extract_text(pdf_path: str, page_start: int = 1, page_end: Optional[int] = None, sort: bool = True) -> str:
         """
         Extracts text from a page range.
-        
+
         Args:
             sort: If True, sorts text blocks by vertical/horizontal position.
                   Set to False for faster extraction if layout order doesn't matter.
@@ -519,22 +651,13 @@ class PDFProcessor:
             total = len(doc)
             start = max(1, page_start)
             end = min(total, page_end if page_end is not None else total)
-
             if start > end:
                 return f"Error: invalid page range {start}-{end} (total pages: {total})"
-
             pages = []
-            # Optimization: Pre-allocate list size if possible, but python lists are dynamic.
-            # Using list comprehension or generator is faster than append in loop for simple cases,
-            # but here logic is complex.
             for i in range(start - 1, end):
-                # Optimization: 'blocks' is structure-aware. 'text' is faster if structure not needed.
-                # We stick to blocks for consistency but allow disabling sort.
                 blocks = doc[i].get_text("blocks", sort=sort)
-                # Block format: (x0, y0, x1, y1, text, block_no, block_type)
                 text = "\n".join(b[4] for b in blocks if b[6] == 0).strip()
                 pages.append(f"[Page {i + 1}]\n{text}")
-
             header = f"[PDF: {path.name} | Pages {start}-{end} of {total}]\n\n"
             return header + "\n\n".join(pages)
 
@@ -544,7 +667,6 @@ class PDFProcessor:
         path = PDFProcessor.validate_file(pdf_path)
         if not query:
             return "Not found"
-
         results: List[str] = []
         with fitz.open(path) as doc:
             for page_idx, page in enumerate(doc):
@@ -552,8 +674,6 @@ class PDFProcessor:
                 hits = PDFProcessor._collect_search_hits(page, query, case_sensitive)
                 if not hits:
                     continue
-
-                # Heuristic: clipped extraction is cheaper for a few hits, full page for many.
                 if len(hits) < 5:
                     for occ_idx, rect in enumerate(hits, start=1):
                         clip_rect = fitz.Rect(rect.x0 - 50, rect.y0 - 20, rect.x1 + 50, rect.y1 + 20)
@@ -565,12 +685,10 @@ class PDFProcessor:
                             f'| context: "...{context}..."'
                         )
                     continue
-
                 page_text = page.get_text()
                 lower_page = page_text.lower()
                 lower_q = query.lower()
                 search_off = 0
-
                 for occ_idx, rect in enumerate(hits, start=1):
                     pos = lower_page.find(lower_q, search_off)
                     ctx_str = ""
@@ -580,13 +698,11 @@ class PDFProcessor:
                         context = page_text[ctx_s:ctx_e].replace("\n", " ").strip()
                         ctx_str = f' | context: "...{context}..."'
                         search_off = pos + 1
-
                     results.append(
                         f"Page {page_num} occurrence #{occ_idx}: "
                         f"rect=({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f})"
                         f"{ctx_str}"
                     )
-
         if not results:
             return "Not found"
         return f"Found {len(results)} occurrence(s):\n" + "\n".join(results)
@@ -596,7 +712,6 @@ class PDFProcessor:
         """Detects dominant font size and color in a rect."""
         defaults = {"size": 11.0, "color": (0, 0, 0)}
         try:
-            # Optimization: limit clip to exact rect to reduce parsing
             blocks = page.get_text("dict", clip=rect)["blocks"]
             spans = [
                 span
@@ -607,7 +722,6 @@ class PDFProcessor:
             ]
             if not spans:
                 return defaults
-
             span = max(spans, key=lambda s: s["size"])
             raw = span.get("color", 0)
             return {
@@ -618,35 +732,30 @@ class PDFProcessor:
             return defaults
 
     @staticmethod
-    def _insert_textbox_with_font_fallback(
+    def _insert_textbox(
         page: fitz.Page,
         rect: fitz.Rect,
         text: str,
         fontsize: float,
-        color: tuple[float, float, float],
+        color: Tuple[float, float, float],
+        fontname: str,
         font_path: str,
     ) -> float:
-        """Inserts text with a lightweight fallback when the font isn't already present."""
-        try:
-            return page.insert_textbox(
-                rect,
-                text,
-                fontsize=fontsize,
-                fontname=DEFAULT_FONT_NAME,
-                fontfile=None,
-                color=color,
-                align=0,
-            )
-        except Exception:
-            return page.insert_textbox(
-                rect,
-                text,
-                fontsize=fontsize,
-                fontname=DEFAULT_FONT_NAME,
-                fontfile=font_path,
-                color=color,
-                align=0,
-            )
+        """
+        Inserts text into a rect using the specified font.
+        Always loads the font from file to guarantee Cyrillic support
+        regardless of prior registration state.
+        Returns remaining space (negative = overflow).
+        """
+        return page.insert_textbox(
+            rect,
+            text,
+            fontsize=fontsize,
+            fontname=fontname,
+            fontfile=font_path,
+            color=color,
+            align=0,
+        )
 
     @classmethod
     def edit_text(
@@ -674,10 +783,12 @@ class PDFProcessor:
             total = len(groups)
             if occurrence == 0:
                 target_groups = groups
+                occurrence_desc = f"all {total} occurrence(s)"
             elif 1 <= occurrence <= total:
                 target_groups = [groups[occurrence - 1]]
+                occurrence_desc = f"occurrence #{occurrence} of {total}"
             else:
-                return f"Occurrence {occurrence} not found. Total: {total}"
+                return f"Occurrence {occurrence} not found. Total occurrences on this page: {total}"
 
             for group in target_groups:
                 for rect in group:
@@ -694,17 +805,17 @@ class PDFProcessor:
                     style = cls._detect_text_style(page, bbox)
                     fontsize = style["size"]
                     line_height = fontsize * 1.4
-
                     needed_h = replacement_lines * line_height + fontsize
                     orig_h = bbox.y1 - bbox.y0
                     insert_bbox = fitz.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y0 + max(orig_h, needed_h))
 
-                    result = cls._insert_textbox_with_font_fallback(
+                    result = cls._insert_textbox(
                         page,
                         insert_bbox,
                         new_text,
                         fontsize,
                         style["color"],
+                        fonts["regular"],
                         fonts["path_regular"],
                     )
 
@@ -721,7 +832,8 @@ class PDFProcessor:
             out = output_path or cls._default_output_path(path, DEFAULT_EDIT_SUFFIX)
             cls._save_optimized(doc, out)
 
-        msg = f"Saved to {out} (replaced {len(target_groups)} occurrences)"
+        action = "deleted" if not new_text.strip() else "replaced"
+        msg = f"Saved to {out} ({action} {occurrence_desc})"
         if warnings:
             msg += "\n" + "\n".join(warnings)
         return msg
@@ -761,12 +873,13 @@ class PDFProcessor:
             if rect.y1 > page_height - 20:
                 rect = fitz.Rect(rect.x0, rect.y0, rect.x1, page_height - 20)
 
-            result = cls._insert_textbox_with_font_fallback(
+            result = cls._insert_textbox(
                 page,
                 rect,
                 text,
                 fontsize,
                 (0, 0, 0),
+                fonts["regular"],
                 fonts["path_regular"],
             )
 
@@ -795,25 +908,21 @@ class PDFProcessor:
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         files: List[str] = []
-
         with fitz.open(path) as doc:
             for idx, token in enumerate(ranges, start=1):
                 parsed = PDFProcessor._split_range_token(token)
                 if parsed is None:
                     logger.warning(f"Invalid range: {token}")
                     continue
-
                 start, end = parsed
                 start, end = max(1, start), min(len(doc), end)
                 if start > end:
                     continue
-
                 fname = out_dir / f"split_{idx}_{start}-{end}.pdf"
                 with fitz.open() as new_doc:
                     new_doc.insert_pdf(doc, from_page=start - 1, to_page=end - 1)
                     new_doc.save(fname)
                 files.append(str(fname))
-
         return f"Created {len(files)} files in {out_dir}"
 
     @staticmethod
@@ -830,12 +939,22 @@ class PDFProcessor:
         return f"Rotated pages saved to {out}"
 
     @staticmethod
-    def extract_images(pdf_path: str) -> str:
-        """Extracts images to a ZIP file."""
+    def extract_images(pdf_path: str, output_path: Optional[str] = None) -> str:
+        """
+        Extracts images to a ZIP file.
+
+        Args:
+            output_path: Path for the ZIP archive. Defaults to <pdf_name>_images.zip
+                         in the same directory as the source PDF.
+        """
         path = PDFProcessor.validate_file(pdf_path)
-        zip_path = Path(tempfile.gettempdir()) / f"{path.stem}_images.zip"
+
+        if output_path:
+            zip_path = Path(output_path)
+        else:
+            zip_path = path.parent / f"{path.stem}_images.zip"
+
         count = 0
-        
         with fitz.open(path) as doc, zipfile.ZipFile(zip_path, "w") as zf:
             for i, page in enumerate(doc):
                 for img in page.get_images(full=True):
@@ -846,7 +965,7 @@ class PDFProcessor:
                         count += 1
                     except Exception as e:
                         logger.warning(f"Image extract error: {e}")
-        
+
         return f"Extracted {count} images to {zip_path}"
 
     @staticmethod
@@ -855,19 +974,34 @@ class PDFProcessor:
         if not image_paths:
             raise PDFProcessingError("No images provided")
 
+        added_count = 0
+        skipped: List[str] = []
+
         with fitz.open() as doc:
             for image in image_paths:
-                path = Path(image).resolve()
-                if not path.exists():
+                img_path = Path(image).resolve()
+                if not img_path.exists():
+                    skipped.append(image)
                     continue
-                with fitz.open(path) as img:
-                    rect = img[0].rect
-                    pdf_bytes = img.convert_to_pdf()
-                    with fitz.open("pdf", pdf_bytes) as img_pdf:
-                        doc.new_page(width=rect.width, height=rect.height).show_pdf_page(rect, img_pdf, 0)
+                try:
+                    with fitz.open(img_path) as img:
+                        rect = img[0].rect
+                        pdf_bytes = img.convert_to_pdf()
+                        with fitz.open("pdf", pdf_bytes) as img_pdf:
+                            doc.new_page(width=rect.width, height=rect.height).show_pdf_page(
+                                rect, img_pdf, 0
+                            )
+                    added_count += 1
+                except Exception as e:
+                    logger.warning("Failed to add image %s: %s", image, e)
+                    skipped.append(image)
+
             PDFProcessor._save_optimized(doc, output_path)
 
-        return f"PDF created from {len(image_paths)} images at {output_path}"
+        msg = f"PDF created from {added_count} image(s) at {output_path}"
+        if skipped:
+            msg += f"\nSkipped {len(skipped)} file(s) (not found or unreadable): {', '.join(skipped)}"
+        return msg
 
 # ---------------------------------------------------------------------------
 # MCP Server & Tool Definitions
@@ -977,12 +1111,12 @@ def _register_pdf_tools() -> None:
         ),
         (
             "pdf_extract_images",
-            "[PDF ONLY] Extracts images to ZIP.",
-            lambda pdf_path: _run_tool(PDFProcessor.extract_images, "Image extraction failed", pdf_path),
+            "[PDF ONLY] Extracts images to ZIP. output_path is optional; defaults to <pdf_name>_images.zip next to the source file.",
+            lambda pdf_path, output_path=None: _run_tool(PDFProcessor.extract_images, "Image extraction failed", pdf_path, output_path),
         ),
         (
             "pdf_from_images",
-            "[PDF ONLY] Creates PDF from images.",
+            "[PDF ONLY] Creates PDF from images. Reports how many images were actually added.",
             lambda image_paths, output_path: _run_tool(PDFProcessor.images_to_pdf, "Conversion failed", image_paths, output_path),
         ),
     ]
@@ -995,13 +1129,6 @@ _register_pdf_tools()
 
 
 if __name__ == "__main__":
-    # Пишем информацию о запуске в stderr
-    #logger.info("=== Starting Local PDF MCP Server ===")
-    #logger.info(f"Максимальный размер PDF: {MAX_PDF_SIZE_BYTES / 1024 / 1024:.0f} MB")
-    #logger.info(f"Ожидаемая папка со шрифтами: {FontManager.get_fonts_dir()}")
-    
-    # Можно сразу проверить наличие шрифтов при запуске, 
-    # чтобы сервер упал с понятной ошибкой до того, как к нему обратится ИИ
     try:
         FontManager.ensure_fonts()
         logger.info("Fonts loaded successfully.")
@@ -1010,14 +1137,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     logger.info("Server started successfully and listening on stdio...")
-    
+
     try:
-        # Запускаем сервер
         mcp.run()
     except KeyboardInterrupt:
-        # Перехватываем нажатие Ctrl+C
         logger.info("Received shutdown signal (Ctrl+C). Shutting down gracefully...")
         sys.exit(0)
-
-
-

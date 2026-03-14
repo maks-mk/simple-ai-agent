@@ -1,5 +1,0 @@
-# Requirements for pdf_mcp/pdf_server.py
-mcp[cli]
-pymupdf
-reportlab
-markdown

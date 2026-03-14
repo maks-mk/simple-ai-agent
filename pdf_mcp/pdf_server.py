@@ -58,9 +58,29 @@ FONTS_DIR_NAME = "fonts"
 # Download destination for Roboto fallback
 ROBOTO_DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "mcp_fonts_roboto"
 
+# True monospace candidates for inline/code rendering.
+_MONO_FONT_NAMES: frozenset[str] = frozenset({"CourierNew", "DejaVuSansMono", "LiberationMono"})
+
 # System font candidates: (display_name, regular, bold, italic, bold_italic)
 # italic/bold_italic may duplicate regular/bold if no dedicated variant exists
 _SYSTEM_FONT_CANDIDATES: Tuple[Tuple[str, str, str, str, str], ...] = (
+    # Windows monospace
+    ("CourierNew",
+     r"C:\Windows\Fonts\cour.ttf",
+     r"C:\Windows\Fonts\courbd.ttf",
+     r"C:\Windows\Fonts\couri.ttf",
+     r"C:\Windows\Fonts\courbi.ttf"),
+    # Linux monospace
+    ("DejaVuSansMono",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf"),
+    ("LiberationMono",
+     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
+     "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf"),
     # Windows
     ("Arial",
      r"C:\Windows\Fonts\arial.ttf",
@@ -110,22 +130,14 @@ _ROBOTO_URLS: Dict[str, str] = {
 
 # Character replacements for unsupported PDF encodings
 CHAR_REPLACEMENTS = str.maketrans({
-    "•": "-", "●": "-", "▪": "-", "—": "-", "–": "-",
-    "│": "|", "─": "-", "┌": "",  "┐": "",  "└": "",  "┘": "",
-    "«": '"', "»": '"', "…": "...", "№": "N",
+    "•": "-", "●": "-", "▪": "-",
+    "│": "|", "─": "-", "┌": "+", "┐": "+", "└": "+", "┘": "+",
+    "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
 })
 
 TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
 HORIZONTAL_RULE_RE = re.compile(r"^(-{3,}|\*{3,})$")
 MARKDOWN_IMAGE_RE = re.compile(r"!\[(.*?)\]\((.*?)\)$")
-MARKDOWN_TAG_REPLACEMENTS = (
-    ("<strong>", "<b>"), ("</strong>", "</b>"),
-    ("<em>", "<i>"), ("</em>", "</i>"),
-    ("<p>", ""), ("</p>", ""),
-    ("<code>", '<font name="Courier" backColor="#f0f0f0">'),
-    ("</code>", "</font>"),
-)
-
 HEADING_RULES: Tuple[Tuple[str, str, int], ...] = (
     ("#### ", "h4", 5),
     ("### ", "h3", 4),
@@ -231,6 +243,9 @@ class FontManager:
 
     @classmethod
     def _try_system_fonts(cls) -> Optional[Dict[str, str]]:
+        mono_name: Optional[str] = None
+        proportional_result: Optional[Dict[str, str]] = None
+
         for display_name, regular, bold, italic, bold_italic in _SYSTEM_FONT_CANDIDATES:
             reg_path = Path(regular)
             bold_path = Path(bold)
@@ -268,19 +283,33 @@ class FontManager:
                 except Exception as e:
                     logger.warning("Font mapping for %s failed: %s", display_name, e)
 
-                logger.info("Using system font: %s (%s)", display_name, reg_path)
-                return {
-                    "regular":      reg_name,
-                    "bold":         bold_name,
-                    "italic":       ital_name,
-                    "mono":         reg_name,
-                    "path_regular": str(reg_path),
-                }
+                if display_name in _MONO_FONT_NAMES:
+                    if mono_name is None:
+                        mono_name = reg_name
+                        logger.info("Using system mono font: %s (%s)", display_name, reg_path)
+                    continue
+
+                if proportional_result is None:
+                    logger.info("Using system font: %s (%s)", display_name, reg_path)
+                    proportional_result = {
+                        "regular":      reg_name,
+                        "bold":         bold_name,
+                        "italic":       ital_name,
+                        "mono":         reg_name,
+                        "path_regular": str(reg_path),
+                    }
+
+                if mono_name is not None:
+                    break
             except Exception as e:
                 logger.debug("System font %s failed to register: %s", display_name, e)
                 continue
 
-        return None
+        if proportional_result is None:
+            return None
+
+        proportional_result["mono"] = mono_name or proportional_result["regular"]
+        return proportional_result
 
     @classmethod
     def _download_roboto(cls) -> Dict[str, str]:
@@ -387,14 +416,24 @@ class PDFGenerator:
 
     @staticmethod
     @lru_cache(maxsize=4096)
-    def _markdown_to_reportlab(text: str) -> str:
+    def _markdown_to_reportlab_cached(text: str, mono_font: str) -> str:
         """Parses inline Markdown and converts to ReportLab XML tags."""
         if not text:
             return ""
         html = md_lib.markdown(text)
-        for old, new in MARKDOWN_TAG_REPLACEMENTS:
+        replacements = (
+            ("<strong>", "<b>"), ("</strong>", "</b>"),
+            ("<em>", "<i>"), ("</em>", "</i>"),
+            ("<p>", ""), ("</p>", ""),
+            ("<code>", f'<font name="{mono_font}" backColor="#f0f0f0">'),
+            ("</code>", "</font>"),
+        )
+        for old, new in replacements:
             html = html.replace(old, new)
         return html.strip()
+
+    def _markdown_to_reportlab(self, text: str) -> str:
+        return self._markdown_to_reportlab_cached(text, self.fonts["mono"])
 
     def _inline(self, text: str) -> str:
         return self._markdown_to_reportlab(self._clean_text(text))
@@ -1025,107 +1064,107 @@ def _run_tool(
         raise PDFProcessingError(f"{error_prefix}: {e}")
 
 
-def _register_mcp_tool(name: str, doc: str, runner: Callable[..., str]) -> None:
-    runner.__name__ = name
-    runner.__doc__ = doc
-    mcp.tool()(runner)
+@mcp.tool()
+def pdf_extract_text(
+    pdf_path: str,
+    page_start: int = 1,
+    page_end: Optional[int] = None,
+    sort: bool = True,
+) -> str:
+    """[PDF ONLY] Extracts text from a .pdf file."""
+    return _run_tool(PDFProcessor.extract_text, "Extraction failed", pdf_path, page_start, page_end, sort)
 
 
-def _register_pdf_tools() -> None:
-    tool_specs = [
-        (
-            "pdf_extract_text",
-            "[PDF ONLY] Extracts text from a .pdf file.",
-            lambda pdf_path, page_start=1, page_end=None, sort=True: _run_tool(
-                PDFProcessor.extract_text,
-                "Extraction failed",
-                pdf_path,
-                page_start,
-                page_end,
-                sort,
-            ),
-        ),
-        (
-            "pdf_create",
-            "[PDF ONLY] Creates a new .pdf file from Markdown text.",
-            lambda output_path, title, content: _run_tool(
-                lambda: PDFGenerator().create_pdf(Path(output_path).resolve(), title, content),
-                "Failed to create PDF",
-                log_error=True,
-            ),
-        ),
-        (
-            "pdf_search",
-            "[PDF ONLY] Searches for text. Returns page number, occurrence, rect, context.",
-            lambda pdf_path, query, case_sensitive=False: _run_tool(
-                PDFProcessor.search_text,
-                "Search failed",
-                pdf_path,
-                query,
-                case_sensitive,
-            ),
-        ),
-        (
-            "pdf_edit_text",
-            "[PDF ONLY] Replaces or deletes EXISTING text on a specific page.",
-            lambda pdf_path, page_num, old_text, new_text, output_path=None, occurrence=0: _run_tool(
-                PDFProcessor.edit_text,
-                "Edit failed",
-                pdf_path,
-                page_num,
-                old_text,
-                new_text,
-                output_path,
-                occurrence,
-            ),
-        ),
-        (
-            "pdf_add_text",
-            "[PDF ONLY] Adds NEW text at a specific position on a page.",
-            lambda pdf_path, page_num, text, x=56.0, y=None, fontsize=10.0, output_path=None: _run_tool(
-                PDFProcessor.add_text,
-                "Add text failed",
-                pdf_path,
-                page_num,
-                text,
-                x,
-                y,
-                fontsize,
-                output_path,
-            ),
-        ),
-        (
-            "pdf_merge",
-            "[PDF ONLY] Merges multiple .pdf files.",
-            lambda pdf_paths, output_path: _run_tool(PDFProcessor.merge_pdfs, "Merge failed", pdf_paths, output_path),
-        ),
-        (
-            "pdf_split",
-            "[PDF ONLY] Splits PDF by ranges (e.g. [\"1-3\", \"5\"]).",
-            lambda pdf_path, ranges, output_dir: _run_tool(PDFProcessor.split_pdf, "Split failed", pdf_path, ranges, output_dir),
-        ),
-        (
-            "pdf_rotate_pages",
-            "[PDF ONLY] Rotates pages by 90/180/270.",
-            lambda pdf_path, rotation, pages=None: _run_tool(PDFProcessor.rotate_pages, "Rotation failed", pdf_path, rotation, pages),
-        ),
-        (
-            "pdf_extract_images",
-            "[PDF ONLY] Extracts images to ZIP. output_path is optional; defaults to <pdf_name>_images.zip next to the source file.",
-            lambda pdf_path, output_path=None: _run_tool(PDFProcessor.extract_images, "Image extraction failed", pdf_path, output_path),
-        ),
-        (
-            "pdf_from_images",
-            "[PDF ONLY] Creates PDF from images. Reports how many images were actually added.",
-            lambda image_paths, output_path: _run_tool(PDFProcessor.images_to_pdf, "Conversion failed", image_paths, output_path),
-        ),
-    ]
-
-    for name, doc, runner in tool_specs:
-        _register_mcp_tool(name, doc, runner)
+@mcp.tool()
+def pdf_create(output_path: str, title: str, content: str) -> str:
+    """[PDF ONLY] Creates a new .pdf file from Markdown text."""
+    return _run_tool(
+        lambda: PDFGenerator().create_pdf(Path(output_path).resolve(), title, content),
+        "Failed to create PDF",
+        log_error=True,
+    )
 
 
-_register_pdf_tools()
+@mcp.tool()
+def pdf_search(pdf_path: str, query: str, case_sensitive: bool = False) -> str:
+    """[PDF ONLY] Searches for text. Returns page number, occurrence, rect, context."""
+    return _run_tool(PDFProcessor.search_text, "Search failed", pdf_path, query, case_sensitive)
+
+
+@mcp.tool()
+def pdf_edit_text(
+    pdf_path: str,
+    page_num: int,
+    old_text: str,
+    new_text: str,
+    output_path: Optional[str] = None,
+    occurrence: int = 0,
+) -> str:
+    """[PDF ONLY] Replaces or deletes EXISTING text on a specific page."""
+    return _run_tool(
+        PDFProcessor.edit_text,
+        "Edit failed",
+        pdf_path,
+        page_num,
+        old_text,
+        new_text,
+        output_path,
+        occurrence,
+    )
+
+
+@mcp.tool()
+def pdf_add_text(
+    pdf_path: str,
+    page_num: int,
+    text: str,
+    x: float = 56.0,
+    y: Optional[float] = None,
+    fontsize: float = 10.0,
+    output_path: Optional[str] = None,
+) -> str:
+    """[PDF ONLY] Adds NEW text at a specific position on a page."""
+    return _run_tool(
+        PDFProcessor.add_text,
+        "Add text failed",
+        pdf_path,
+        page_num,
+        text,
+        x,
+        y,
+        fontsize,
+        output_path,
+    )
+
+
+@mcp.tool()
+def pdf_merge(pdf_paths: List[str], output_path: str) -> str:
+    """[PDF ONLY] Merges multiple .pdf files."""
+    return _run_tool(PDFProcessor.merge_pdfs, "Merge failed", pdf_paths, output_path)
+
+
+@mcp.tool()
+def pdf_split(pdf_path: str, ranges: List[str], output_dir: str) -> str:
+    """[PDF ONLY] Splits PDF by ranges (e.g. [\"1-3\", \"5\"])."""
+    return _run_tool(PDFProcessor.split_pdf, "Split failed", pdf_path, ranges, output_dir)
+
+
+@mcp.tool()
+def pdf_rotate_pages(pdf_path: str, rotation: int, pages: Optional[List[int]] = None) -> str:
+    """[PDF ONLY] Rotates pages by 90/180/270."""
+    return _run_tool(PDFProcessor.rotate_pages, "Rotation failed", pdf_path, rotation, pages)
+
+
+@mcp.tool()
+def pdf_extract_images(pdf_path: str, output_path: Optional[str] = None) -> str:
+    """[PDF ONLY] Extracts images to ZIP. output_path is optional; defaults to <pdf_name>_images.zip next to the source file."""
+    return _run_tool(PDFProcessor.extract_images, "Image extraction failed", pdf_path, output_path)
+
+
+@mcp.tool()
+def pdf_from_images(image_paths: List[str], output_path: str) -> str:
+    """[PDF ONLY] Creates PDF from images. Reports how many images were actually added."""
+    return _run_tool(PDFProcessor.images_to_pdf, "Conversion failed", image_paths, output_path)
 
 
 if __name__ == "__main__":

@@ -242,24 +242,42 @@ class FilesystemManager:
 
             if offset >= total_lines and total_lines > 0:
                 return format_error(ErrorType.VALIDATION, f"Line offset {offset} exceeds file length ({total_lines} lines).")
-            
-            result =[]
+
+            # Character budget: reserve 120 chars for the pagination footer so it
+            # always survives MAX_TOOL_OUTPUT truncation in nodes.py.
+            char_budget = max(500, self._tool_limit() - 120)
+
+            result: list[str] = []
+            chars_used = 0
+            lines_read = 0
             try:
                 with open(target, 'r', encoding='utf-8', errors='replace') as f:
                     for i, line in enumerate(itertools.islice(f, offset, offset + limit)):
                         clean_line = line.rstrip('\n').rstrip('\r')
-                        if show_line_numbers:
-                            result.append(f"{offset + i + 1:6}  {clean_line}")
-                        else:
-                            result.append(clean_line)
+                        formatted = (f"{offset + i + 1:6}  {clean_line}" if show_line_numbers else clean_line)
+                        line_chars = len(formatted) + 1  # +1 for \n
+                        if chars_used + line_chars > char_budget:
+                            break  # stop before hitting agent's hard cut
+                        result.append(formatted)
+                        chars_used += line_chars
+                        lines_read += 1
             except Exception as e:
                 return format_error(ErrorType.EXECUTION, f"Error reading file stream: {e}")
                 
             output = "\n".join(result)
             
-            end_index = offset + len(result)
-            if total_lines > end_index:
-                output += f"\n\n... (Showing lines {offset+1}-{end_index} of {total_lines}. Use offset/limit to read more)"
+            end_index = offset + lines_read
+            has_more = total_lines > end_index
+            if has_more:
+                next_offset = end_index
+                output += (
+                    f"\n\n[TRUNCATED] Showing lines {offset+1}-{end_index} of {total_lines} "
+                    f"({stats.st_size} bytes total). "
+                    f"To continue: read_file(path='{path}', offset={next_offset}, "
+                    f"limit={limit}, show_line_numbers={show_line_numbers})"
+                )
+            else:
+                output += f"\n\n[EOF] Lines {offset+1}-{end_index} of {total_lines} ({stats.st_size} bytes)."
                 
             return output
 
@@ -712,6 +730,51 @@ class FilesystemManager:
         except Exception as e:
             return format_error(ErrorType.EXECUTION, f"Error finding files: {e}")
     
+    def file_info(self, path: str) -> str:
+        """Returns metadata about a file without reading its content."""
+        try:
+            target = self._resolve_path(path)
+            if not target.exists():
+                return format_error(ErrorType.NOT_FOUND, f"File '{path}' not found.")
+            if not target.is_file():
+                return format_error(ErrorType.VALIDATION, f"'{path}' is not a file or directory.")
+
+            stats = target.stat()
+            size_bytes = stats.st_size
+            size_kb = size_bytes / 1024
+
+            is_binary = self._is_binary(target)
+            total_lines = self._count_lines(target) if not is_binary else None
+
+            char_budget = max(500, self._tool_limit() - 120)
+            # Estimate how many chars per line on average (for planning chunks)
+            avg_chars_per_line = (
+                round(size_bytes / total_lines) if total_lines and total_lines > 0 else None
+            )
+            suggested_limit = None
+            if avg_chars_per_line and not is_binary:
+                suggested_limit = max(50, char_budget // max(1, avg_chars_per_line))
+
+            lines: list[str] = [
+                f"path:          {path}",
+                f"size:          {size_bytes} bytes ({size_kb:.1f} KB)",
+                f"binary:        {'yes' if is_binary else 'no'}",
+            ]
+            if total_lines is not None:
+                lines.append(f"total_lines:   {total_lines}")
+            if avg_chars_per_line is not None:
+                lines.append(f"avg_line_len:  ~{avg_chars_per_line} chars")
+            if suggested_limit is not None:
+                lines.append(
+                    f"suggested_limit: {suggested_limit} lines per read_file() call "
+                    f"(fits within MAX_TOOL_OUTPUT at current settings)"
+                )
+            import time
+            lines.append(f"modified:      {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats.st_mtime))}")
+            return "\n".join(lines)
+        except Exception as e:
+            return format_error(ErrorType.EXECUTION, f"Error getting file info: {e}")
+
     def list_files(self, path: str, include_hidden: bool = False) -> str:
         try:
             target = self._resolve_path(path)
@@ -751,14 +814,37 @@ fs_manager = FilesystemManager(virtual_mode=True)
 def set_safety_policy(policy: SafetyPolicy):
     fs_manager.set_policy(policy)
 
+@tool("file_info")
+def file_info_tool(path: str) -> str:
+    """Returns metadata for a file: size, line count, and suggested chunk size for read_file().
+    Call this FIRST before reading any file you haven't seen before, especially large ones.
+    The output includes 'suggested_limit' — the safe number of lines per read_file() call
+    that fits within MAX_TOOL_OUTPUT. Use it to plan chunked reads.
+    Args:
+        path: Relative path to the file
+    """
+    return fs_manager.file_info(path)
+
+
 @tool("read_file")
 def read_file_tool(path: str, offset: int = 0, limit: int = 2000, show_line_numbers: bool = True) -> str:
-    """Reads a file from the filesystem.
+    """Reads a file from the filesystem with automatic pagination.
+
+    For large files, the output is char-limited and ends with a [TRUNCATED] footer
+    containing the exact next read_file() call to continue. Always check for [TRUNCATED]
+    and keep reading until you see [EOF].
+
+    WORKFLOW FOR LARGE FILES:
+      1. file_info(path) -> check 'suggested_limit'
+      2. read_file(path, offset=0, limit=<suggested_limit>, show_line_numbers=False)
+      3. If output ends with [TRUNCATED], call read_file again with the shown offset
+      4. Repeat until [EOF]
+
     Args:
         path: Relative path to file
         offset: Line number to start reading from (0-indexed, default 0)
-        limit: Max lines to read (default 2000)
-        show_line_numbers: Set to False to get raw text without line numbers. Use False if you plan to copy-paste exact text into edit_file!
+        limit: Max lines to read (default 2000). Use file_info() to get suggested_limit.
+        show_line_numbers: Set to False for raw text (saves ~20% chars, use when processing content)
     """
     return fs_manager.read_file(path, offset, limit, show_line_numbers)
 

@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -16,7 +16,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.lexers import PygmentsLexer
 from pygments.lexers.markup import MarkdownLexer
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
@@ -29,6 +29,7 @@ from core.fuzzy_completer import FuzzyPathCompleter
 from core.logging_config import setup_logging
 from core.session_store import SessionSnapshot, SessionStore
 from core.session_utils import repair_session_if_needed
+from core.tool_policy import ToolMetadata
 from core.ui_theme import AGENT_THEME
 
 if str(BASE_DIR) not in sys.path:
@@ -39,8 +40,30 @@ from agent import build_agent_app
 console = Console(theme=AGENT_THEME, color_system="truecolor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-COMMANDS = ["/help", "/tools", "/session", "exit", "clear", "reset"]
+COMMANDS = ["/help", "/tools", "/session", "/new", "/quit", "clear", "reset"]
 CLEAR_COMMAND = "cls" if os.name == "nt" else "clear"
+
+
+@dataclass(frozen=True)
+class ApprovalSummary:
+    destructive_count: int
+    mutating_count: int
+    networked_count: int
+    default_approve: bool
+    risk_level: str
+    impacts: tuple[str, ...]
+
+    @property
+    def default_prompt(self) -> str:
+        return "[Y/n]" if self.default_approve else "[y/N]"
+
+    @property
+    def default_hint(self) -> str:
+        return "Enter = approve" if self.default_approve else "Enter = deny"
+
+    @property
+    def impact_text(self) -> str:
+        return ", ".join(self.impacts) if self.impacts else "local state"
 
 
 class MergeCompleter(Completer):
@@ -54,6 +77,10 @@ class MergeCompleter(Completer):
 
 def clear_screen() -> None:
     os.system(CLEAR_COMMAND)
+
+
+def _resolve_console(out: Console | None) -> Console:
+    return out or console
 
 
 def get_prompt_message() -> HTML:
@@ -71,92 +98,192 @@ def get_prompt_message() -> HTML:
     )
 
 
-def get_bottom_toolbar(model_name: str = "", tools_count: int = 0) -> HTML:
+def get_bottom_toolbar(mode: str = "normal", model_name: str = "", tools_count: int = 0) -> HTML:
+    if mode == "approval":
+        return HTML(
+            " <b>Approval</b> | <b>Enter</b> default | <b>y</b>/<b>n</b> respond | <b>Ctrl+C</b> cancel prompt "
+        )
+
     model_part = f" │ <b>{model_name}</b>" if model_name else ""
     tools_part = f" │ tools: {tools_count}" if tools_count else ""
     return HTML(
         f" <b>ALT+ENTER</b> multiline"
-        f" | <b>/help</b> · <b>/tools</b> · <b>/session</b>"
-        f" | <b>exit</b> quit"
+        f" | <b>/help</b> · <b>/tools</b> · <b>/session</b> · <b>/new</b>"
+        f" | <b>/quit</b> exit"
         f"{tools_part}{model_part} "
     )
 
 
-def render_tools(tools) -> None:
+def _provider_model(config: AgentConfig) -> tuple[str, str]:
+    if config.provider == "gemini":
+        return "Gemini", config.gemini_model
+    return "OpenAI", config.openai_model
+
+
+def _short_id(value: str, length: int = 16) -> str:
+    if len(value) <= length:
+        return value
+    return f"{value[:length]}…"
+
+
+def _tool_is_mcp(tool, metadata: ToolMetadata | None) -> bool:
+    return bool((metadata and metadata.source == "mcp") or hasattr(tool, "_is_mcp") or ":" in tool.name)
+
+
+def _format_tool_badges(metadata: ToolMetadata | None, *, is_mcp: bool) -> str:
+    metadata = metadata or ToolMetadata(name="unknown", read_only=True)
+    parts: list[str] = []
+    if is_mcp:
+        parts.append("[tool.mcp]mcp[/]")
+    if metadata.read_only and not metadata.mutating and not metadata.destructive:
+        parts.append("[tool.readonly]read-only[/]")
+    if metadata.requires_approval:
+        parts.append("[approval.border]approval[/]")
+    if metadata.mutating:
+        parts.append("[approval.mutating]mutating[/]")
+    if metadata.destructive:
+        parts.append("[approval.danger]destructive[/]")
+    if metadata.networked:
+        parts.append("[approval.networked]network[/]")
+    return "  ".join(parts) if parts else "[dim]protected[/]"
+
+
+def _tool_group(tool, metadata: ToolMetadata | None) -> str:
+    if _tool_is_mcp(tool, metadata):
+        return "MCP"
+    if metadata and (metadata.mutating or metadata.destructive or metadata.requires_approval):
+        return "Protected"
+    return "Read-only"
+
+
+def _enabled_mcp_servers(tool_registry) -> list[str]:
+    names = []
+    for status in getattr(tool_registry, "mcp_server_status", []):
+        server = status.get("server", "unknown")
+        if status.get("error"):
+            names.append(f"{server} (error)")
+        else:
+            names.append(server)
+    return names
+
+
+def _runtime_issue_count(tool_registry) -> int:
+    lines = tool_registry.get_runtime_status_lines()
+    return sum(
+        1
+        for line in lines
+        if any(keyword in line.lower() for keyword in ("error", "warning", "failed", "unavailable"))
+    )
+
+
+def render_overview(
+    config: AgentConfig,
+    tool_registry,
+    snapshot: SessionSnapshot,
+    *,
+    show_cheatsheet: bool = False,
+    out: Console | None = None,
+) -> None:
+    out = _resolve_console(out)
+    provider_label, model_name = _provider_model(config)
+    provider_icon = "[overview.value]◆[/]" if config.provider == "openai" else "[status.text]◆[/]"
+    checkpoint_info = getattr(tool_registry, "checkpoint_info", {}) or {}
+    backend = checkpoint_info.get("resolved_backend", config.checkpoint_backend)
+    tools_count = len(getattr(tool_registry, "tools", []))
+    approvals = "on" if config.enable_approvals else "off"
+    mcp_servers = _enabled_mcp_servers(tool_registry)
+    mcp_text = ", ".join(mcp_servers) if mcp_servers else "none"
+    issue_count = _runtime_issue_count(tool_registry)
+    status_text = "ready" if issue_count == 0 else f"degraded ({issue_count} issue{'s' if issue_count != 1 else ''})"
+
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(style="overview.label", justify="right", no_wrap=True)
+    table.add_column(style="overview.value", ratio=1)
+    table.add_column(style="overview.label", justify="right", no_wrap=True)
+    table.add_column(style="overview.value", ratio=1)
+
+    table.add_row("Provider", f"{provider_icon} {provider_label}", "Model", model_name)
+    table.add_row("Backend", backend, "Tools", str(tools_count))
+    table.add_row("Session", _short_id(snapshot.session_id), "Thread", _short_id(snapshot.thread_id))
+    table.add_row("Approvals", approvals, "MCP", mcp_text)
+    table.add_row("Status", status_text, "Config", "debug" if config.debug else "standard")
+
+    out.print(
+        Panel(
+            table,
+            title=f"[panel.title]AI Agent[/] [dim]v{AGENT_VERSION}[/]",
+            border_style="panel.border",
+            padding=(0, 1),
+        )
+    )
+    if show_cheatsheet:
+        out.print(
+            "[dim]/help[/] workflow guide  ·  [dim]/tools[/] inspect capabilities  ·  [dim]/session[/] overview  ·  [dim]/new[/] fresh session  ·  [dim]Alt+Enter[/] multiline"
+        )
+
+
+def render_tools(tool_registry, out: Console | None = None) -> None:
+    out = _resolve_console(out)
+    tools = getattr(tool_registry, "tools", [])
+    metadata_map = getattr(tool_registry, "tool_metadata", {})
+    grouped = {"Read-only": [], "Protected": [], "MCP": []}
+
+    for tool in tools:
+        metadata = metadata_map.get(tool.name)
+        grouped[_tool_group(tool, metadata)].append((tool, metadata))
+
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", expand=False)
-    table.add_column("#", style="dim", width=3, justify="right")
-    table.add_column("Tool", style="tool.name")
+    table.add_column("Group", style="overview.label", no_wrap=True)
+    table.add_column("Tool", style="tool.name", no_wrap=True)
     table.add_column("Description", ratio=1)
     table.add_column("Flags", style="dim", no_wrap=True)
-    for i, tool in enumerate(tools, 1):
-        desc = tool.description or "No description"
-        desc = (desc[:72] + "…") if len(desc) > 72 else desc
-        # Detect MCP tools by naming convention (they carry a namespace separator)
-        source_flag = "[dim]mcp[/]" if ":" in tool.name or hasattr(tool, "_is_mcp") else ""
-        table.add_row(str(i), tool.name, desc, source_flag)
+
+    order = ("Read-only", "Protected", "MCP")
+    added_rows = 0
+    for group_name in order:
+        items = sorted(grouped[group_name], key=lambda item: item[0].name)
+        if not items:
+            continue
+        if added_rows:
+            table.add_section()
+        for tool, metadata in items:
+            desc = tool.description or "No description"
+            desc = (desc[:72] + "…") if len(desc) > 72 else desc
+            table.add_row(
+                group_name,
+                tool.name,
+                desc,
+                _format_tool_badges(metadata, is_mcp=_tool_is_mcp(tool, metadata)),
+            )
+            added_rows += 1
+
     count_str = f"{len(tools)} tool{'s' if len(tools) != 1 else ''}"
-    console.print(Panel(table, title=f"[panel.title]Available Tools[/] [dim]({count_str})[/]", border_style="panel.border"))
+    out.print(
+        Panel(
+            table,
+            title=f"[panel.title]Tools[/] [dim]({count_str})[/]",
+            border_style="panel.border",
+            padding=(0, 1),
+        )
+    )
 
 
-def render_help() -> None:
+def render_help(out: Console | None = None) -> None:
+    out = _resolve_console(out)
     table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2), expand=False)
-    table.add_column(justify="right", style="bold cyan", no_wrap=True)
+    table.add_column(justify="right", style="overview.label", no_wrap=True)
     table.add_column(justify="left", style="dim")
 
-    table.add_row("── Commands ──", "")
-    table.add_row("/tools",   "List available tools")
-    table.add_row("/session", "Show session · thread · backend")
-    table.add_row("/help",    "This message")
-    table.add_row("clear",    "Start a fresh session")
-    table.add_row("exit",     "Quit")
+    table.add_row("Start work", "Type a request and press Enter")
+    table.add_row("Inspect tools", "/tools shows read-only, protected, and MCP tools")
+    table.add_row("Inspect session", "/session shows the current runtime overview")
+    table.add_row("Reset", "/new starts a fresh session  ·  clear/reset still work")
+    table.add_row("Exit", "/quit closes the CLI")
     table.add_row("", "")
-    table.add_row("── Keys ──", "")
-    table.add_row("Alt+Enter", "Multiline input")
-    table.add_row("Ctrl+C",   "Cancel generation")
-    table.add_row("↑↓",         "History navigation")
-    console.print(Panel(table, title="[panel.title]Help[/]", border_style="panel.border", padding=(0, 1)))
-
-
-def render_session_info(snapshot: SessionSnapshot, checkpoint_info: dict) -> None:
-    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1), expand=False)
-    table.add_column(justify="right", style="dim", no_wrap=True)
-    table.add_column(justify="left")
-
-    backend = checkpoint_info.get("resolved_backend", "unknown")
-    backend_icon = {"sqlite": "▣", "postgres": "○", "memory": "◦"}.get(backend, "□")
-
-    table.add_row("session",  f"[cyan]{snapshot.session_id[:16]}…[/]")
-    table.add_row("thread",   f"[dim]{snapshot.thread_id[:16]}…[/]")
-    table.add_row("backend",  f"{backend_icon} [bold]{backend}[/]")
-    table.add_row("target",   f"[dim]{checkpoint_info.get('target', 'unknown')}[/]")
-    table.add_row("updated",  f"[dim]{_format_timestamp_local(snapshot.updated_at)}[/]")
-    console.print(Panel(table, title="[panel.title]Session[/]", border_style="panel.border", padding=(0, 1)))
-
-
-def _format_timestamp_local(value: str) -> str:
-    try:
-        dt = datetime.fromisoformat(value)
-    except ValueError:
-        return value
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
-def render_runtime_status(tool_registry) -> None:
-    lines = tool_registry.get_runtime_status_lines()
-    if not lines:
-        return
-    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1), expand=False)
-    table.add_column(no_wrap=True)
-    for line in lines:
-        # Color lines that indicate errors/warnings vs. successes
-        line_lower = line.lower()
-        if any(kw in line_lower for kw in ("error", "failed", "unavailable")):
-            table.add_row(f"[status.error]✖[/] [dim]{line}[/]")
-        elif any(kw in line_lower for kw in ("warn", "disabled", "skip")):
-            table.add_row(f"[status.warning]⚠[/] [dim]{line}[/]")
-        else:
-            table.add_row(f"[status.success]✔[/] [dim]{line}[/]")
-    console.print(Panel(table, title="[panel.title]Runtime[/]", border_style="panel.border", padding=(0, 1)))
+    table.add_row("Input", "Alt+Enter adds a new line  ·  ↑↓ reuses history")
+    table.add_row("Approvals", "Enter accepts the shown default  ·  y/n answers explicitly")
+    table.add_row("Stop", "Ctrl+C cancels the current generation")
+    out.print(Panel(table, title="[panel.title]Help[/]", border_style="panel.border", padding=(0, 1)))
 
 
 def setup_runtime() -> AgentConfig:
@@ -235,17 +362,16 @@ def build_graph_config(thread_id: str, max_loops: int) -> dict:
 
 def try_handle_command(
     user_input: str,
-    tools,
+    tool_registry,
     reset_session: Callable[[], None],
     show_session: Callable[[], None],
 ) -> bool:
     normalized = user_input.lower()
-    if normalized in ["clear", "reset"]:
+    if normalized in ["clear", "reset", "/new"]:
         reset_session()
-        clear_screen()
         return True
     if normalized == "/tools":
-        render_tools(tools)
+        render_tools(tool_registry)
         return True
     if normalized == "/help":
         render_help()
@@ -268,11 +394,74 @@ def _format_policy_flags(policy: dict) -> str:
     return "  ".join(parts) if parts else "[dim]protected[/]"
 
 
-async def prompt_for_interrupt(session: PromptSession, interrupt_payload: dict) -> dict:
+def _summarize_approval_request(req_tools: list[dict]) -> ApprovalSummary:
+    destructive_count = 0
+    mutating_count = 0
+    networked_count = 0
+    impacts: set[str] = set()
+
+    for tool in req_tools:
+        policy = tool.get("policy") or {}
+        name = (tool.get("name") or "").lower()
+        destructive = bool(policy.get("destructive"))
+        mutating = bool(policy.get("mutating"))
+        networked = bool(policy.get("networked"))
+
+        destructive_count += int(destructive)
+        mutating_count += int(mutating)
+        networked_count += int(networked)
+
+        if destructive or mutating:
+            if any(token in name for token in ("process", "pid", "port", "shell", "exec", "command")):
+                impacts.add("processes")
+            elif any(token in name for token in ("file", "directory", "path", "write", "edit", "delete", "download")):
+                impacts.add("files")
+            else:
+                impacts.add("local state")
+        if networked:
+            impacts.add("network")
+
+    risk_kinds = sum(int(count > 0) for count in (destructive_count, mutating_count, networked_count))
+    mixed_risk = risk_kinds > 1
+    default_approve = destructive_count == 0 and not mixed_risk
+    risk_level = "high" if destructive_count or mixed_risk else "medium" if (mutating_count or networked_count) else "low"
+
+    return ApprovalSummary(
+        destructive_count=destructive_count,
+        mutating_count=mutating_count,
+        networked_count=networked_count,
+        default_approve=default_approve,
+        risk_level=risk_level,
+        impacts=tuple(sorted(impacts)),
+    )
+
+
+def render_user_turn(user_input: str, out: Console | None = None) -> None:
+    out = _resolve_console(out)
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.add_column(width=7, no_wrap=True)
+    grid.add_column(ratio=1)
+    grid.add_row("[turn.user]You[/]", Text(user_input))
+    out.print(grid)
+
+
+def render_assistant_turn(out: Console | None = None) -> None:
+    out = _resolve_console(out)
+    out.print("[turn.assistant]Agent[/]")
+
+
+async def prompt_for_interrupt(
+    session: PromptSession,
+    interrupt_payload: dict,
+    *,
+    model_name: str = "",
+    tools_count: int = 0,
+) -> dict:
     if interrupt_payload.get("kind") != "tool_approval":
         return {"approved": False}
 
     req_tools = interrupt_payload.get("tools", [])
+    summary = _summarize_approval_request(req_tools)
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", expand=False)
     table.add_column("Tool", style="tool.name", no_wrap=True)
     table.add_column("Args", style="tool.args")
@@ -286,28 +475,45 @@ async def prompt_for_interrupt(session: PromptSession, interrupt_payload: dict) 
             args_str,
             _format_policy_flags(policy),
         )
+    summary_line = (
+        f"[approval.summary]Risk {summary.risk_level}[/]  "
+        f"[approval.danger]{summary.destructive_count} destructive[/]  "
+        f"[approval.mutating]{summary.mutating_count} mutating[/]  "
+        f"[approval.networked]{summary.networked_count} networked[/]  "
+        f"[dim]Affects:[/] {summary.impact_text}"
+    )
     console.print(
         Panel(
-            table,
+            Group(summary_line, table),
             title="[approval.border]⚠  Approval Required[/]",
             border_style="approval.border",
             padding=(0, 1),
         )
     )
     _valid = {"", "y", "yes", "n", "no"}
+    prompt_prefix = "[Approve]" if summary.default_approve else "[Review]"
     while True:
         answer = (
             await session.prompt_async(
-                HTML('<style fg="#e0af68"> Approve? [Y/n] </style><style fg="#565f89">(enter = approve) </style><style fg="#e0af68">❯</style> ')
+                HTML(
+                    f'<style fg="#e0af68"> {prompt_prefix} {summary.default_prompt} </style>'
+                    f'<style fg="#565f89">({summary.default_hint} · affects {summary.impact_text}) </style>'
+                    f'<style fg="#e0af68">❯</style> '
+                ),
+                bottom_toolbar=lambda: get_bottom_toolbar(
+                    mode="approval",
+                    model_name=model_name,
+                    tools_count=tools_count,
+                ),
             )
         ).strip().lower()
         if answer in _valid:
             break
         console.print(f"  [status.warning]⚠[/] [dim]Enter y / n / or press Enter[/]")
 
-    approved = answer in {"", "y", "yes"}
+    approved = answer in {"y", "yes"} or (summary.default_approve and answer == "")
     status = "[status.success]approved[/]" if approved else "[status.error]denied[/]"
-    console.print(f"  └ {status}")
+    console.print(f"  [approval.summary]Action[/] {status}")
     return {"approved": approved}
 
 
@@ -319,6 +525,9 @@ async def run_user_request(
     config: AgentConfig,
     stream_processor_cls,
     prompt_session: PromptSession,
+    *,
+    model_name: str = "",
+    tools_count: int = 0,
 ):
     from core.stream_processor import StreamProcessResult
 
@@ -335,7 +544,14 @@ async def run_user_request(
         result: StreamProcessResult = await processor.process_stream(stream)
         if result.interrupt is None:
             return result.stats
-        payload = Command(resume=await prompt_for_interrupt(prompt_session, result.interrupt))
+        payload = Command(
+            resume=await prompt_for_interrupt(
+                prompt_session,
+                result.interrupt,
+                model_name=model_name,
+                tools_count=tools_count,
+            )
+        )
 
 
 async def close_runtime_resources(tool_registry) -> None:
@@ -380,9 +596,7 @@ async def main():
     store.save_active_session(current_session)
 
     tools = tool_registry.tools
-    render_header(config, tools)
-    render_runtime_status(tool_registry)
-    render_session_info(current_session, checkpoint_info)
+    render_overview(config, tool_registry, current_session, show_cheatsheet=True)
     session = create_session()
 
     from core.stream_processor import StreamProcessor
@@ -396,16 +610,16 @@ async def main():
             checkpoint_target=checkpoint_info.get("target", "unknown"),
         )
         store.save_active_session(current_session)
-        render_header(config, tools)
-        render_session_info(current_session, checkpoint_info)
+        clear_screen()
+        render_overview(config, tool_registry, current_session, show_cheatsheet=True)
 
     def show_session() -> None:
-        render_session_info(current_session, checkpoint_info)
+        render_overview(config, tool_registry, current_session, show_cheatsheet=False)
 
     model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
 
     def _toolbar():
-        return get_bottom_toolbar(model_name=model_name, tools_count=len(tools))
+        return get_bottom_toolbar(mode="normal", model_name=model_name, tools_count=len(tools))
 
     turn_count = 0
 
@@ -418,15 +632,16 @@ async def main():
             user_input = (await session.prompt_async(get_prompt_message(), bottom_toolbar=_toolbar)).strip()
             if not user_input:
                 continue
-            if user_input.lower() in ["exit", "quit"]:
+            if user_input.lower() == "/quit":
                 break
-            if try_handle_command(user_input, tools, reset_session, show_session):
+            if try_handle_command(user_input, tool_registry, reset_session, show_session):
                 continue
 
-            # Print a subtle turn separator after the first message
             if turn_count > 0:
                 console.print(Rule(style="turn.separator"))
             turn_count += 1
+            render_user_turn(user_input)
+            render_assistant_turn()
 
             last_stats = await run_user_request(
                 agent_app,
@@ -436,6 +651,8 @@ async def main():
                 config,
                 StreamProcessor,
                 session,
+                model_name=model_name,
+                tools_count=len(tools),
             )
             store.save_active_session(current_session)
         except (KeyboardInterrupt, asyncio.CancelledError):

@@ -44,25 +44,27 @@ def setup_logging(
         log_file = str(BASE_DIR / rel_path)
 
     handlers: List[logging.Handler] = []
+    show_console_logs = level <= logging.DEBUG
 
-    # 1. Console Handler (Rich or Standard)
-    if RichHandler:
-        console_handler = RichHandler(
-            rich_tracebacks=False,
-            markup=True,
-            show_path=False,
-            show_time=True,
-            omit_repeated_times=False
-        )
-        console_handler.setFormatter(logging.Formatter("%(message)s"))
-    else:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(
-            logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-        )
-    
-    console_handler.setLevel(level)
-    handlers.append(console_handler)
+    # 1. Console Handler (only in debug mode; regular CLI keeps logs in file only)
+    if show_console_logs:
+        if RichHandler:
+            console_handler = RichHandler(
+                rich_tracebacks=False,
+                markup=True,
+                show_path=False,
+                show_time=True,
+                omit_repeated_times=False
+            )
+            console_handler.setFormatter(logging.Formatter("%(message)s"))
+        else:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(
+                logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+            )
+        
+        console_handler.setLevel(level)
+        handlers.append(console_handler)
 
     # 2. File Handler
     if log_file:
@@ -78,6 +80,9 @@ def setup_logging(
             handlers.append(file_handler)
         except Exception as e:
             sys.stderr.write(f"⚠️ Warning: Could not create log file: {e}\n")
+
+    if not handlers:
+        handlers.append(logging.NullHandler())
 
     # 3. Apply Configuration
     logging.basicConfig(level=level, handlers=handlers, force=True)

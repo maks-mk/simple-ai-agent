@@ -12,8 +12,6 @@ from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.spinner import Spinner
 from rich.syntax import Syntax
-from rich.table import Table
-
 from core.cli_utils import (
     TokenTracker,
     format_tool_display,
@@ -44,7 +42,6 @@ class StreamProcessor:
         'printed_tool_ids',
         'tool_buffer',
         'tool_start_times',
-        'status_text',
         'start_time',
         'pending_interrupt',
         'active_node',
@@ -60,7 +57,6 @@ class StreamProcessor:
         self.printed_tool_ids: Set[str] = set()
         self.tool_buffer: Dict[str, Dict[str, Any]] = {}
         self.tool_start_times: Dict[str, float] = {}
-        self.status_text = "Thinking..."
         self.start_time = time.time()
         self.pending_interrupt: Optional[Dict[str, Any]] = None
         self.active_node: str = "agent"
@@ -69,7 +65,7 @@ class StreamProcessor:
         """Consumes the agent event stream and updates the UI."""
         try:
             with Live(
-                Spinner("dots", text=self.status_text, style="cyan"),
+                self._spinner_row(),
                 refresh_per_second=15,
                 console=self.console,
                 transient=True,
@@ -110,6 +106,7 @@ class StreamProcessor:
 
     def _handle_updates(self, payload: Dict) -> None:
         if "__interrupt__" in payload:
+            self.active_node = "approval"
             interrupt_entries = payload.get("__interrupt__") or []
             if interrupt_entries:
                 interrupt_value = getattr(interrupt_entries[0], "value", interrupt_entries[0])
@@ -145,8 +142,8 @@ class StreamProcessor:
         rendered_count = remove_count if remove_count > 0 else len(removed_messages)
         self.console.print(
             Padding(
-                f"[dim]Context compressed automatically ({rendered_count} message(s) summarized).[/]",
-                (0, 0, 0, 2),
+                f"[approval.summary]note[/] [dim]Context compressed automatically ({rendered_count} message(s) summarized).[/]",
+                (0, 0, 0, 4),
             )
         )
 
@@ -204,9 +201,9 @@ class StreamProcessor:
         else:
             display_styled = f"[tool.name]{display_str}[/]"
 
-        self.console.print(Padding(f"[tool.badge]▶[/] {display_styled}", (0, 0, 0, 2)))
+        self.console.print(Padding(f"[tool.badge]tool[/] [tool.badge]▶[/] {display_styled}", (0, 0, 0, 4)))
         self.printed_tool_ids.add(tool_id)
-        self.status_text = f"Running {tool_call['name']}..."
+        self.active_node = "tools"
 
     def _handle_tool_result(self, msg: ToolMessage) -> None:
         tool_id = msg.tool_call_id
@@ -226,12 +223,12 @@ class StreamProcessor:
             elapsed = time.time() - start_t
             elapsed_str = f" [tool.timing]{elapsed:.1f}s[/]"
 
-        self.console.print(Padding(f"  {icon}[{style}]{summary}[/]{elapsed_str}", (0, 0, 0, 4)))
+        self.console.print(Padding(f"[tool.badge]tool[/] {icon}[{style}]{summary}[/]{elapsed_str}", (0, 0, 0, 4)))
 
         if not is_error:
             self._render_diff_preview(content_str)
 
-        self.status_text = "Thinking..."
+        self.active_node = "agent"
 
     def _render_diff_preview(self, content: str) -> None:
         diff_match = DIFF_REGEX.search(content)
@@ -240,7 +237,7 @@ class StreamProcessor:
 
         diff_code = diff_match.group(1).strip()
         syntax = Syntax(diff_code, "diff", theme="monokai", line_numbers=True, word_wrap=True)
-        self.console.print(Padding(syntax, (0, 0, 0, 6)))
+        self.console.print(Padding(syntax, (0, 0, 0, 8)))
 
     def _commit_printed_text(self, end_index: Optional[int] = None) -> None:
         limit = end_index if end_index is not None else len(self.clean_full)
@@ -248,7 +245,7 @@ class StreamProcessor:
             return
 
         new_text = prepare_markdown_for_render(self.clean_full[self.printed_len:limit])
-        self.console.print(Padding(Markdown(new_text, code_theme="dracula", hyperlinks=False), (0, 0, 0, 2)))
+        self.console.print(Padding(Markdown(new_text, code_theme="dracula", hyperlinks=False), (0, 0, 0, 4)))
         self.printed_len = limit
 
     def _try_commit(self) -> None:
@@ -281,28 +278,26 @@ class StreamProcessor:
         """Returns formatted elapsed time since stream start."""
         return f"{time.time() - self.start_time:.0f}s"
 
-    def _spinner_row(self):
+    def _status_label(self) -> str:
         node_labels = {
-            "agent":    "Thinking",
-            "critic":   "Verifying",
-            "tools":    "Running",
-            "summarize": "Compressing",
-            "approval": "Waiting",
+            "agent": "Thinking",
+            "critic": "Reviewing",
+            "tools": "Running tools",
+            "summarize": "Compressing context",
+            "approval": "Waiting for approval",
         }
-        base = node_labels.get(self.active_node, "Working")
+        return node_labels.get(self.active_node, "Thinking")
+
+    def _spinner_row(self):
+        base = self._status_label()
         if self.has_thought:
-            label = f"[agent.thought]{base}...[/] [tool.timing]{self._elapsed()}[/]"
+            label = f"[agent.thought]{base}[/] [tool.timing]{self._elapsed()}[/]"
         else:
-            label = f"{base}... [tool.timing]{self._elapsed()}[/]"
+            label = f"{base} [tool.timing]{self._elapsed()}[/]"
         return Spinner("dots", text=label, style="status.spinner")
 
     def _update_live_display(self, live: Live) -> None:
         try:
-            if self.has_thought:
-                self.status_text = "[agent.thought]Thinking...[/]"
-            elif self.status_text == "[agent.thought]Thinking...[/]":
-                self.status_text = "Thinking..."
-
             renderables = []
 
             # Always show any pending partial text ABOVE the spinner
@@ -311,20 +306,16 @@ class StreamProcessor:
                 renderables.append(
                     Padding(
                         Markdown(pending_markdown, code_theme="dracula", hyperlinks=False),
-                        (0, 0, 0, 2),
+                        (0, 0, 0, 4),
                     )
                 )
 
-            # Spinner is always visible so the user sees the agent is still working
+            # Spinner is always visible so the user sees the agent is still working.
             renderables.append(self._spinner_row())
 
             live.update(RichGroup(*renderables))
         except Exception as e:
             logger.debug("Live display update failed: %s", e)
-
-
-
-
 
 
 

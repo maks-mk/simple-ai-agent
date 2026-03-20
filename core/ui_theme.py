@@ -5,58 +5,64 @@ from rich.style import Style
 # Modern, professional color palette (Tokyonight / Catppuccin inspired)
 AGENT_THEME = Theme({
     # General status
-    "status.spinner": Style(color="cyan", bold=True),
-    "status.text": Style(color="#7dcfff"),  # Light Blue
-    "status.error": Style(color="#f7768e", bold=True),  # Red
-    "status.warning": Style(color="#e0af68", bold=True),  # Yellow/Orange
-    "status.success": Style(color="#9ece6a", bold=True),  # Green
+    "status.spinner": Style(color="#5ad1e6", bold=True),
+    "status.text": Style(color="#77c5ff"),
+    "status.error": Style(color="#ff6b6b", bold=True),
+    "status.warning": Style(color="#f4b942", bold=True),
+    "status.success": Style(color="#7fd17f", bold=True),
 
     # Tool execution
-    "tool.name": Style(color="#bb9af7", bold=True),  # Purple
-    "tool.args": Style(color="#565f89", italic=True),  # Comment-like grey-blue
-    "tool.result": Style(color="#73daca"),  # Teal
-    "tool.error": Style(color="#db4b4b", bold=True),
-    "tool.timing": Style(color="#414868", italic=True),  # Subtle dim timing
-    "tool.badge": Style(color="#9d7cd8"),  # Muted purple for tool badge
+    "tool.name": Style(color="#ffd166", bold=True),
+    "tool.args": Style(color="#7c8799", italic=True),
+    "tool.result": Style(color="#5ed0b1"),
+    "tool.error": Style(color="#ff6b6b", bold=True),
+    "tool.timing": Style(color="#6f7b8e", italic=True),
+    "tool.badge": Style(color="#f4b942", bold=True),
+    "tool.readonly": Style(color="#7fd17f", bold=True),
+    "tool.mcp": Style(color="#77c5ff", bold=True),
 
     # Agent interaction
-    "agent.thought": Style(color="#565f89", italic=True),  # Subtle thought color
-    "agent.node": Style(color="#7dcfff", italic=True),    # Active node hint
+    "agent.thought": Style(color="#7c8799", italic=True),
+    "agent.node": Style(color="#77c5ff", italic=True),
 
     # Approval UI
-    "approval.border": Style(color="#e0af68"),           # Warning yellow border
-    "approval.danger": Style(color="#f7768e", bold=True), # Destructive flag
-    "approval.mutating": Style(color="#e0af68", bold=True), # Mutating flag
-    "approval.networked": Style(color="#7dcfff"),          # Network flag
+    "approval.border": Style(color="#f4b942"),
+    "approval.danger": Style(color="#ff6b6b", bold=True),
+    "approval.mutating": Style(color="#f4b942", bold=True),
+    "approval.networked": Style(color="#77c5ff"),
+    "approval.summary": Style(color="#d6deeb", bold=True),
 
     # Conversation turns
-    "turn.separator": Style(color="#292e42"),  # Barely-visible divider
+    "turn.separator": Style(color="#334155"),
     "turn.user": Style(color="#0077c2", bold=True),
+    "turn.assistant": Style(color="#5ed0b1", bold=True),
 
     # Stats / metrics
-    "stats.text": Style(color="#414868", italic=True),  # Dim inline stats
-    "stats.time": Style(color="#565f89"),
-    "stats.tokens": Style(color="#7aa2f7"),
+    "stats.text": Style(color="#6f7b8e", italic=True),
+    "stats.time": Style(color="#7c8799"),
+    "stats.tokens": Style(color="#77c5ff"),
 
     # Init / startup
-    "init.step": Style(color="#9ece6a"),
-    "init.info": Style(color="#7dcfff", dim=True),
+    "init.step": Style(color="#7fd17f"),
+    "init.info": Style(color="#77c5ff", dim=True),
 
     # Panels and Layouts
-    "panel.border": Style(color="#3b4261"),  # Dark Grey Blue
-    "panel.title": Style(color="#7aa2f7", bold=True),
-    "panel.error": Style(color="#f7768e"),   # Error panel border
-    "panel.warning": Style(color="#e0af68"), # Warning panel border
+    "panel.border": Style(color="#3c495d"),
+    "panel.title": Style(color="#77c5ff", bold=True),
+    "panel.error": Style(color="#ff6b6b"),
+    "panel.warning": Style(color="#f4b942"),
+    "overview.label": Style(color="#8c98a8", bold=True),
+    "overview.value": Style(color="#d6deeb"),
 
     # Code
-    "code.block": Style(color="#c0caf5"),
-    "markdown.code": Style(color="#ff9e64"),  # Orange for inline code
+    "code.block": Style(color="#d6deeb"),
+    "markdown.code": Style(color="#ffb86c"),
 
     # Markdown readability on dark backgrounds
-    "markdown.h1": Style(color="#7dcfff", bold=True),
-    "markdown.h2": Style(color="#7dcfff", bold=True),
-    "markdown.h3": Style(color="#9ece6a", bold=True),
-    "markdown.h4": Style(color="#9ece6a", bold=True),
-    "markdown.link": Style(color="#73daca", underline=True, bold=True),
-    "markdown.link_url": Style(color="#7aa2f7", underline=True),
+    "markdown.h1": Style(color="#77c5ff", bold=True),
+    "markdown.h2": Style(color="#77c5ff", bold=True),
+    "markdown.h3": Style(color="#7fd17f", bold=True),
+    "markdown.h4": Style(color="#7fd17f", bold=True),
+    "markdown.link": Style(color="#5ed0b1", underline=True, bold=True),
+    "markdown.link_url": Style(color="#77c5ff", underline=True),
 })

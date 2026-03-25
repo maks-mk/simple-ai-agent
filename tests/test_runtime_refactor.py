@@ -241,11 +241,35 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
         tmp = self._workspace_tempdir()
         store = SessionStore(tmp / "session.json")
         snapshot = store.new_session(checkpoint_backend="sqlite", checkpoint_target="demo.sqlite")
+        snapshot.approval_mode = "always"
         store.save_active_session(snapshot)
         loaded = store.load_active_session()
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.session_id, snapshot.session_id)
         self.assertEqual(loaded.thread_id, snapshot.thread_id)
+        self.assertEqual(loaded.approval_mode, "always")
+
+    def test_session_store_defaults_missing_approval_mode_to_prompt(self):
+        tmp = self._workspace_tempdir()
+        session_path = tmp / "session.json"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "session_id": "session-old",
+                    "thread_id": "thread-old",
+                    "checkpoint_backend": "sqlite",
+                    "checkpoint_target": "demo.sqlite",
+                    "created_at": "2026-03-25T10:00:00+00:00",
+                    "updated_at": "2026-03-25T10:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = SessionStore(session_path).load_active_session()
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.approval_mode, "prompt")
 
     def test_stop_background_process_denies_external_pid_by_default(self):
         result = process_tools.stop_background_process.invoke({"pid": os.getpid()})

@@ -1,12 +1,12 @@
 # Autonomous AI Agent
 
-**v0.61b**
+**v0.62b**
 
 Автономный CLI-агент на базе LangGraph с durable checkpointing, session resume, policy-driven tool execution, approval gate для опасных действий, MCP-интеграцией и встроенным `critic`-узлом для проверки завершённости задачи.
 
 ---
 
-## Что нового в `v0.61b`
+## Что нового в `v0.62b`
 
 - Добавлен настраиваемый checkpoint backend: `sqlite`, `memory`, `postgres`.
 - Локальный CLI по умолчанию использует `sqlite`, поэтому сессии реально переживают перезапуск приложения.
@@ -50,14 +50,14 @@
 - `render_tools`: инструменты теперь группируются в `Read-only`, `Protected`, `MCP` и показывают policy badges (`read-only`, `approval`, `mutating`, `destructive`, `network`, `mcp`).
 - `render_help`: теперь task-oriented — старт работы, инспекция инструментов и сессии, reset, approvals, multiline input.
 - `initialize_agent`: прогресс-статус с именем провайдера и модели, `✔ Agent ready` после загрузки.
-- `prompt_for_interrupt`: risk-first approval panel с summary по destructive/mutating/networked calls. Enter по умолчанию:
-  - `approve` для single-risk non-destructive batch;
-  - `deny` для destructive или mixed-risk batch.
+- `prompt_for_interrupt`: risk-first approval panel с summary по destructive/mutating/networked calls и компактным selector на `Yes` / `No` / `Always`.
+- `Always` действует на все последующие protected actions в рамках текущей session snapshot, переживает auto-resume и сбрасывается через `/new`.
+- При активном `Always` approval prompt больше не открывается — CLI печатает короткое `auto-approved` уведомление и продолжает выполнение.
 - Главный цикл: тонкий `Rule()` между ходами, явные метки `You` / `Agent`, `✕ cancelled` при `Ctrl+C`, ошибки оборачиваются в `Panel(border_style="panel.error")`.
 - Ошибки инициализации (`Config error`, `Init error`) тоже в styled Panel.
 - Команда выхода приведена к slash-стилю: используется `/quit`.
 - `_format_policy_flags()` вынесена в отдельную функцию.
-- `cli_utils.py`: убран guard `if not buf.text.strip(): return` из обработчика `enter` — пустой Enter теперь проходит через `validate_and_handle()` (нужно для дефолтного ответа в approval-промпте). Главный цикл по-прежнему игнорирует пустой ввод через `if not user_input: continue`.
+- `cli_utils.py`: `Alt+Enter` по-прежнему добавляет новую строку в основном вводе; approval selector обрабатывается отдельно через `prompt_toolkit`.
 
 ---
 
@@ -68,7 +68,8 @@
 - Потоковый вывод ответов: спиннер и накапливающийся текст отображаются одновременно — пользователь всегда видит прогресс.
 - Контекстный спиннер по активному узлу графа: `Thinking` / `Running tools` / `Reviewing` / `Waiting for approval` / `Compressing context` с elapsed time.
 - Тайминг каждого tool-вызова: `tool ▶ имя(...)` при старте, `tool ✔ summary 1.4s` при завершении.
-- Approval-промпт с risk summary, цветными policy-флагами, валидацией ввода и безопасным дефолтом по Enter для destructive/mixed-risk batch.
+- Approval-промпт с risk summary, цветными policy-флагами и компактным selector `Yes / No / Always`.
+- `Always` сохраняется в активной session snapshot, показывается в overview как `on (always for this session)` и сбрасывается командой `/new`.
 - Контекстный bottom toolbar: основные slash-команды в обычном режиме и отдельная подсказка в approval prompt.
 - Явные turn labels `You` / `Agent` делают историю диалога легче для чтения.
 - CLI на `rich` + `prompt_toolkit`; fuzzy autocomplete для команд и путей.
@@ -153,7 +154,7 @@
 - `config.py` загружает `.env`, парсит feature flags, лимиты, backend persistence и approval settings.
 - `nodes.py` содержит LangGraph-узлы: `agent`, `approval`, `tools`, `critic`, summarize и runtime overlays.
 - `state.py` описывает расширенное состояние графа, включая `session_id`, `run_id`, `pending_approval`, `last_tool_error`, `last_tool_result`.
-- `session_store.py` хранит snapshot активной сессии для auto-resume.
+- `session_store.py` хранит snapshot активной сессии для auto-resume, включая session-scoped approval mode.
 - `run_logger.py` пишет JSONL events по сессиям.
 - `tool_policy.py` описывает policy metadata для tool layer.
 - `tool_results.py` нормализует tool output во внутренний structured shape для логирования и анализа.
@@ -304,7 +305,7 @@ python agent_cli.py
 - session store;
 - JSONL run logging;
 - safer process control;
-- CLI UX: overview, tools/help panels, approval defaults, stream layout.
+- CLI UX: overview, tools/help panels, session-scoped approval selector, stream layout.
 
 ---
 
@@ -324,7 +325,9 @@ python agent_cli.py
 
 - Read-only tools могут выполняться автономно.
 - Mutating/destructive tools по умолчанию требуют approval.
-- Для destructive и mixed-risk approval batch пустой Enter по умолчанию трактуется как `deny`; для single-risk non-destructive batch — как `approve`.
+- Approval в CLI выбирается через selector `Yes / No / Always`, без ручного `y/n` ввода.
+- Режим `Always` распространяется на все последующие protected actions в рамках текущей session snapshot и сбрасывается через `/new`.
+- `Esc` и `Ctrl+C` в approval selector трактуются как безопасный отказ.
 - При отказе пользователя (`ACCESS_DENIED`) агент не симулирует и не выдумывает результат — явно сообщает об отказе и спрашивает что делать дальше.
 - `cli_exec` отключён по умолчанию и считается high-risk инструментом.
 - `stop_background_process` не завершает внешние процессы без `ALLOW_EXTERNAL_PROCESS_CONTROL=true`.

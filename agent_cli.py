@@ -13,7 +13,9 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, WordCompleter
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.lexers import PygmentsLexer
+from prompt_toolkit.shortcuts.choice_input import ChoiceInput
 from pygments.lexers.markup import MarkdownLexer
 from rich import box
 from rich.console import Console, Group
@@ -42,6 +44,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 COMMANDS = ["/help", "/tools", "/session", "/new", "/quit", "clear", "reset"]
 CLEAR_COMMAND = "cls" if os.name == "nt" else "clear"
+APPROVAL_MODE_PROMPT = "prompt"
+APPROVAL_MODE_ALWAYS = "always"
 
 
 @dataclass(frozen=True)
@@ -101,7 +105,7 @@ def get_prompt_message() -> HTML:
 def get_bottom_toolbar(mode: str = "normal", model_name: str = "", tools_count: int = 0) -> HTML:
     if mode == "approval":
         return HTML(
-            " <b>Approval</b> | <b>Enter</b> default | <b>y</b>/<b>n</b> respond | <b>Ctrl+C</b> cancel prompt "
+            " <b>Approval</b> | <b>↑↓</b> choose | <b>Enter</b> confirm | <b>Esc</b> cancel "
         )
 
     model_part = f" │ <b>{model_name}</b>" if model_name else ""
@@ -190,7 +194,11 @@ def render_overview(
     checkpoint_info = getattr(tool_registry, "checkpoint_info", {}) or {}
     backend = checkpoint_info.get("resolved_backend", config.checkpoint_backend)
     tools_count = len(getattr(tool_registry, "tools", []))
-    approvals = "on" if config.enable_approvals else "off"
+    approvals = "off"
+    if config.enable_approvals:
+        approvals = "on"
+        if getattr(snapshot, "approval_mode", APPROVAL_MODE_PROMPT) == APPROVAL_MODE_ALWAYS:
+            approvals = "on (always for this session)"
     mcp_servers = _enabled_mcp_servers(tool_registry)
     mcp_text = ", ".join(mcp_servers) if mcp_servers else "none"
     issue_count = _runtime_issue_count(tool_registry)
@@ -281,7 +289,7 @@ def render_help(out: Console | None = None) -> None:
     table.add_row("Exit", "/quit closes the CLI")
     table.add_row("", "")
     table.add_row("Input", "Alt+Enter adds a new line  ·  ↑↓ reuses history")
-    table.add_row("Approvals", "Enter accepts the shown default  ·  y/n answers explicitly")
+    table.add_row("Approvals", "↑↓ choose Yes/No/Always  ·  Enter confirms  ·  Esc cancels")
     table.add_row("Stop", "Ctrl+C cancels the current generation")
     out.print(Panel(table, title="[panel.title]Help[/]", border_style="panel.border", padding=(0, 1)))
 
@@ -436,6 +444,41 @@ def _summarize_approval_request(req_tools: list[dict]) -> ApprovalSummary:
     )
 
 
+def _normalize_approval_mode(value: str | None) -> str:
+    if value == APPROVAL_MODE_ALWAYS:
+        return APPROVAL_MODE_ALWAYS
+    return APPROVAL_MODE_PROMPT
+
+
+async def _run_approval_selector(summary: ApprovalSummary) -> str | None:
+    default_choice = "yes" if summary.default_approve else "no"
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    def _cancel(event) -> None:
+        event.app.exit(result=None)
+
+    @kb.add("c-c")
+    def _cancel_interrupt(event) -> None:
+        event.app.exit(result=None)
+
+    prompt = ChoiceInput(
+        message="Approval choice:",
+        options=[
+            ("yes", "Yes     Approve this batch"),
+            ("no", "No      Deny this batch"),
+            ("always", "Always  Approve future protected actions in this session"),
+        ],
+        default=default_choice,
+        mouse_support=True,
+        symbol="(*)",
+        show_frame=False,
+        enable_interrupt=False,
+        key_bindings=kb,
+    )
+    return await prompt.prompt_async()
+
+
 def render_user_turn(user_input: str, out: Console | None = None) -> None:
     out = _resolve_console(out)
     grid = Table.grid(expand=True, padding=(0, 1))
@@ -451,17 +494,29 @@ def render_assistant_turn(out: Console | None = None) -> None:
 
 
 async def prompt_for_interrupt(
-    session: PromptSession,
     interrupt_payload: dict,
+    current_session: SessionSnapshot,
+    session_store: SessionStore,
     *,
     model_name: str = "",
     tools_count: int = 0,
+    out: Console | None = None,
+    selector=None,
 ) -> dict:
+    out = _resolve_console(out)
     if interrupt_payload.get("kind") != "tool_approval":
         return {"approved": False}
 
     req_tools = interrupt_payload.get("tools", [])
     summary = _summarize_approval_request(req_tools)
+    current_session.approval_mode = _normalize_approval_mode(getattr(current_session, "approval_mode", APPROVAL_MODE_PROMPT))
+    if current_session.approval_mode == APPROVAL_MODE_ALWAYS:
+        out.print(
+            "  [approval.summary]Action[/] [status.success]auto-approved[/] "
+            "[dim](always for this session · /new resets)[/]"
+        )
+        return {"approved": True}
+
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", expand=False)
     table.add_column("Tool", style="tool.name", no_wrap=True)
     table.add_column("Args", style="tool.args")
@@ -482,7 +537,7 @@ async def prompt_for_interrupt(
         f"[approval.networked]{summary.networked_count} networked[/]  "
         f"[dim]Affects:[/] {summary.impact_text}"
     )
-    console.print(
+    out.print(
         Panel(
             Group(summary_line, table),
             title="[approval.border]⚠  Approval Required[/]",
@@ -490,30 +545,21 @@ async def prompt_for_interrupt(
             padding=(0, 1),
         )
     )
-    _valid = {"", "y", "yes", "n", "no"}
-    prompt_prefix = "[Approve]" if summary.default_approve else "[Review]"
-    while True:
-        answer = (
-            await session.prompt_async(
-                HTML(
-                    f'<style fg="#e0af68"> {prompt_prefix} {summary.default_prompt} </style>'
-                    f'<style fg="#565f89">({summary.default_hint} · affects {summary.impact_text}) </style>'
-                    f'<style fg="#e0af68">❯</style> '
-                ),
-                bottom_toolbar=lambda: get_bottom_toolbar(
-                    mode="approval",
-                    model_name=model_name,
-                    tools_count=tools_count,
-                ),
-            )
-        ).strip().lower()
-        if answer in _valid:
-            break
-        console.print(f"  [status.warning]⚠[/] [dim]Enter y / n / or press Enter[/]")
+    out.print("  [dim]Use ↑/↓ to choose Yes/No/Always, Enter to confirm, Esc to cancel.[/]")
 
-    approved = answer in {"y", "yes"} or (summary.default_approve and answer == "")
+    selected = await (selector(summary) if selector else _run_approval_selector(summary))
+    approved = False
+    if selected == "always":
+        current_session.approval_mode = APPROVAL_MODE_ALWAYS
+        session_store.save_active_session(current_session)
+        approved = True
+    elif selected == "yes":
+        approved = True
+
     status = "[status.success]approved[/]" if approved else "[status.error]denied[/]"
-    console.print(f"  [approval.summary]Action[/] {status}")
+    out.print(f"  [approval.summary]Action[/] {status}")
+    if selected == "always":
+        out.print("  [dim]Future protected actions will be auto-approved in this session. Use /new to reset.[/]")
     return {"approved": approved}
 
 
@@ -524,7 +570,8 @@ async def run_user_request(
     user_input: str,
     config: AgentConfig,
     stream_processor_cls,
-    prompt_session: PromptSession,
+    current_session: SessionSnapshot,
+    session_store: SessionStore,
     *,
     model_name: str = "",
     tools_count: int = 0,
@@ -546,8 +593,9 @@ async def run_user_request(
             return result.stats
         payload = Command(
             resume=await prompt_for_interrupt(
-                prompt_session,
                 result.interrupt,
+                current_session,
+                session_store,
                 model_name=model_name,
                 tools_count=tools_count,
             )
@@ -593,6 +641,7 @@ async def main():
         checkpoint_backend=checkpoint_info.get("resolved_backend", config.checkpoint_backend),
         checkpoint_target=checkpoint_info.get("target", "unknown"),
     )
+    current_session.approval_mode = _normalize_approval_mode(getattr(current_session, "approval_mode", APPROVAL_MODE_PROMPT))
     store.save_active_session(current_session)
 
     tools = tool_registry.tools
@@ -650,7 +699,8 @@ async def main():
                 user_input,
                 config,
                 StreamProcessor,
-                session,
+                current_session,
+                store,
                 model_name=model_name,
                 tools_count=len(tools),
             )

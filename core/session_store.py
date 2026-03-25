@@ -14,6 +14,7 @@ class SessionSnapshot:
     checkpoint_target: str
     created_at: str
     updated_at: str
+    approval_mode: str = "prompt"
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc).isoformat()
@@ -34,6 +35,7 @@ class SessionStore:
         if not isinstance(payload, dict):
             return None
         try:
+            payload.setdefault("approval_mode", "prompt")
             return SessionSnapshot(**payload)
         except TypeError:
             return None

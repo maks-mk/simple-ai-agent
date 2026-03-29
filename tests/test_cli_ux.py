@@ -13,7 +13,15 @@ import agent_cli
 from core.session_store import SessionSnapshot, SessionStore
 from core.stream_processor import StreamProcessor
 from core.tool_policy import ToolMetadata
-from core.ui_theme import ACCENT_BLUE, AGENT_THEME, TEXT_MUTED, TEXT_PRIMARY, build_shimmer_text
+from core.ui_theme import (
+    ACCENT_BLUE,
+    AGENT_THEME,
+    AMBER_WARNING,
+    ERROR_RED,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    build_shimmer_text,
+)
 
 
 class FakeTool:
@@ -228,6 +236,31 @@ class CliUxTests(unittest.TestCase):
         self.assertEqual(summary.risk_level, "high")
         self.assertIn("files", summary.impacts)
         self.assertIn("network", summary.impacts)
+
+    def test_approval_panel_style_uses_risk_level(self):
+        self.assertEqual(
+            agent_cli._approval_panel_style(
+                agent_cli.ApprovalSummary(0, 1, 0, True, "medium", ("files",))
+            ),
+            "approval.border",
+        )
+        self.assertEqual(
+            agent_cli._approval_panel_style(
+                agent_cli.ApprovalSummary(1, 1, 0, False, "high", ("files",))
+            ),
+            "approval.danger",
+        )
+        self.assertEqual(
+            agent_cli._approval_panel_style(
+                agent_cli.ApprovalSummary(0, 0, 0, True, "low", ())
+            ),
+            "approval.networked",
+        )
+
+    def test_approval_theme_uses_warning_accent_for_border_and_mutating(self):
+        self.assertEqual(AGENT_THEME.styles["approval.border"].color.triplet.hex, AMBER_WARNING.lower())
+        self.assertEqual(AGENT_THEME.styles["approval.mutating"].color.triplet.hex, AMBER_WARNING.lower())
+        self.assertEqual(AGENT_THEME.styles["approval.danger"].color.triplet.hex, ERROR_RED.lower())
 
     def test_stream_processor_status_labels_are_normalized(self):
         processor = StreamProcessor(self._console())

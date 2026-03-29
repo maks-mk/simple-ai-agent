@@ -349,25 +349,6 @@ async def initialize_agent(config: AgentConfig):
     return result
 
 
-def render_header(config: AgentConfig, tools) -> None:
-    clear_screen()
-    model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
-    provider_icon = "[status.spinner]◆[/]"
-    tools_str = f"[dim]{len(tools)} tools[/]" if tools else "[dim]no tools[/]"
-    grid = Table.grid(expand=True)
-    grid.add_column(justify="left")
-    grid.add_column(justify="center")
-    grid.add_column(justify="right")
-    grid.add_row(
-        f"[panel.title]AI Agent[/] [dim]v{AGENT_VERSION}[/]",
-        tools_str,
-        f"[dim]{model_name}[/] {provider_icon}",
-    )
-    console.print(Panel(grid, border_style="panel.border", padding=(0, 1)))
-    if config.debug:
-        console.print(Panel("[status.text]Debug mode active[/]", border_style="panel.border", padding=(0, 1)))
-
-
 def create_session() -> PromptSession:
     return PromptSession(
         history=FileHistory(".history"),
@@ -528,6 +509,14 @@ def _use_detailed_approval_panel(summary: ApprovalSummary, req_tools: list[dict]
     return len(req_tools) > 1 or summary.destructive_count > 0 or summary.networked_count > 0
 
 
+def _approval_panel_style(summary: ApprovalSummary) -> str:
+    if summary.risk_level == "high":
+        return "approval.danger"
+    if summary.risk_level == "low":
+        return "approval.networked"
+    return "approval.border"
+
+
 async def _run_approval_selector(summary: ApprovalSummary) -> str | None:
     default_choice = "yes" if summary.default_approve else "no"
     kb = KeyBindings()
@@ -596,6 +585,7 @@ async def prompt_for_interrupt(
         return {"approved": True}
 
     summary_line = _approval_summary_line(summary)
+    panel_style = _approval_panel_style(summary)
     panel_body: Group | str
     if _use_detailed_approval_panel(summary, req_tools):
         table = Table(box=box.ROUNDED, show_header=True, header_style="table.header", expand=False)
@@ -620,8 +610,8 @@ async def prompt_for_interrupt(
     out.print(
         Panel(
             panel_body,
-            title="[approval.border]⚠  Approval Required[/]",
-            border_style="approval.border",
+            title=f"[{panel_style}]⚠  Approval Required[/]",
+            border_style=panel_style,
             padding=(0, 1),
         )
     )

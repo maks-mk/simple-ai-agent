@@ -11,6 +11,7 @@ TEXT_MUTED = "#97A0AB"
 TEXT_DIM = "#6F7884"
 BORDER = "#3C4452"
 SEPARATOR = "#2B313C"
+AMBER_WARNING = "#E8A838"
 ERROR_RED = "#FF5A5F"
 
 
@@ -86,9 +87,9 @@ AGENT_THEME = Theme({
     "agent.thought": Style(color=TEXT_MUTED, italic=True),
     "agent.node": Style(color=ACCENT_BLUE, italic=True),
 
-    "approval.border": Style(color=BORDER),
+    "approval.border": Style(color=AMBER_WARNING, bold=True),
     "approval.danger": Style(color=ERROR_RED, bold=True),
-    "approval.mutating": Style(color=TEXT_PRIMARY, bold=True),
+    "approval.mutating": Style(color=AMBER_WARNING, bold=True),
     "approval.networked": Style(color=ACCENT_BLUE),
     "approval.summary": Style(color=TEXT_PRIMARY, bold=True),
 
@@ -106,7 +107,7 @@ AGENT_THEME = Theme({
     "panel.border": Style(color=BORDER),
     "panel.title": Style(color=TEXT_PRIMARY, bold=True),
     "panel.error": Style(color=ERROR_RED),
-    "panel.warning": Style(color=TEXT_PRIMARY),
+    "panel.warning": Style(color=AMBER_WARNING),
     "overview.label": Style(color=TEXT_MUTED, bold=True),
     "overview.value": Style(color=TEXT_PRIMARY),
     "table.header": Style(color=TEXT_PRIMARY, bold=True),

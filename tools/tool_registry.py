@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence, Union
@@ -14,6 +15,54 @@ from core.config import AgentConfig
 from core.tool_policy import ToolMetadata, default_tool_metadata
 
 logger = logging.getLogger(__name__)
+_MCP_MUTATING_KEYWORDS = {
+    "append",
+    "create",
+    "download",
+    "edit",
+    "insert",
+    "mkdir",
+    "modify",
+    "move",
+    "patch",
+    "rename",
+    "replace",
+    "save",
+    "update",
+    "upload",
+    "write",
+}
+_MCP_DESTRUCTIVE_KEYWORDS = {
+    "delete",
+    "destroy",
+    "erase",
+    "kill",
+    "purge",
+    "remove",
+    "rm",
+    "rmdir",
+    "terminate",
+    "trash",
+    "unlink",
+    "wipe",
+}
+_MCP_EXECUTION_KEYWORDS = {
+    "bash",
+    "cmd",
+    "command",
+    "exec",
+    "execute",
+    "powershell",
+    "process",
+    "python",
+    "run",
+    "script",
+    "shell",
+    "spawn",
+    "start",
+    "terminal",
+}
+_MCP_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(frozen=True)
@@ -278,6 +327,26 @@ class ToolRegistry:
     def _configure_shell(module: Any, config: AgentConfig) -> None:
         ToolRegistry._configure_safety(module, config)
 
+    @staticmethod
+    def _infer_mcp_metadata(tool_name: str) -> ToolMetadata:
+        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", tool_name).lower()
+        tokens = set(_MCP_TOKEN_RE.findall(normalized))
+
+        destructive = bool(tokens & _MCP_DESTRUCTIVE_KEYWORDS)
+        execution = bool(tokens & _MCP_EXECUTION_KEYWORDS)
+        mutating = destructive or execution or bool(tokens & _MCP_MUTATING_KEYWORDS)
+        requires_approval = mutating or destructive
+
+        return ToolMetadata(
+            name=tool_name,
+            read_only=not mutating and not destructive,
+            mutating=mutating,
+            destructive=destructive or execution,
+            requires_approval=requires_approval,
+            networked=True,
+            source="mcp",
+        )
+
     async def _load_single_mcp_server(
         self,
         name: str,
@@ -350,7 +419,13 @@ class ToolRegistry:
                 if mcp_tools:
                     self.tools.extend(mcp_tools)
                     for tool in mcp_tools:
-                        self.tool_metadata[tool.name] = default_tool_metadata(tool.name, source="mcp")
+                        metadata = self._infer_mcp_metadata(tool.name)
+                        self.tool_metadata[tool.name] = metadata
+                        if metadata.requires_approval:
+                            logger.warning(
+                                "MCP tool '%s' was marked as approval-required by heuristic policy detection.",
+                                tool.name,
+                            )
                     self.mcp_server_status.append(
                         {
                             "server": name,

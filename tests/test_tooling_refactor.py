@@ -47,6 +47,33 @@ class ToolingRefactorTests(unittest.IsolatedAsyncioTestCase):
         names = [tool.name for tool in registry.tools]
         self.assertEqual(names, ["safe_delete_file", "safe_delete_directory"])
 
+    def test_mcp_metadata_keeps_safe_tools_read_only(self):
+        metadata = ToolRegistry._infer_mcp_metadata("context7:resolve-library-id")
+
+        self.assertTrue(metadata.read_only)
+        self.assertFalse(metadata.mutating)
+        self.assertFalse(metadata.destructive)
+        self.assertFalse(metadata.requires_approval)
+        self.assertTrue(metadata.networked)
+
+    def test_mcp_metadata_flags_write_like_tools_for_approval(self):
+        metadata = ToolRegistry._infer_mcp_metadata("filesystem:write_file")
+
+        self.assertFalse(metadata.read_only)
+        self.assertTrue(metadata.mutating)
+        self.assertFalse(metadata.destructive)
+        self.assertTrue(metadata.requires_approval)
+        self.assertTrue(metadata.networked)
+
+    def test_mcp_metadata_flags_execution_like_tools_for_approval(self):
+        metadata = ToolRegistry._infer_mcp_metadata("terminal:run_command")
+
+        self.assertFalse(metadata.read_only)
+        self.assertTrue(metadata.mutating)
+        self.assertTrue(metadata.destructive)
+        self.assertTrue(metadata.requires_approval)
+        self.assertTrue(metadata.networked)
+
     def test_validation_supports_delete_argument_aliases(self):
         tmp = self._workspace_tempdir()
         file_path = tmp / "data.txt"

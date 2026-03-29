@@ -78,7 +78,7 @@ class StreamProcessor:
                     if self.pending_interrupt is not None:
                         break
         except (KeyboardInterrupt, asyncio.CancelledError):
-            self.console.print("\n[bold red]🛑 Stopped by user[/]")
+            self.console.print("\n[dim]✕ cancelled[/][/]")
             return StreamProcessResult(stats=None)
 
         self._commit_printed_text()

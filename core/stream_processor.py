@@ -20,8 +20,10 @@ from core.cli_utils import (
     prepare_markdown_for_render,
 )
 from core.message_utils import is_tool_message_error, stringify_content
+from core.ui_theme import build_shimmer_text, shimmer_supported
 
 DIFF_REGEX = re.compile(r"```diff\r?\n(.*?)```", re.DOTALL)
+CODE_THEME = "ansi_dark"
 logger = logging.getLogger("agent")
 
 
@@ -236,7 +238,7 @@ class StreamProcessor:
             return
 
         diff_code = diff_match.group(1).strip()
-        syntax = Syntax(diff_code, "diff", theme="monokai", line_numbers=True, word_wrap=True)
+        syntax = Syntax(diff_code, "diff", theme=CODE_THEME, line_numbers=True, word_wrap=True)
         self.console.print(Padding(syntax, (0, 0, 0, 8)))
 
     def _commit_printed_text(self, end_index: Optional[int] = None) -> None:
@@ -245,7 +247,7 @@ class StreamProcessor:
             return
 
         new_text = prepare_markdown_for_render(self.clean_full[self.printed_len:limit])
-        self.console.print(Padding(Markdown(new_text, code_theme="dracula", hyperlinks=False), (0, 0, 0, 4)))
+        self.console.print(Padding(Markdown(new_text, code_theme=CODE_THEME, hyperlinks=False), (0, 0, 0, 4)))
         self.printed_len = limit
 
     def _try_commit(self) -> None:
@@ -290,10 +292,14 @@ class StreamProcessor:
 
     def _spinner_row(self):
         base = self._status_label()
-        if self.has_thought:
-            label = f"[agent.thought]{base}[/] [tool.timing]{self._elapsed()}[/]"
-        else:
-            label = f"{base} [tool.timing]{self._elapsed()}[/]"
+        shimmer = self.active_node != "approval" and shimmer_supported(self.console.color_system)
+        label = build_shimmer_text(
+            base,
+            phase=time.time() - self.start_time,
+            italic=self.has_thought and self.active_node == "agent",
+            enabled=shimmer,
+        )
+        label.append(f" {self._elapsed()}", style="tool.timing")
         return Spinner("dots", text=label, style="status.spinner")
 
     def _update_live_display(self, live: Live) -> None:
@@ -305,7 +311,7 @@ class StreamProcessor:
             if pending_markdown:
                 renderables.append(
                     Padding(
-                        Markdown(pending_markdown, code_theme="dracula", hyperlinks=False),
+                        Markdown(pending_markdown, code_theme=CODE_THEME, hyperlinks=False),
                         (0, 0, 0, 4),
                     )
                 )
@@ -316,6 +322,4 @@ class StreamProcessor:
             live.update(RichGroup(*renderables))
         except Exception as e:
             logger.debug("Live display update failed: %s", e)
-
-
 

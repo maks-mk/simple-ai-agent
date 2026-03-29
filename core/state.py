@@ -29,7 +29,9 @@ class AgentState(TypedDict):
     # Durable runtime/session info
     session_id: NotRequired[str]
     run_id: NotRequired[str]
+    turn_id: NotRequired[int]
     pending_approval: NotRequired[Dict[str, Any] | None]
+    open_tool_issue: NotRequired[Dict[str, Any] | None]
     last_tool_error: NotRequired[str]
     last_tool_result: NotRequired[str]
     safety_mode: NotRequired[str]

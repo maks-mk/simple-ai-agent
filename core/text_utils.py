@@ -395,6 +395,9 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
     content = str(content).strip()
 
     if is_error:
+        lower_content = content.lower()
+        if "error[access_denied]" in lower_content or "cancelled by approval policy" in lower_content:
+            return "Skipped"
         summary = truncate_value(content, 120)
         return f"[red]{summary}[/][yellow italic]{_hint_for_error(content)}[/]"
 

@@ -210,13 +210,148 @@ class AgentNodes:
             for m in messages
         )
 
+    def _current_turn_id(self, state: AgentState, messages: List[BaseMessage]) -> int:
+        derived_turn_id = 0
+        for message in messages:
+            if not isinstance(message, HumanMessage):
+                continue
+            content = stringify_content(message.content).strip()
+            if content and content != constants.REFLECTION_PROMPT:
+                derived_turn_id += 1
+        return max(int(state.get("turn_id", 0) or 0), derived_turn_id)
+
+    def _get_active_open_tool_issue(
+        self,
+        state: AgentState,
+        messages: List[BaseMessage],
+        current_turn_id: int | None = None,
+    ) -> Dict[str, Any] | None:
+        issue = state.get("open_tool_issue")
+        if not isinstance(issue, dict):
+            return None
+
+        active_turn_id = current_turn_id if current_turn_id is not None else self._current_turn_id(state, messages)
+        issue_turn_id = int(issue.get("turn_id", 0) or 0)
+        summary = str(issue.get("summary", "")).strip()
+        if issue_turn_id != active_turn_id or not summary:
+            return None
+
+        tool_names = [str(name) for name in (issue.get("tool_names") or []) if str(name).strip()]
+        return {
+            "turn_id": issue_turn_id,
+            "kind": str(issue.get("kind") or "tool_error"),
+            "summary": summary,
+            "tool_names": tool_names,
+            "source": str(issue.get("source") or "tools"),
+        }
+
+    def _normalize_critic_feedback(self, critic_feedback: str) -> str:
+        return critic_feedback.strip()
+
+    def _build_tool_issue_system_message(self, open_tool_issue: Dict[str, Any] | None) -> SystemMessage | None:
+        if not open_tool_issue:
+            return None
+
+        issue_summary = open_tool_issue.get("summary", "")
+        if open_tool_issue.get("kind") == "approval_denied":
+            return SystemMessage(
+                content=(
+                    "TOOL EXECUTION DENIED BY USER:\n"
+                    f"{issue_summary}\n\n"
+                    "The user explicitly rejected this tool call. "
+                    "Do not simulate the denied tool or describe imaginary results. "
+                    "Do not make any more tool calls in this turn. "
+                    "Reply briefly and simply: say that you did not do it because the user chose No, "
+                    "then wait for the next instruction."
+                )
+            )
+
+        return SystemMessage(
+            content=constants.UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE.format(
+                error_summary=issue_summary
+            )
+        )
+
+    def _build_retry_context_message(
+        self,
+        current_task: str,
+        critic_feedback: str,
+        messages: List[BaseMessage],
+    ) -> SystemMessage | None:
+        if not critic_feedback or not messages or not isinstance(messages[-1], AIMessage):
+            return None
+        return SystemMessage(
+            content=(
+                "RETRY CONTEXT:\n"
+                f"Current task: {current_task or 'No explicit task provided.'}\n"
+                "The previous assistant response in this same turn was incomplete. "
+                "Use the critic feedback above to continue the same task, improve the answer or take the next needed step, "
+                "and avoid repeating the same incomplete result."
+            )
+        )
+
+    def _assistant_acknowledges_open_tool_issue(self, text: str, open_tool_issue: Dict[str, Any] | None) -> bool:
+        if not open_tool_issue:
+            return False
+        return self._assistant_acknowledges_unresolved_tool_error(text)
+
+    def _build_open_tool_issue(
+        self,
+        *,
+        current_turn_id: int,
+        kind: str,
+        summary: str,
+        tool_names: List[str],
+        source: str,
+    ) -> Dict[str, Any]:
+        return {
+            "turn_id": current_turn_id,
+            "kind": kind,
+            "summary": compact_text(summary.strip(), 320),
+            "tool_names": [name for name in tool_names if name],
+            "source": source,
+        }
+
+    def _merge_open_tool_issues(
+        self,
+        issues: List[Dict[str, Any]],
+        current_turn_id: int,
+    ) -> Dict[str, Any] | None:
+        if not issues:
+            return None
+
+        summaries: List[str] = []
+        tool_names: List[str] = []
+        kind = "tool_error"
+        source = "tools"
+        for issue in issues:
+            summary = str(issue.get("summary", "")).strip()
+            if summary and summary not in summaries:
+                summaries.append(summary)
+            for tool_name in issue.get("tool_names") or []:
+                tool_name = str(tool_name).strip()
+                if tool_name and tool_name not in tool_names:
+                    tool_names.append(tool_name)
+            if issue.get("kind") == "approval_denied":
+                kind = "approval_denied"
+                source = "approval"
+
+        return self._build_open_tool_issue(
+            current_turn_id=current_turn_id,
+            kind=kind,
+            summary=" | ".join(summaries[:3]),
+            tool_names=tool_names,
+            source=source,
+        )
+
     def _build_agent_context(
         self,
         messages: List[BaseMessage],
         summary: str,
+        current_task: str,
         critic_feedback: str,
         tools_available: bool,
-        unresolved_tool_error: str,
+        open_tool_issue: Dict[str, Any] | None,
     ) -> List[BaseMessage]:
         sanitized_messages = self._sanitize_messages_for_model(messages)
         full_context: List[BaseMessage] = [
@@ -225,28 +360,9 @@ class AgentNodes:
         safety_overlay = self._build_safety_overlay(tools_available=tools_available)
         if safety_overlay:
             full_context.append(SystemMessage(content=safety_overlay))
-        if unresolved_tool_error:
-            if "ACCESS_DENIED" in unresolved_tool_error:
-                full_context.append(
-                    SystemMessage(
-                        content=(
-                            "TOOL EXECUTION DENIED BY USER:\n"
-                            f"{unresolved_tool_error}\n\n"
-                            "The user explicitly rejected this tool call. "
-                            "You MUST NOT simulate, emulate, fabricate, or invent any output for the denied tool. "
-                            "Do NOT describe what the tool would have done. "
-                            "Inform the user that the action was denied and ask what they would like to do instead."
-                        )
-                    )
-                )
-            else:
-                full_context.append(
-                    SystemMessage(
-                        content=constants.UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE.format(
-                            error_summary=unresolved_tool_error
-                        )
-                    )
-                )
+        issue_message = self._build_tool_issue_system_message(open_tool_issue)
+        if issue_message:
+            full_context.append(issue_message)
         if critic_feedback:
             full_context.append(
                 SystemMessage(
@@ -257,17 +373,10 @@ class AgentNodes:
                     )
                 )
             )
+        retry_context = self._build_retry_context_message(current_task, critic_feedback, sanitized_messages)
+        if retry_context:
+            full_context.append(retry_context)
         full_context.extend(sanitized_messages)
-        if critic_feedback and sanitized_messages and isinstance(sanitized_messages[-1], AIMessage):
-            full_context.append(
-                HumanMessage(
-                    content=(
-                        "Continue the task from the latest incomplete assistant attempt. "
-                        "Use the critic feedback above, do not repeat the same incomplete answer, "
-                        "and only stop when the requested work is actually finished."
-                    )
-                )
-            )
         return full_context
 
     def _sanitize_messages_for_model(self, messages: List[BaseMessage]) -> List[BaseMessage]:
@@ -299,6 +408,8 @@ class AgentNodes:
         response: AIMessage,
         current_task: str,
         tools_available: bool,
+        turn_id: int,
+        open_tool_issue: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         token_usage_update = {}
         if getattr(response, "usage_metadata", None):
@@ -306,6 +417,7 @@ class AgentNodes:
 
         has_tool_calls = False
         protocol_error = ""
+        issue_still_open = open_tool_issue
 
         if isinstance(response, AIMessage):
             t_calls = list(getattr(response, "tool_calls", []))
@@ -327,14 +439,35 @@ class AgentNodes:
                 t_calls = []
 
             has_tool_calls = bool(tools_available and t_calls)
+            if has_tool_calls and open_tool_issue and open_tool_issue.get("kind") == "approval_denied":
+                base_text = stringify_content(response.content).strip()
+                if not self._assistant_acknowledges_open_tool_issue(base_text, open_tool_issue):
+                    base_text = (
+                        "Okay, I did not do that because you chose No. Tell me what you want to do instead."
+                    )
+                response = AIMessage(
+                    content=base_text,
+                    additional_kwargs=response.additional_kwargs,
+                    response_metadata=response.response_metadata,
+                    usage_metadata=response.usage_metadata,
+                    id=response.id,
+                )
+                has_tool_calls = False
+
+            if not has_tool_calls and issue_still_open:
+                response_text = stringify_content(response.content).strip()
+                if self._assistant_acknowledges_open_tool_issue(response_text, issue_still_open):
+                    issue_still_open = None
 
         return {
             "messages": [response],
+            "turn_id": turn_id,
             "current_task": current_task,
             "critic_feedback": "",
             "critic_status": "",
             "critic_source": "" if has_tool_calls else "agent",
             "pending_approval": None,
+            "open_tool_issue": issue_still_open,
             "last_tool_error": "",
             "last_tool_result": "",
             **token_usage_update,
@@ -393,9 +526,10 @@ class AgentNodes:
     async def agent_node(self, state: AgentState):
         messages = state["messages"]
         summary = state.get("summary", "")
-        critic_feedback = (state.get("critic_feedback") or "").strip()
+        critic_feedback = self._normalize_critic_feedback(state.get("critic_feedback") or "")
         current_task = state.get("current_task") or self._derive_current_task(messages)
-        unresolved_tool_error = self._get_unresolved_tool_error(messages)
+        current_turn_id = self._current_turn_id(state, messages)
+        open_tool_issue = self._get_active_open_tool_issue(state, messages, current_turn_id)
         self._log_run_event(
             state,
             "agent_node_start",
@@ -408,9 +542,10 @@ class AgentNodes:
         full_context = self._build_agent_context(
             messages,
             summary,
+            current_task,
             critic_feedback,
             tools_available,
-            unresolved_tool_error,
+            open_tool_issue,
         )
         response = await self._invoke_llm_with_retry(
             self.llm_with_tools,
@@ -418,7 +553,13 @@ class AgentNodes:
             state=state,
             node_name="agent",
         )
-        result = self._build_agent_result(response, current_task, tools_available)
+        result = self._build_agent_result(
+            response,
+            current_task,
+            tools_available,
+            current_turn_id,
+            open_tool_issue,
+        )
         self._log_run_event(
             state,
             "agent_node_end",
@@ -432,11 +573,13 @@ class AgentNodes:
 
     async def critic_node(self, state: AgentState):
         messages = state.get("messages", [])
+        current_turn_id = self._current_turn_id(state, messages)
         current_task = (state.get("current_task") or self._derive_current_task(messages)).strip()
         summary = state.get("summary", "")
         critic_source = (state.get("critic_source") or "agent").strip().lower()
         trace = self._format_trace_for_critic(messages)
-        unresolved_tool_error = self._get_unresolved_tool_error(messages) or "None."
+        open_tool_issue = self._get_active_open_tool_issue(state, messages, current_turn_id)
+        unresolved_tool_error = open_tool_issue.get("summary") if open_tool_issue else "None."
 
         prompt = constants.CRITIC_PROMPT_TEMPLATE.format(
             current_task=current_task or "No explicit task provided.",
@@ -467,6 +610,7 @@ class AgentNodes:
             reason,
             next_step,
             messages,
+            open_tool_issue,
         )
         self._log_run_event(
             state,
@@ -479,6 +623,7 @@ class AgentNodes:
         )
 
         return {
+            "turn_id": current_turn_id,
             "critic_status": status,
             "critic_feedback": self._build_critic_feedback(status, reason, next_step, critic_source),
             "current_task": current_task,
@@ -558,6 +703,7 @@ class AgentNodes:
 
         messages = state["messages"]
         last_msg = messages[-1]
+        current_turn_id = self._current_turn_id(state, messages)
 
         if not isinstance(last_msg, AIMessage) or not last_msg.tool_calls:
             return {}
@@ -566,6 +712,7 @@ class AgentNodes:
         has_error = False
         last_error = ""
         last_result = ""
+        tool_issues: List[Dict[str, Any]] = []
         approval_state = state.get("pending_approval") or {}
 
         # Оптимизация: собираем историю вызовов один раз, а не для каждого инструмента.
@@ -581,11 +728,16 @@ class AgentNodes:
 
         if self._can_parallelize_tool_calls(tool_calls):
             processed = await asyncio.gather(
-                *(self._process_tool_call(tool_call, recent_calls, state, approval_state) for tool_call in tool_calls)
+                *(
+                    self._process_tool_call(tool_call, recent_calls, state, approval_state, current_turn_id)
+                    for tool_call in tool_calls
+                )
             )
-            for tool_msg, had_error in processed:
+            for tool_msg, had_error, issue in processed:
                 final_messages.append(tool_msg)
                 has_error = has_error or had_error
+                if issue:
+                    tool_issues.append(issue)
                 parsed = parse_tool_execution_result(tool_msg.content)
                 if parsed.ok:
                     last_result = parsed.message
@@ -593,9 +745,17 @@ class AgentNodes:
                     last_error = parsed.message
         else:
             for tool_call in tool_calls:
-                tool_msg, had_error = await self._process_tool_call(tool_call, recent_calls, state, approval_state)
+                tool_msg, had_error, issue = await self._process_tool_call(
+                    tool_call,
+                    recent_calls,
+                    state,
+                    approval_state,
+                    current_turn_id,
+                )
                 final_messages.append(tool_msg)
                 has_error = has_error or had_error
+                if issue:
+                    tool_issues.append(issue)
                 parsed = parse_tool_execution_result(tool_msg.content)
                 if parsed.ok:
                     last_result = parsed.message
@@ -604,9 +764,11 @@ class AgentNodes:
 
         return {
             "messages": final_messages,
+            "turn_id": current_turn_id,
             "critic_source": "tools",
             "critic_feedback": "",
             "pending_approval": None,
+            "open_tool_issue": self._merge_open_tool_issues(tool_issues, current_turn_id),
             "last_tool_error": last_error,
             "last_tool_result": last_result,
         }
@@ -623,7 +785,8 @@ class AgentNodes:
         recent_calls: List[Dict[str, Any]],
         state: AgentState,
         approval_state: Dict[str, Any],
-    ) -> Tuple[ToolMessage, bool]:
+        current_turn_id: int,
+    ) -> Tuple[ToolMessage, bool, Dict[str, Any] | None]:
         # Безопасное извлечение с фоллбеками
         t_name = tool_call.get("name") or "unknown_tool"
         t_args = tool_call.get("args") or {}
@@ -650,7 +813,19 @@ class AgentNodes:
                 policy=metadata.to_dict(),
             )
             limit = self.config.safety.max_tool_output
-            return ToolMessage(content=truncate_output(content, limit, source=t_name), tool_call_id=t_id, name=t_name), True
+            parsed_result = parse_tool_execution_result(content)
+            issue = self._build_open_tool_issue(
+                current_turn_id=current_turn_id,
+                kind="approval_denied",
+                summary=parsed_result.message or content,
+                tool_names=[t_name],
+                source="approval",
+            )
+            return (
+                ToolMessage(content=truncate_output(content, limit, source=t_name), tool_call_id=t_id, name=t_name),
+                True,
+                issue,
+            )
 
         # Проверка на зацикливание
         loop_count = sum(
@@ -701,7 +876,19 @@ class AgentNodes:
             result=parsed_result.to_event_payload(),
         )
 
-        return ToolMessage(content=content, tool_call_id=t_id, name=t_name), had_error
+        issue = None
+        if not parsed_result.ok:
+            issue_kind = "approval_denied" if parsed_result.error_type == "ACCESS_DENIED" else "tool_error"
+            issue_source = "approval" if issue_kind == "approval_denied" else "tools"
+            issue = self._build_open_tool_issue(
+                current_turn_id=current_turn_id,
+                kind=issue_kind,
+                summary=parsed_result.message or content,
+                tool_names=[t_name],
+                source=issue_source,
+            )
+
+        return ToolMessage(content=content, tool_call_id=t_id, name=t_name), had_error, issue
 
     def _tool_call_is_approved(self, tool_call_id: str, approval_state: Dict[str, Any]) -> bool:
         if not self.config.enable_approvals:
@@ -730,6 +917,8 @@ class AgentNodes:
             return ""
 
         for message in messages[last_error_index + 1 :]:
+            if isinstance(message, HumanMessage):
+                return ""
             if isinstance(message, ToolMessage) and not is_tool_message_error(message):
                 return ""
 
@@ -758,6 +947,10 @@ class AgentNodes:
             "не смог",
             "не могу",
             "не получилось",
+            "не сделал",
+            "не выполнял",
+            "вы выбрали no",
+            "выбрали no",
             "ошибка",
             "сбой",
             "не завершил",
@@ -777,6 +970,10 @@ class AgentNodes:
             "error",
             "blocker",
             "denied",
+            "chose no",
+            "did not do that",
+            "didn't do that",
+            "not executed",
             "access denied",
             "access_denied",
             "cancelled by",
@@ -790,9 +987,9 @@ class AgentNodes:
         reason: str,
         next_step: str,
         messages: List[BaseMessage],
+        open_tool_issue: Dict[str, Any] | None,
     ) -> Tuple[str, str, str]:
-        unresolved_tool_error = self._get_unresolved_tool_error(messages)
-        if not unresolved_tool_error:
+        if not open_tool_issue:
             return status, reason, next_step
 
         last_ai = self._get_last_ai_message(messages)
@@ -804,7 +1001,7 @@ class AgentNodes:
             )
 
         last_text = stringify_content(last_ai.content)
-        if self._assistant_acknowledges_unresolved_tool_error(last_text):
+        if self._assistant_acknowledges_open_tool_issue(last_text, open_tool_issue):
             return (
                 "FINISHED",
                 "The assistant explicitly reported the unresolved tool failure to the user.",
@@ -1123,8 +1320,3 @@ class AgentNodes:
             "error code: 403",
         )
         return any(marker in err_str for marker in fatal_markers)
-
-
-
-
-

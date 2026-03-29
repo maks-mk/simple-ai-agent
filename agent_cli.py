@@ -1,4 +1,5 @@
 import asyncio
+from html import escape
 import logging
 import os
 import sys
@@ -14,9 +15,7 @@ from prompt_toolkit.completion import Completer, WordCompleter
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.shortcuts.choice_input import ChoiceInput
-from pygments.lexers.markup import MarkdownLexer
 from rich import box
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -32,7 +31,7 @@ from core.logging_config import setup_logging
 from core.session_store import SessionSnapshot, SessionStore
 from core.session_utils import repair_session_if_needed
 from core.tool_policy import ToolMetadata
-from core.ui_theme import AGENT_THEME
+from core.ui_theme import ACCENT_BLUE, AGENT_THEME, TEXT_MUTED, TEXT_PRIMARY
 
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -87,6 +86,21 @@ def _resolve_console(out: Console | None) -> Console:
     return out or console
 
 
+def _html_style(text: str, *, fg: str | None = None, bg: str | None = None, bold: bool = False) -> str:
+    attrs = []
+    if fg:
+        attrs.append(f'fg="{fg}"')
+    if bg:
+        attrs.append(f'bg="{bg}"')
+    if bold:
+        attrs.append('bold="true"')
+    attr_text = " ".join(attrs)
+    safe_text = escape(text)
+    if not attr_text:
+        return safe_text
+    return f"<style {attr_text}>{safe_text}</style>"
+
+
 def get_prompt_message() -> HTML:
     cwd = Path.cwd()
     home = Path.home()
@@ -98,22 +112,37 @@ def get_prompt_message() -> HTML:
     display_parts = [parts[0], "\u2026", *parts[-2:]] if len(parts) > 4 else list(parts)
     path_str = "/".join(display_parts).replace("\\", "/")
     return HTML(
-        f'<style bg="#0077c2" fg="white"> Agent </style><style fg="#0077c2"></style><style fg="#ansigreen"> {path_str} </style><style fg="#ansigreen" bold="true">❯</style> '
+        f"{_html_style(' Agent ', fg=TEXT_PRIMARY, bg=ACCENT_BLUE, bold=True)}"
+        f"{_html_style('', fg=ACCENT_BLUE)}"
+        f"{_html_style(f' {path_str} ', fg=TEXT_MUTED)}"
+        f"{_html_style('❯', fg=ACCENT_BLUE, bold=True)} "
     )
 
 
 def get_bottom_toolbar(mode: str = "normal", model_name: str = "", tools_count: int = 0) -> HTML:
     if mode == "approval":
         return HTML(
-            " <b>Approval</b> | <b>↑↓</b> choose | <b>Enter</b> confirm | <b>Esc</b> cancel "
+            f" {_html_style('Approval', fg=TEXT_PRIMARY, bold=True)}"
+            f" | {_html_style('↑↓', fg=ACCENT_BLUE, bold=True)} choose"
+            f" | {_html_style('Enter', fg=ACCENT_BLUE, bold=True)} confirm"
+            f" | {_html_style('Esc', fg=ACCENT_BLUE, bold=True)} cancel "
         )
 
-    model_part = f" │ <b>{model_name}</b>" if model_name else ""
-    tools_part = f" │ tools: {tools_count}" if tools_count else ""
+    model_part = (
+        f" | {_html_style(model_name, fg=TEXT_PRIMARY, bold=True)}"
+        if model_name
+        else ""
+    )
+    tools_part = (
+        f" | {_html_style(f'tools: {tools_count}', fg=TEXT_MUTED)}"
+        if tools_count
+        else ""
+    )
     return HTML(
-        f" <b>ALT+ENTER</b> multiline"
-        f" | <b>/help</b> · <b>/tools</b> · <b>/session</b> · <b>/new</b>"
-        f" | <b>/quit</b> exit"
+        f" {_html_style('ALT+ENTER', fg=ACCENT_BLUE, bold=True)} multiline"
+        f" | {_html_style('/help', fg=ACCENT_BLUE, bold=True)} · {_html_style('/tools', fg=ACCENT_BLUE, bold=True)}"
+        f" · {_html_style('/session', fg=ACCENT_BLUE, bold=True)} · {_html_style('/new', fg=ACCENT_BLUE, bold=True)}"
+        f" | {_html_style('/quit', fg=ACCENT_BLUE, bold=True)} exit"
         f"{tools_part}{model_part} "
     )
 
@@ -190,7 +219,7 @@ def render_overview(
 ) -> None:
     out = _resolve_console(out)
     provider_label, model_name = _provider_model(config)
-    provider_icon = "[overview.value]◆[/]" if config.provider == "openai" else "[status.text]◆[/]"
+    provider_icon = "[status.spinner]◆[/]"
     checkpoint_info = getattr(tool_registry, "checkpoint_info", {}) or {}
     backend = checkpoint_info.get("resolved_backend", config.checkpoint_backend)
     tools_count = len(getattr(tool_registry, "tools", []))
@@ -202,7 +231,11 @@ def render_overview(
     mcp_servers = _enabled_mcp_servers(tool_registry)
     mcp_text = ", ".join(mcp_servers) if mcp_servers else "none"
     issue_count = _runtime_issue_count(tool_registry)
-    status_text = "ready" if issue_count == 0 else f"degraded ({issue_count} issue{'s' if issue_count != 1 else ''})"
+    status_text = (
+        "[status.spinner]ready[/]"
+        if issue_count == 0
+        else f"[status.error]degraded ({issue_count} issue{'s' if issue_count != 1 else ''})[/]"
+    )
 
     table = Table.grid(expand=True, padding=(0, 1))
     table.add_column(style="overview.label", justify="right", no_wrap=True)
@@ -240,7 +273,7 @@ def render_tools(tool_registry, out: Console | None = None) -> None:
         metadata = metadata_map.get(tool.name)
         grouped[_tool_group(tool, metadata)].append((tool, metadata))
 
-    table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", expand=False)
+    table = Table(box=box.ROUNDED, show_header=True, header_style="table.header", expand=False)
     table.add_column("Group", style="overview.label", no_wrap=True)
     table.add_column("Tool", style="tool.name", no_wrap=True)
     table.add_column("Description", ratio=1)
@@ -308,31 +341,31 @@ async def initialize_agent(config: AgentConfig):
     provider_label = config.provider.capitalize()
     model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
     with console.status(
-        f"[init.step]▶[/] [dim]Loading {provider_label} · {model_name}...[/]",
+        f"[init.step]●[/] [init.info]Loading {provider_label} · {model_name}...[/]",
         spinner="dots",
     ):
         result = await build_agent_app(config)
-    console.print(f"[init.step]✔[/] [dim]Agent ready[/]")
+    console.print(f"[init.step]●[/] [status.success]Agent ready[/]")
     return result
 
 
 def render_header(config: AgentConfig, tools) -> None:
     clear_screen()
     model_name = config.gemini_model if config.provider == "gemini" else config.openai_model
-    provider_icon = "[cyan]◆[/]" if config.provider == "gemini" else "[green]◆[/]"
+    provider_icon = "[status.spinner]◆[/]"
     tools_str = f"[dim]{len(tools)} tools[/]" if tools else "[dim]no tools[/]"
     grid = Table.grid(expand=True)
     grid.add_column(justify="left")
     grid.add_column(justify="center")
     grid.add_column(justify="right")
     grid.add_row(
-        f"[bold cyan]AI Agent[/] [dim]v{AGENT_VERSION}[/]",
+        f"[panel.title]AI Agent[/] [dim]v{AGENT_VERSION}[/]",
         tools_str,
         f"[dim]{model_name}[/] {provider_icon}",
     )
-    console.print(Panel(grid, style="panel.border", padding=(0, 1)))
+    console.print(Panel(grid, border_style="panel.border", padding=(0, 1)))
     if config.debug:
-        console.print(Panel("[yellow]Debug mode active[/]", border_style="panel.warning", padding=(0, 1)))
+        console.print(Panel("[status.text]Debug mode active[/]", border_style="panel.border", padding=(0, 1)))
 
 
 def create_session() -> PromptSession:
@@ -340,7 +373,6 @@ def create_session() -> PromptSession:
         history=FileHistory(".history"),
         completer=MergeCompleter([WordCompleter(COMMANDS), FuzzyPathCompleter(root_dir=".")]),
         key_bindings=get_key_bindings(),
-        lexer=PygmentsLexer(MarkdownLexer),
         auto_suggest=AutoSuggestFromHistory(),
     )
 
@@ -356,7 +388,9 @@ def build_initial_state(user_input: str, session_id: str, safety_mode: str = "de
         "critic_feedback": "",
         "session_id": session_id,
         "run_id": uuid.uuid4().hex,
+        "turn_id": 1,
         "pending_approval": None,
+        "open_tool_issue": None,
         "last_tool_error": "",
         "last_tool_result": "",
         "safety_mode": safety_mode,
@@ -450,6 +484,50 @@ def _normalize_approval_mode(value: str | None) -> str:
     return APPROVAL_MODE_PROMPT
 
 
+def _approval_target_text(tool: dict) -> str:
+    args = tool.get("args") or {}
+    if not isinstance(args, dict):
+        return ""
+
+    for key in ("path", "target", "destination", "source", "cwd", "url", "pid"):
+        value = args.get(key)
+        if value:
+            text = str(value)
+            return (text[:72] + "…") if len(text) > 72 else text
+    return ""
+
+
+def _approval_compact_action(tool: dict) -> str:
+    name = str(tool.get("name") or "action")
+    target = _approval_target_text(tool)
+    friendly = {
+        "write_file": "Save file",
+        "edit_file": "Edit file",
+        "safe_delete_file": "Delete file",
+        "delete_file": "Delete file",
+        "download_file": "Download file",
+        "cli_exec": "Run command",
+    }.get(name, name)
+    return f"{friendly}: {target}" if target else friendly
+
+
+def _approval_summary_line(summary: ApprovalSummary) -> str:
+    parts = []
+    if summary.destructive_count:
+        parts.append(f"[approval.danger]{summary.destructive_count} destructive[/]")
+    if summary.networked_count:
+        parts.append(f"[approval.networked]{summary.networked_count} networked[/]")
+    if summary.impacts and (summary.destructive_count or summary.networked_count):
+        parts.append(f"[dim]Affects:[/] {summary.impact_text}")
+    if not parts and summary.mutating_count:
+        parts.append("[dim]This will change local files.[/]")
+    return "  ".join(parts)
+
+
+def _use_detailed_approval_panel(summary: ApprovalSummary, req_tools: list[dict]) -> bool:
+    return len(req_tools) > 1 or summary.destructive_count > 0 or summary.networked_count > 0
+
+
 async def _run_approval_selector(summary: ApprovalSummary) -> str | None:
     default_choice = "yes" if summary.default_approve else "no"
     kb = KeyBindings()
@@ -517,35 +595,37 @@ async def prompt_for_interrupt(
         )
         return {"approved": True}
 
-    table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", expand=False)
-    table.add_column("Tool", style="tool.name", no_wrap=True)
-    table.add_column("Args", style="tool.args")
-    table.add_column("Flags", no_wrap=True)
-    for tool in req_tools:
-        policy = tool.get("policy") or {}
-        args_str = str(tool.get("args", {}))
-        args_str = (args_str[:80] + "…") if len(args_str) > 80 else args_str
-        table.add_row(
-            tool.get("name", "unknown_tool"),
-            args_str,
-            _format_policy_flags(policy),
-        )
-    summary_line = (
-        f"[approval.summary]Risk {summary.risk_level}[/]  "
-        f"[approval.danger]{summary.destructive_count} destructive[/]  "
-        f"[approval.mutating]{summary.mutating_count} mutating[/]  "
-        f"[approval.networked]{summary.networked_count} networked[/]  "
-        f"[dim]Affects:[/] {summary.impact_text}"
-    )
+    summary_line = _approval_summary_line(summary)
+    panel_body: Group | str
+    if _use_detailed_approval_panel(summary, req_tools):
+        table = Table(box=box.ROUNDED, show_header=True, header_style="table.header", expand=False)
+        table.add_column("Tool", style="tool.name", no_wrap=True)
+        table.add_column("Args", style="tool.args")
+        table.add_column("Flags", no_wrap=True)
+        for tool in req_tools:
+            policy = tool.get("policy") or {}
+            args_str = str(tool.get("args", {}))
+            args_str = (args_str[:80] + "…") if len(args_str) > 80 else args_str
+            table.add_row(
+                tool.get("name", "unknown_tool"),
+                args_str,
+                _format_policy_flags(policy),
+            )
+        panel_body = Group(summary_line, table)
+    else:
+        tool = req_tools[0] if req_tools else {}
+        action_line = f"[approval.summary]{_approval_compact_action(tool)}[/]"
+        panel_body = action_line
+
     out.print(
         Panel(
-            Group(summary_line, table),
+            panel_body,
             title="[approval.border]⚠  Approval Required[/]",
             border_style="approval.border",
             padding=(0, 1),
         )
     )
-    out.print("  [dim]Use ↑/↓ to choose Yes/No/Always, Enter to confirm, Esc to cancel.[/]")
+    out.print("  [dim]Choose Yes, No or Always. Enter confirms.[/]")
 
     selected = await (selector(summary) if selector else _run_approval_selector(summary))
     approved = False
@@ -559,7 +639,7 @@ async def prompt_for_interrupt(
     status = "[status.success]approved[/]" if approved else "[status.error]denied[/]"
     out.print(f"  [approval.summary]Action[/] {status}")
     if selected == "always":
-        out.print("  [dim]Future protected actions will be auto-approved in this session. Use /new to reset.[/]")
+        out.print("  [dim]I will stop asking in this session. Use /new to reset.[/]")
     return {"approved": approved}
 
 

@@ -54,7 +54,7 @@ class ToolRegistry:
         for spec in self._loader_specs():
             if not spec.enabled(self.config):
                 continue
-            self._load_from_spec(spec)
+            self._load_local_spec(spec)
 
         if self.config.mcp_config_path.exists():
             await self._load_mcp_tools()
@@ -214,52 +214,51 @@ class ToolRegistry:
             ),
         ]
 
-    def _load_from_spec(self, spec: ToolLoaderSpec) -> None:
+    def _iter_spec_tool_names(self, spec: ToolLoaderSpec, module: Any) -> List[str]:
+        names = list(spec.tool_names)
+        names.extend(name for name in spec.optional_tool_names if hasattr(module, name))
+        return names
+
+    @staticmethod
+    def _metadata_for_spec_attr(spec: ToolLoaderSpec, attr_name: str, tool_name: str) -> ToolMetadata:
+        metadata = (spec.metadata or {}).get(attr_name) or (spec.optional_metadata or {}).get(attr_name)
+        if metadata:
+            return metadata
+        return default_tool_metadata(tool_name)
+
+    def _record_loader_status(
+        self,
+        *,
+        spec: ToolLoaderSpec,
+        loaded_tools: List[BaseTool],
+        error: str = "",
+    ) -> None:
+        self.loader_status.append(
+            {
+                "loader": spec.name,
+                "module": spec.module_name,
+                "loaded_tools": [tool.name for tool in loaded_tools],
+                "error": error,
+            }
+        )
+
+    def _load_local_spec(self, spec: ToolLoaderSpec) -> None:
         try:
             module = importlib.import_module(spec.module_name)
             if spec.configure:
                 spec.configure(module, self.config)
 
-            names = list(spec.tool_names)
-            names.extend(name for name in spec.optional_tool_names if hasattr(module, name))
-            loaded_tools = [getattr(module, name) for name in names]
-            self.tools.extend(loaded_tools)
-            for tool in loaded_tools:
-                metadata = self._metadata_for_loaded_tool(spec, tool.name)
+            loaded_tools: List[BaseTool] = []
+            for attr_name in self._iter_spec_tool_names(spec, module):
+                tool = getattr(module, attr_name)
+                loaded_tools.append(tool)
+                metadata = self._metadata_for_spec_attr(spec, attr_name, tool.name)
                 self.tool_metadata[tool.name] = metadata
-            self.loader_status.append(
-                {
-                    "loader": spec.name,
-                    "module": spec.module_name,
-                    "loaded_tools": [tool.name for tool in loaded_tools],
-                    "error": "",
-                }
-            )
+            self.tools.extend(loaded_tools)
+            self._record_loader_status(spec=spec, loaded_tools=loaded_tools)
         except Exception as e:
-            self.loader_status.append(
-                {
-                    "loader": spec.name,
-                    "module": spec.module_name,
-                    "loaded_tools": [],
-                    "error": str(e),
-                }
-            )
+            self._record_loader_status(spec=spec, loaded_tools=[], error=str(e))
             logger.exception("Failed to load %s tools: %s", spec.name, e)
-
-    @staticmethod
-    def _metadata_key_by_tool_name(spec: ToolLoaderSpec, tool_name: str) -> str | None:
-        for mapping in (spec.metadata or {}, spec.optional_metadata or {}):
-            for key, metadata in mapping.items():
-                if metadata.name == tool_name:
-                    return key
-        return None
-
-    def _metadata_for_loaded_tool(self, spec: ToolLoaderSpec, tool_name: str) -> ToolMetadata:
-        for mapping in (spec.metadata or {}, spec.optional_metadata or {}):
-            for metadata in mapping.values():
-                if metadata.name == tool_name:
-                    return metadata
-        return default_tool_metadata(tool_name)
 
     @staticmethod
     def _configure_safety(module: Any, config: AgentConfig) -> None:
@@ -278,6 +277,23 @@ class ToolRegistry:
     @staticmethod
     def _configure_shell(module: Any, config: AgentConfig) -> None:
         ToolRegistry._configure_safety(module, config)
+
+    async def _load_single_mcp_server(
+        self,
+        name: str,
+        cfg: Dict[str, Any],
+        valid_keys: set[str],
+        semaphore: asyncio.Semaphore,
+    ):
+        async with semaphore:
+            try:
+                from langchain_mcp_adapters.client import MultiServerMCPClient
+
+                server_config = {key: value for key, value in cfg.items() if key in valid_keys}
+                client = MultiServerMCPClient({name: server_config})
+                return name, client, await client.get_tools(), None
+            except Exception as e:
+                return name, None, None, e
 
     async def _load_mcp_tools(self):
         try:
@@ -299,8 +315,6 @@ class ToolRegistry:
                 logger.debug("No enabled MCP servers in config.")
                 return
 
-            from langchain_mcp_adapters.client import MultiServerMCPClient
-
             valid_keys = {
                 "command",
                 "args",
@@ -320,17 +334,12 @@ class ToolRegistry:
             }
 
             semaphore = asyncio.Semaphore(4)
-
-            async def _load_one_server(name: str, cfg: Dict[str, Any]):
-                async with semaphore:
-                    try:
-                        server_config = {key: value for key, value in cfg.items() if key in valid_keys}
-                        client = MultiServerMCPClient({name: server_config})
-                        return name, client, await client.get_tools(), None
-                    except Exception as e:
-                        return name, None, None, e
-
-            results = await asyncio.gather(*(_load_one_server(name, cfg) for name, cfg in enabled_servers))
+            results = await asyncio.gather(
+                *(
+                    self._load_single_mcp_server(name, cfg, valid_keys, semaphore)
+                    for name, cfg in enabled_servers
+                )
+            )
             for name, client, mcp_tools, err in results:
                 if err is not None:
                     self.mcp_server_status.append({"server": name, "loaded_tools": [], "error": str(err)})

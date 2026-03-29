@@ -13,7 +13,7 @@ import agent_cli
 from core.session_store import SessionSnapshot, SessionStore
 from core.stream_processor import StreamProcessor
 from core.tool_policy import ToolMetadata
-from core.ui_theme import AGENT_THEME
+from core.ui_theme import ACCENT_BLUE, AGENT_THEME, TEXT_MUTED, TEXT_PRIMARY, build_shimmer_text
 
 
 class FakeTool:
@@ -122,6 +122,22 @@ class CliUxTests(unittest.TestCase):
         self.assertIn("context7, pdf-tools", output)
         self.assertIn("/new", output)
 
+    def test_prompt_message_uses_monochrome_prompt_palette(self):
+        prompt = str(agent_cli.get_prompt_message())
+
+        self.assertIn(ACCENT_BLUE, prompt)
+        self.assertIn(TEXT_PRIMARY, prompt)
+        self.assertIn(TEXT_MUTED, prompt)
+        self.assertNotIn("#0077c2", prompt)
+        self.assertNotIn("ansigreen", prompt)
+
+    def test_bottom_toolbar_uses_accent_shortcuts(self):
+        toolbar = str(agent_cli.get_bottom_toolbar(model_name="gpt-4o", tools_count=3))
+
+        self.assertIn(ACCENT_BLUE, toolbar)
+        self.assertIn("gpt-4o", toolbar)
+        self.assertIn("tools: 3", toolbar)
+
     def test_render_overview_shows_session_scoped_always_status(self):
         out = self._console()
         snapshot = self._snapshot()
@@ -227,6 +243,18 @@ class CliUxTests(unittest.TestCase):
         processor.active_node = "summarize"
         self.assertEqual(processor._status_label(), "Compressing context")
 
+    def test_build_shimmer_text_creates_animated_spans(self):
+        text = build_shimmer_text("Thinking", phase=0.5, enabled=True)
+
+        self.assertEqual(text.plain, "Thinking")
+        self.assertGreater(len(text.spans), 1)
+
+    def test_build_shimmer_text_can_render_static_label(self):
+        text = build_shimmer_text("Waiting for approval", phase=0.5, enabled=False)
+
+        self.assertEqual(text.plain, "Waiting for approval")
+        self.assertEqual(len(text.spans), 0)
+
     def test_stream_processor_live_layout_keeps_pending_markdown_above_spinner(self):
         processor = StreamProcessor(self._console())
         processor._append_text("Partial answer")
@@ -258,6 +286,19 @@ class CliUxTests(unittest.TestCase):
         self.assertIn("edit_file", output)
         self.assertIn("foo", output)
 
+    def test_stream_processor_source_uses_neutral_colorful_code_theme(self):
+        source = (Path.cwd() / "core" / "stream_processor.py").read_text(encoding="utf-8")
+
+        self.assertIn('CODE_THEME = "ansi_dark"', source)
+        self.assertNotIn("dracula", source)
+        self.assertNotIn("monokai", source)
+
+    def test_cli_source_removes_markdown_lexer_from_input(self):
+        source = (Path.cwd() / "agent_cli.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("PygmentsLexer", source)
+        self.assertNotIn("MarkdownLexer", source)
+
     def test_prompt_for_interrupt_yes_approves(self):
         tmp = self._workspace_tempdir()
         store = SessionStore(tmp / "session.json")
@@ -283,7 +324,14 @@ class CliUxTests(unittest.TestCase):
 
         self.assertEqual(result, {"approved": True})
         self.assertEqual(snapshot.approval_mode, "prompt")
-        self.assertIn("approved", out.export_text())
+        output = out.export_text()
+        self.assertIn("approved", output)
+        self.assertIn("Edit file:", output)
+        self.assertIn("demo.txt", output)
+        self.assertNotIn("Args", output)
+        self.assertNotIn("Flags", output)
+        self.assertNotIn("Risk", output)
+        self.assertNotIn("mutating", output)
 
     def test_prompt_for_interrupt_no_denies(self):
         tmp = self._workspace_tempdir()
@@ -310,6 +358,10 @@ class CliUxTests(unittest.TestCase):
 
         self.assertEqual(result, {"approved": False})
         self.assertEqual(snapshot.approval_mode, "prompt")
+        output = out.export_text()
+        self.assertIn("Tool", output)
+        self.assertIn("Flags", output)
+        self.assertNotIn("0 networked", output)
 
     def test_prompt_for_interrupt_always_persists_session_mode(self):
         tmp = self._workspace_tempdir()
@@ -338,7 +390,7 @@ class CliUxTests(unittest.TestCase):
         self.assertEqual(snapshot.approval_mode, "always")
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.approval_mode, "always")
-        self.assertIn("Future protected actions will be auto-approved", out.export_text())
+        self.assertIn("I will stop asking in this session", out.export_text())
 
     def test_prompt_for_interrupt_bypasses_prompt_when_session_is_always(self):
         tmp = self._workspace_tempdir()

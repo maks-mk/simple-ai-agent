@@ -1,103 +1,97 @@
 # Autonomous AI Agent
 
-**v0.62b**
+**v0.62.3b**
 
-Автономный CLI-агент на базе LangGraph с durable checkpointing, session resume, policy-driven tool execution, approval gate для опасных действий, MCP-интеграцией и встроенным `critic`-узлом для проверки завершённости задачи.
+Автономный CLI-агент на базе LangGraph с durable checkpointing, session resume, policy-driven tool execution, approval gate для опасных действий, MCP-интеграцией, встроенным `critic`-узлом и локальным workflow-first TUI на `rich` + `prompt_toolkit`.
 
 ---
 
-## Что нового в `v0.62b`
+## Что нового в `v0.62.3b`
 
 - Добавлен настраиваемый checkpoint backend: `sqlite`, `memory`, `postgres`.
-- Локальный CLI по умолчанию использует `sqlite`, поэтому сессии реально переживают перезапуск приложения.
+- Локальный CLI по умолчанию использует `sqlite`, поэтому сессии переживают перезапуск приложения.
 - Появился `SessionStore`: активная сессия автоматически восстанавливается при следующем запуске.
 - Для mutating/destructive tools добавлен approval flow на базе LangGraph `interrupt`.
-- Реестр инструментов теперь хранит metadata/policy для каждого tool: `read_only`, `mutating`, `destructive`, `requires_approval`, `networked`.
+- Реестр инструментов хранит metadata/policy для каждого tool: `read_only`, `mutating`, `destructive`, `requires_approval`, `networked`.
 - Добавлено локальное JSONL-логирование рантайма: tool calls, critic verdicts, retries, approvals, ошибки.
-- `stop_background_process` по умолчанию не завершает внешние процессы, которые агент не запускал сам.
-- `context7` включён в `mcp.json` как рекомендуемый MCP для документации и setup-задач.
-- Read-only инструменты запускаются параллельно через `asyncio.gather` — ускоряет батчевые операции чтения/поиска.
-- Детектор зацикливания с раздельными лимитами для read-only и mutating инструментов.
-
-## UI/UX улучшения (workflow-first refresh)
-
-**`core/constants.py`**
-- `AGENT_VERSION` вынесен как единый источник истины; хардкод версии из `agent_cli.py` удалён.
-- Версия обновлена до `v0.61b`.
-
-**`core/ui_theme.py`**
-- Палитра стала более семантической: отдельно разведены нейтральный текст, tool/action-акценты, warning/danger и overview-метки.
-- Добавлены стили `tool.readonly`, `tool.mcp`, `approval.summary`, `turn.assistant`, `overview.label/value`.
-
-**`core/stream_processor.py`**
-- Исправлен главный UX-баг: спиннер и частичный текст теперь отображаются одновременно через `RichGroup` — пользователь всегда видит, что агент работает.
-- Спиннер показывает нормализованные статусы по активному узлу: `Thinking`, `Running tools`, `Reviewing`, `Waiting for approval`, `Compressing context`, с elapsed time.
-- Отслеживание активного узла графа через поле `active_node`.
-- Tool activity, summarization notes и diff preview теперь оформлены единообразно и визуально привязаны к текущему ходу агента.
-- Тайминг каждого tool-вызова: `tool ▶ name(...)` при старте, `tool ✔ summary 1.4s` при завершении.
-
-**`core/text_utils.py`**
-- `_rewrite_local_file_links()`: локальные Markdown-ссылки `[имя.md](имя.md)` автоматически конвертируются в инлайн-код `` `имя.md` `` до передачи в Rich — устраняет URL-кодирование кириллицы в именах файлов (`%D0%BC%D0%BE%D0%B4...`).
-
-**`core/nodes.py`**
-- При `ACCESS_DENIED` агент получает жёсткий системный оверлей вместо общего `UNRESOLVED_TOOL_ERROR_PROMPT_TEMPLATE` — запрещает симулировать, эмулировать или выдумывать результат отклонённого вызова.
-- Расширен список `failure_markers` в `_assistant_acknowledges_unresolved_tool_error`: добавлены `denied`, `access_denied`, `cancelled by`, `was cancelled`, `отказан`, `отклонён` — critic теперь правильно завершает цикл после явного отказа пользователя.
-
-**`agent_cli.py`**
-- Стартовые `header/runtime/session` объединены в единый overview-панель: провайдер, модель, backend, session/thread, approvals, tool count и активные MCP-серверы видны сразу.
-- Под overview выводится компактный cheatsheet: `/help`, `/tools`, `/session`, `/new`, `Alt+Enter`.
-- `get_bottom_toolbar`: контекстный — в обычном режиме показывает основные команды, а в approval prompt переключается на подсказки для подтверждения.
-- `render_tools`: инструменты теперь группируются в `Read-only`, `Protected`, `MCP` и показывают policy badges (`read-only`, `approval`, `mutating`, `destructive`, `network`, `mcp`).
-- `render_help`: теперь task-oriented — старт работы, инспекция инструментов и сессии, reset, approvals, multiline input.
-- `initialize_agent`: прогресс-статус с именем провайдера и модели, `✔ Agent ready` после загрузки.
-- `prompt_for_interrupt`: risk-first approval panel с summary по destructive/mutating/networked calls и компактным selector на `Yes` / `No` / `Always`.
-- `Always` действует на все последующие protected actions в рамках текущей session snapshot, переживает auto-resume и сбрасывается через `/new`.
-- При активном `Always` approval prompt больше не открывается — CLI печатает короткое `auto-approved` уведомление и продолжает выполнение.
-- Главный цикл: тонкий `Rule()` между ходами, явные метки `You` / `Agent`, `✕ cancelled` при `Ctrl+C`, ошибки оборачиваются в `Panel(border_style="panel.error")`.
-- Ошибки инициализации (`Config error`, `Init error`) тоже в styled Panel.
-- Команда выхода приведена к slash-стилю: используется `/quit`.
-- `_format_policy_flags()` вынесена в отдельную функцию.
-- `cli_utils.py`: `Alt+Enter` по-прежнему добавляет новую строку в основном вводе; approval selector обрабатывается отдельно через `prompt_toolkit`.
-
----
+- Read-only инструменты запускаются параллельно через `asyncio.gather`.
+- Добавлен loop guard с отдельными лимитами для read-only и mutating инструментов.
+- TUI обновлён до более строгого monochrome-стиля: белый/серый каркас, один холодный синий акцент и shimmer-статусы для активных фаз.
+- Ввод больше не подсвечивается как Markdown, а code blocks и diff preview сохраняют цветную syntax highlighting.
 
 ## Возможности
 
 ### CLI и UX
-- Единый overview-панель при старте: провайдер, модель, backend, session/thread, approvals, tool count и активные MCP-серверы.
-- Потоковый вывод ответов: спиннер и накапливающийся текст отображаются одновременно — пользователь всегда видит прогресс.
-- Контекстный спиннер по активному узлу графа: `Thinking` / `Running tools` / `Reviewing` / `Waiting for approval` / `Compressing context` с elapsed time.
-- Тайминг каждого tool-вызова: `tool ▶ имя(...)` при старте, `tool ✔ summary 1.4s` при завершении.
-- Approval-промпт с risk summary, цветными policy-флагами и компактным selector `Yes / No / Always`.
-- `Always` сохраняется в активной session snapshot, показывается в overview как `on (always for this session)` и сбрасывается командой `/new`.
-- Контекстный bottom toolbar: основные slash-команды в обычном режиме и отдельная подсказка в approval prompt.
-- Явные turn labels `You` / `Agent` делают историю диалога легче для чтения.
-- CLI на `rich` + `prompt_toolkit`; fuzzy autocomplete для команд и путей.
-- Автовосстановление последней активной сессии.
-- Команды `/help`, `/tools`, `/session`, `/new`, `/quit` для быстрого доступа к справке, состоянию и управлению сессией.
+- Единая overview-панель при старте: провайдер, модель, backend, session/thread, approvals, число инструментов и активные MCP-серверы.
+- Потоковый вывод ответов: спиннер и накапливающийся текст отображаются одновременно.
+- Контекстный статус по активному узлу графа: `Thinking`, `Running tools`, `Reviewing`, `Waiting for approval`, `Compressing context`.
+- Для рабочих фаз используется shimmer-анимация текста; approval-состояние остаётся статичным для читаемости.
+- Тайминг каждого tool-вызова: `tool ▶ name(...)` при старте, `tool ✔ summary 1.4s` при завершении.
+- Approval-промпт с risk summary и selector `Yes / No / Always`.
+- `Always` сохраняется в active session snapshot и сбрасывается через `/new`.
+- Контекстный bottom toolbar и команды `/help`, `/tools`, `/session`, `/new`, `/quit`.
+- Fuzzy autocomplete для команд и путей.
+- Каркас интерфейса придерживается схемы white/gray + one-accent-blue; syntax highlighting для кода и diff рендерится отдельно.
 
 ### Граф агента
-- Основной поток: `summarize -> update_step -> agent -> approval/tools/critic`.
-- `critic` не даёт агенту преждевременно объявить задачу завершённой. Работает в двух режимах: после ответа агента (`critic_source=agent`) — проверяет полноту текстового ответа; после выполнения инструментов (`critic_source=tools`) — проверяет что результаты инструментов действительно закрывают задачу.
-- Автосжатие контекста по `SESSION_SIZE` с сохранением последних сообщений.
-- Loop guard на уровне графа и на уровне повторяющихся tool-вызовов, с раздельными лимитами для read-only и mutating инструментов.
-- Interrupt-driven approval для опасных действий без ручной перестройки графа.
+- Базовый поток: `summarize -> update_step -> agent -> approval/tools/critic`.
+- `critic` не даёт агенту преждевременно объявить задачу завершённой.
+- `critic` работает в двух режимах:
+  - `critic_source=agent` проверяет полноту текстового ответа.
+  - `critic_source=tools` проверяет, закрывают ли результаты инструментов исходную задачу.
+- Автосжатие контекста запускается по `SESSION_SIZE`, сохраняя последние `SUMMARY_KEEP_LAST` сообщений без сжатия.
+- Interrupt-driven approval встроен в граф без ручной перестройки основного workflow.
 
-### Инструменты и политика безопасности
+### Инструменты и безопасность
 - Filesystem tools для чтения, записи, редактирования, поиска и удаления файлов.
 - Search tools через Tavily.
 - System tools для диагностики ОС и сети.
-- Process tools для фоновых процессов с ограничениями на `cwd` и внешний PID control.
+- Process tools для фоновых процессов с ограничениями на внешний PID control.
 - Опциональный shell tool с approval gate.
-- MCP tools из `mcp.json`, включая `context7` и `sequential-thinking`.
-- Policy metadata для каждого инструмента: read-only tools могут выполняться без approval, destructive tools требуют явного подтверждения.
+- MCP tools из `mcp.json`.
+- Политика на уровне инструмента: read-only, mutating, destructive, approval-required и networked.
 
 ### Надёжность и observability
 - Durable checkpoints через SQLite/Postgres backend.
 - Session snapshot в отдельном JSON-файле.
 - JSONL run logs по сессиям.
-- Явный runtime status по backend и MCP-серверам.
+- Runtime status-report по backend, local loaders и MCP-серверам.
 - Обработка malformed tool calls и protocol errors без краша CLI.
+
+---
+
+## Актуальная архитектура
+
+### Точка сборки
+- [agent.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/agent.py) создаёт LLM, `ToolRegistry`, checkpoint runtime и `JsonlRunLogger`, затем компилирует LangGraph workflow.
+- [agent_cli.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/agent_cli.py) отвечает за локальный CLI, overview, slash-команды, approval UX и запуск потокового рендера.
+
+### `core/`
+- [core/config.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/config.py) загружает `.env`, парсит runtime path fields, feature flags, summarization thresholds, loop-guard настройки, retry settings и approval settings.
+- [core/checkpointing.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/checkpointing.py) создаёт runtime checkpointer и выбирает backend `sqlite` / `memory` / `postgres`.
+- [core/nodes.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/nodes.py) содержит LangGraph-узлы: `summarize`, `agent`, `approval`, `tools`, `critic`.
+- [core/state.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/state.py) описывает расширенное состояние графа, включая `session_id`, `run_id`, `critic_*`, `pending_approval`, `last_tool_error`, `last_tool_result`.
+- [core/session_store.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/session_store.py) хранит snapshot активной сессии для auto-resume, включая session-scoped approval mode.
+- [core/run_logger.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/run_logger.py) пишет JSONL events по сессиям.
+- [core/tool_policy.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/tool_policy.py) описывает metadata/policy для tool layer.
+- [core/tool_results.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/tool_results.py) нормализует tool output для логирования и анализа.
+- [core/stream_processor.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/stream_processor.py) обрабатывает поток LangGraph событий, tool results и approval interrupts.
+- [core/ui_theme.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/ui_theme.py) хранит централизованную палитру TUI и shimmer-хелперы.
+- [core/session_utils.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/session_utils.py), [core/validation.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/validation.py), [core/errors.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/errors.py), [core/safety_policy.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/safety_policy.py) отвечают за repair, post-tool validation и security contracts.
+
+### `tools/`
+- [tools/tool_registry.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/tool_registry.py) собирает локальные и MCP-инструменты, назначает им metadata и формирует runtime status.
+- [tools/filesystem.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/filesystem.py) реализует filesystem-инструменты.
+- [tools/filesystem_impl/manager.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/filesystem_impl/manager.py), [tools/filesystem_impl/editing.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/filesystem_impl/editing.py), [tools/filesystem_impl/pathing.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/filesystem_impl/pathing.py) содержат низкоуровневую реализацию файловых операций.
+- [tools/search_tools.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/search_tools.py) даёт web search/fetch через Tavily.
+- [tools/system_tools.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/system_tools.py) отдаёт системную и сетевую информацию.
+- [tools/process_tools.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/process_tools.py) управляет фоновыми процессами и ограничивает контроль внешних PID.
+- [tools/local_shell.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/local_shell.py) содержит shell tool с approval-политикой.
+- [tools/delete_tools.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tools/delete_tools.py) используется как fallback для удаления, если filesystem-tools отключены.
+
+### Дополнительно
+- [pdf_mcp/pdf_server.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/pdf_mcp/pdf_server.py) содержит отдельный MCP-сервер для PDF-задач.
+- [tests](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/tests) покрывают граф, CLI UX, filesystem, checkpointing, tooling refactor и PDF MCP.
 
 ---
 
@@ -106,6 +100,7 @@
 ```text
 .
 ├── core/
+│   ├── __init__.py
 │   ├── checkpointing.py
 │   ├── cli_utils.py
 │   ├── config.py
@@ -127,47 +122,43 @@
 │   ├── ui_theme.py
 │   ├── utils.py
 │   └── validation.py
+├── pdf_mcp/
+│   ├── fonts/
+│   ├── pdf_server.py
+│   └── README.md
+├── tests/
+│   ├── test_cli_ux.py
+│   ├── test_critic_graph.py
+│   ├── test_pdf_mcp.py
+│   ├── test_runtime_refactor.py
+│   ├── test_stream_and_filesystem.py
+│   └── test_tooling_refactor.py
 ├── tools/
+│   ├── __init__.py
 │   ├── delete_tools.py
 │   ├── filesystem.py
+│   ├── filesystem_impl/
+│   │   ├── __init__.py
+│   │   ├── editing.py
+│   │   ├── manager.py
+│   │   └── pathing.py
 │   ├── local_shell.py
 │   ├── process_tools.py
 │   ├── search_tools.py
 │   ├── system_tools.py
 │   └── tool_registry.py
-├── tests/
 ├── agent.py
 ├── agent_cli.py
+├── build.bat
+├── check_models.py
 ├── env_example.txt
+├── icon.ico
 ├── mcp.json
+├── models_comparison.md
 ├── prompt.txt
 ├── README.md
 └── requirements.txt
 ```
-
----
-
-## Назначение ключевых модулей
-
-### `core/`
-- `checkpointing.py` создаёт runtime checkpointer и выбирает backend (`sqlite`, `memory`, `postgres`).
-- `config.py` загружает `.env`, парсит feature flags, лимиты, backend persistence и approval settings.
-- `nodes.py` содержит LangGraph-узлы: `agent`, `approval`, `tools`, `critic`, summarize и runtime overlays.
-- `state.py` описывает расширенное состояние графа, включая `session_id`, `run_id`, `pending_approval`, `last_tool_error`, `last_tool_result`.
-- `session_store.py` хранит snapshot активной сессии для auto-resume, включая session-scoped approval mode.
-- `run_logger.py` пишет JSONL events по сессиям.
-- `tool_policy.py` описывает policy metadata для tool layer.
-- `tool_results.py` нормализует tool output во внутренний structured shape для логирования и анализа.
-- `stream_processor.py` обрабатывает поток LangGraph событий, tool results и interrupts.
-- `session_utils.py`, `validation.py`, `errors.py`, `safety_policy.py` отвечают за repair, post-tool validation и security contracts.
-
-### `tools/`
-- `filesystem.py` реализует filesystem-инструменты с path guards, virtual mode и диффами для edit.
-- `search_tools.py` даёт web search/fetch через Tavily.
-- `system_tools.py` отдаёт системную и сетевую информацию.
-- `process_tools.py` управляет фоновыми процессами и не позволяет по умолчанию убивать произвольные внешние PID.
-- `local_shell.py` содержит shell tool с общими лимитами и approval-политикой.
-- `tool_registry.py` собирает локальные и MCP-инструменты, назначает им metadata и формирует runtime status.
 
 ---
 
@@ -186,6 +177,8 @@
 
 | Параметр | Значение по умолчанию | Назначение |
 | :--- | :--- | :--- |
+| `PROMPT_PATH` | `prompt.txt` | путь к системному промпту |
+| `MCP_CONFIG_PATH` | `mcp.json` | путь к конфигурации MCP-серверов |
 | `CHECKPOINT_BACKEND` | `sqlite` | backend для checkpoint saver |
 | `CHECKPOINT_SQLITE_PATH` | `.agent_state/checkpoints.sqlite` | локальная SQLite БД для state persistence |
 | `CHECKPOINT_POSTGRES_URL` | пусто | строка подключения к Postgres backend |
@@ -198,10 +191,21 @@
 | :--- | :--- |
 | `TEMPERATURE` | `0.2` |
 | `MAX_LOOPS` | `50` |
-| `PROMPT_PATH` | `prompt.txt` |
 | `MODEL_SUPPORTS_TOOLS` | `true` |
 | `DEBUG` | `false` |
 | `STRICT_MODE` | `false` |
+| `SESSION_SIZE` | `8000` |
+| `SUMMARY_KEEP_LAST` | `4` |
+| `MAX_RETRIES` | `3` |
+| `RETRY_DELAY` | `2` |
+
+### Loop guard для инструментов
+
+| Параметр | Значение по умолчанию | Назначение |
+| :--- | :--- | :--- |
+| `TOOL_LOOP_WINDOW` | вычисляется от `MAX_LOOPS` | окно истории для поиска повторяющихся tool calls |
+| `TOOL_LOOP_LIMIT_MUTATING` | вычисляется от `MAX_LOOPS` | лимит повторов для mutating tools |
+| `TOOL_LOOP_LIMIT_READONLY` | вычисляется от `MAX_LOOPS` | лимит повторов для read-only tools |
 
 ### Включение подсистем
 
@@ -221,11 +225,11 @@
 | :--- | :--- | :--- |
 | `MAX_TOOL_OUTPUT` | `4000` | лимит вывода инструмента |
 | `MAX_SEARCH_CHARS` | `15000` | лимит search/fetch контента |
-| `MAX_FILE_SIZE` | `300MiB` | число без суффикса = байты |
+| `MAX_FILE_SIZE` | `300MiB` | число без суффикса трактуется как байты |
 | `MAX_READ_LINES` | `2000` | лимит строк при чтении |
 | `MAX_BACKGROUND_PROCESSES` | `5` | лимит фоновых задач |
 
-Для `MAX_FILE_SIZE` используйте явные единицы: `4MB`, `300MiB`, `1GiB`. Значение `300` означает `300 bytes`, а не `300 MB`.
+Для `MAX_FILE_SIZE` лучше указывать явные единицы: `4MB`, `300MiB`, `1GiB`.
 
 ---
 
@@ -234,10 +238,8 @@
 - Конфигурация серверов находится в `mcp.json`.
 - Подключаются только записи с `"enabled": true`.
 - MCP tools регистрируются вместе с локальными инструментами и получают runtime status-report.
-- В поставляемом `mcp.json` по умолчанию включены (`"enabled": true`):
-  - `context7` для документации, setup и API reference.
-  - `sequential-thinking` для сложных reasoning-задач.
-- Набор активных серверов определяется полем `"enabled"` в `mcp.json`, а не кодом агента — можно менять без правки исходников.
+- Набор активных серверов определяется полем `"enabled"` в `mcp.json`, а не кодом агента.
+- В поставляемом `mcp.json` обычно используются `context7` и `sequential-thinking`.
 
 ---
 
@@ -261,10 +263,6 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-`requirements.txt` включает:
-- `langgraph-checkpoint-sqlite` для локального durable runtime;
-- `langgraph-checkpoint-postgres` и `psycopg` для production-like backend.
-
 ### 3. Настройка `.env`
 
 ```powershell
@@ -286,8 +284,8 @@ python agent_cli.py
 
 При старте CLI:
 - поднимет последнюю активную сессию из `SESSION_STATE_PATH`;
-- покажет unified overview по модели, backend, session/thread, approvals и MCP;
-- выведет краткий cheatsheet по основным slash-командам.
+- покажет overview по модели, backend, session/thread, approvals и MCP;
+- выведет краткий cheatsheet по slash-командам.
 
 ---
 
@@ -305,7 +303,10 @@ python agent_cli.py
 - session store;
 - JSONL run logging;
 - safer process control;
-- CLI UX: overview, tools/help panels, session-scoped approval selector, stream layout.
+- CLI UX: overview, tools/help panels, stream layout, shimmer/status rendering и prompt palette.
+
+Примечание:
+- полный прогон может упереться во внешнюю проблему окружения вокруг `pdf_mcp`/`fitz`; это не относится к архитектуре CLI/TUI.
 
 ---
 
@@ -328,7 +329,7 @@ python agent_cli.py
 - Approval в CLI выбирается через selector `Yes / No / Always`, без ручного `y/n` ввода.
 - Режим `Always` распространяется на все последующие protected actions в рамках текущей session snapshot и сбрасывается через `/new`.
 - `Esc` и `Ctrl+C` в approval selector трактуются как безопасный отказ.
-- При отказе пользователя (`ACCESS_DENIED`) агент не симулирует и не выдумывает результат — явно сообщает об отказе и спрашивает что делать дальше.
+- При отказе пользователя (`ACCESS_DENIED`) агент не симулирует и не выдумывает результат.
 - `cli_exec` отключён по умолчанию и считается high-risk инструментом.
 - `stop_background_process` не завершает внешние процессы без `ALLOW_EXTERNAL_PROCESS_CONTROL=true`.
 - Для production-режима предпочтителен `postgres` backend; для локального CLI — `sqlite`.

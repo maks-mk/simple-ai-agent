@@ -92,6 +92,8 @@ class CriticGraphTests(unittest.IsolatedAsyncioTestCase):
             "critic_status": "",
             "critic_source": "",
             "critic_feedback": "",
+            "turn_id": 1,
+            "open_tool_issue": None,
         }
 
     def _assert_feedback_hidden(self, messages):
@@ -153,7 +155,12 @@ class CriticGraphTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(critic_hint)
         self.assertIn("Task incomplete.", critic_hint[0])
-        self.assertIsInstance(agent_llm.invocations[2][-1], HumanMessage)
+        retry_context = [
+            message.content
+            for message in agent_llm.invocations[2]
+            if isinstance(message, SystemMessage) and "RETRY CONTEXT:" in str(message.content)
+        ]
+        self.assertTrue(retry_context)
         self._assert_feedback_hidden(result["messages"])
 
     async def test_tools_flow_reaches_final_answer_before_running_critic(self):
@@ -353,6 +360,13 @@ class CriticGraphTests(unittest.IsolatedAsyncioTestCase):
                     AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "x"}, "id": "tc-10"}]),
                     ToolMessage(content="ERROR[EXECUTION]: boom", tool_call_id="tc-10", name="demo_tool"),
                 ],
+                "open_tool_issue": {
+                    "turn_id": 1,
+                    "kind": "tool_error",
+                    "summary": "boom",
+                    "tool_names": ["demo_tool"],
+                    "source": "tools",
+                },
             }
         )
 
@@ -393,6 +407,29 @@ class CriticGraphTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(message, SystemMessage) and "UNRESOLVED TOOL FAILURE" in str(message.content)
         ]
         self.assertTrue(final_hint_messages)
+
+    async def test_tool_failure_sets_open_tool_issue_for_current_turn(self):
+        config = self._make_config(model_supports_tools=True)
+        failing_tool = FakeTool("demo_tool", "ERROR[EXECUTION]: boom")
+        nodes = AgentNodes(
+            config=config,
+            llm=FakeLLM([]),
+            tools=[failing_tool],
+            llm_with_tools=FakeLLM([]),
+        )
+
+        result = await nodes.tools_node(
+            {
+                **self._initial_state("Почини ошибку"),
+                "messages": [
+                    AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "x"}, "id": "tc-12"}])
+                ],
+            }
+        )
+
+        self.assertEqual(result["turn_id"], 1)
+        self.assertEqual(result["open_tool_issue"]["kind"], "tool_error")
+        self.assertEqual(result["open_tool_issue"]["tool_names"], ["demo_tool"])
 
 
 if __name__ == "__main__":

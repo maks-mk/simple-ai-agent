@@ -81,7 +81,9 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
             "critic_feedback": "",
             "session_id": session_id,
             "run_id": run_id,
+            "turn_id": 1,
             "pending_approval": None,
+            "open_tool_issue": None,
             "last_tool_error": "",
             "last_tool_result": "",
             "safety_mode": "default",
@@ -205,6 +207,91 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
         tool_messages = [msg for msg in resumed["messages"] if isinstance(msg, ToolMessage)]
         self.assertTrue(tool_messages)
         self.assertIn("ACCESS_DENIED", str(tool_messages[-1].content))
+        self.assertIsNone(resumed["open_tool_issue"])
+
+    async def test_approval_rejection_blocks_followup_tool_calls_in_same_turn(self):
+        config = self._make_config(ENABLE_APPROVALS=True)
+        denied_tool = FakeTool("danger_tool", "Изменение применено.")
+        fallback_tool = FakeTool("write_file", "Файл записан.")
+        nodes = AgentNodes(
+            config=config,
+            llm=FakeLLM([AIMessage(content="STATUS: FINISHED\nREASON: blocker reported\nNEXT_STEP: NONE")]),
+            tools=[denied_tool, fallback_tool],
+            llm_with_tools=FakeLLM(
+                [
+                    AIMessage(content="", tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-3"}]),
+                    AIMessage(
+                        content="Сохраню результат в другой файл.",
+                        tool_calls=[{"name": "write_file", "args": {"path": "alt.md", "content": "x"}, "id": "tc-4"}],
+                    ),
+                ]
+            ),
+            tool_metadata={
+                "danger_tool": ToolMetadata(
+                    name="danger_tool",
+                    mutating=True,
+                    destructive=True,
+                    requires_approval=True,
+                ),
+                "write_file": ToolMetadata(
+                    name="write_file",
+                    mutating=True,
+                    requires_approval=True,
+                ),
+            },
+        )
+        app = create_agent_workflow(nodes, config, tools_enabled=True).compile(checkpointer=MemorySaver())
+        thread_config = {"configurable": {"thread_id": "approval-thread-3"}, "recursion_limit": 36}
+
+        interrupted = await app.ainvoke(self._initial_state("Сделай изменение"), config=thread_config)
+        self.assertIn("__interrupt__", interrupted)
+        resumed = await app.ainvoke(Command(resume={"approved": False}), config=thread_config)
+
+        self.assertEqual(denied_tool.calls, [])
+        self.assertEqual(fallback_tool.calls, [])
+        self.assertIsInstance(resumed["messages"][-1], AIMessage)
+        self.assertIn("you chose No", str(resumed["messages"][-1].content))
+        self.assertEqual(resumed["critic_status"], "FINISHED")
+        self.assertIsNone(resumed["open_tool_issue"])
+
+    async def test_tools_node_marks_approval_denied_as_open_issue_before_agent_ack(self):
+        config = self._make_config(ENABLE_APPROVALS=True)
+        tool = FakeTool("danger_tool", "Изменение применено.")
+        nodes = AgentNodes(
+            config=config,
+            llm=FakeLLM([]),
+            tools=[tool],
+            llm_with_tools=FakeLLM([]),
+            tool_metadata={
+                "danger_tool": ToolMetadata(
+                    name="danger_tool",
+                    mutating=True,
+                    destructive=True,
+                    requires_approval=True,
+                )
+            },
+        )
+
+        result = await nodes.tools_node(
+            {
+                **self._initial_state("Сделай изменение"),
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-issue"}],
+                    )
+                ],
+                "pending_approval": {
+                    "approved": False,
+                    "decision": {"approved": False},
+                    "tool_call_ids": ["tc-issue"],
+                    "tool_names": ["danger_tool"],
+                },
+            }
+        )
+
+        self.assertEqual(result["open_tool_issue"]["kind"], "approval_denied")
+        self.assertEqual(result["open_tool_issue"]["turn_id"], 1)
 
     async def test_run_logger_writes_structured_tool_failure_event(self):
         tmp = self._workspace_tempdir()
@@ -270,6 +357,43 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.approval_mode, "prompt")
+
+    async def test_new_user_turn_ignores_old_open_tool_issue(self):
+        agent_llm = FakeLLM([AIMessage(content="Короткая сводка на экране.")])
+        nodes = AgentNodes(
+            config=self._make_config(),
+            llm=FakeLLM([]),
+            tools=[],
+            llm_with_tools=agent_llm,
+        )
+        state = {
+            **self._initial_state("Покажи коротко эту инфу на экран"),
+            "messages": [
+                HumanMessage(content="Сохрани в файл"),
+                AIMessage(content="Не сделал, так как вы выбрали Нет. Ожидаю дальнейших инструкций."),
+                HumanMessage(content="Покажи коротко эту инфу на экран"),
+            ],
+            "turn_id": 1,
+            "open_tool_issue": {
+                "turn_id": 1,
+                "kind": "approval_denied",
+                "summary": "Execution of 'write_file' was cancelled by approval policy.",
+                "tool_names": ["write_file"],
+                "source": "approval",
+            },
+            "current_task": "Покажи коротко эту инфу на экран",
+        }
+
+        result = await nodes.agent_node(state)
+
+        self.assertEqual(result["turn_id"], 2)
+        self.assertIsNone(result["open_tool_issue"])
+        unresolved_messages = [
+            str(message.content)
+            for message in agent_llm.invocations[0]
+            if "UNRESOLVED TOOL FAILURE" in str(message.content) or "TOOL EXECUTION DENIED BY USER" in str(message.content)
+        ]
+        self.assertFalse(unresolved_messages)
 
     def test_stop_background_process_denies_external_pid_by_default(self):
         result = process_tools.stop_background_process.invoke({"pid": os.getpid()})

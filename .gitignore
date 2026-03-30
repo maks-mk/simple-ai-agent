@@ -23,6 +23,7 @@ share/python-wheels/
 MANIFEST
 
 # Virtual Environments
+.history
 .env
 .venv
 env/

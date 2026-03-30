@@ -18,6 +18,8 @@
 - Добавлен loop guard с отдельными лимитами для read-only и mutating инструментов.
 - TUI обновлён до более строгого monochrome-стиля: белый/серый каркас, один холодный синий акцент и shimmer-статусы для активных фаз.
 - Ввод больше не подсвечивается как Markdown, а code blocks и diff preview сохраняют цветную syntax highlighting.
+- Graph flow переведён на явный turn-control: `critic` возвращает `CONTROL`, а retry проходит через internal `HumanMessage`, не ломая provider message order.
+- Approval-панель сделана спокойнее: нейтральный заголовок `Confirmation Needed`, мягкая warning-рамка и минималистичное содержимое без лишнего risk-noise.
 
 ## Возможности
 
@@ -27,7 +29,7 @@
 - Контекстный статус по активному узлу графа: `Thinking`, `Running tools`, `Reviewing`, `Waiting for approval`, `Compressing context`.
 - Для рабочих фаз используется shimmer-анимация текста; approval-состояние остаётся статичным для читаемости.
 - Тайминг каждого tool-вызова: `tool ▶ name(...)` при старте, `tool ✔ summary 1.4s` при завершении.
-- Approval-промпт с risk summary и selector `Yes / No / Always`.
+- Approval-промпт рендерится как компактная панель `Confirmation Needed` и показывает только инструмент и его аргументы, затем selector `Yes / No / Always`.
 - `Always` сохраняется в active session snapshot и сбрасывается через `/new`.
 - Контекстный bottom toolbar и команды `/help`, `/tools`, `/session`, `/new`, `/quit`.
 - Fuzzy autocomplete для команд и путей.
@@ -35,10 +37,11 @@
 
 ### Граф агента
 - Базовый поток: `summarize -> update_step -> agent -> approval/tools/critic`.
+- При critic-driven retry граф идёт по ветке `critic -> prepare_retry -> update_step -> agent`.
 - `critic` не даёт агенту преждевременно объявить задачу завершённой.
-- `critic` работает в двух режимах:
-  - `critic_source=agent` проверяет полноту текстового ответа.
-  - `critic_source=tools` проверяет, закрывают ли результаты инструментов исходную задачу.
+- `critic` возвращает не только `STATUS/REASON/NEXT_STEP`, но и `CONTROL: FINISH_TURN | RETRY_AGENT`.
+- Routing после `critic` опирается на `turn_outcome`, а не на эвристики по тексту последнего ответа.
+- Повторный вход в `agent` provider-safe: перед `llm_with_tools` проверяется, что последнее model-visible сообщение имеет роль `user` или `tool`.
 - Автосжатие контекста запускается по `SESSION_SIZE`, сохраняя последние `SUMMARY_KEEP_LAST` сообщений без сжатия.
 - Interrupt-driven approval встроен в граф без ручной перестройки основного workflow.
 
@@ -69,8 +72,8 @@
 ### `core/`
 - [core/config.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/config.py) загружает `.env`, парсит runtime path fields, feature flags, summarization thresholds, loop-guard настройки, retry settings и approval settings.
 - [core/checkpointing.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/checkpointing.py) создаёт runtime checkpointer и выбирает backend `sqlite` / `memory` / `postgres`.
-- [core/nodes.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/nodes.py) содержит LangGraph-узлы: `summarize`, `agent`, `approval`, `tools`, `critic`.
-- [core/state.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/state.py) описывает расширенное состояние графа, включая `session_id`, `run_id`, `critic_*`, `pending_approval`, `last_tool_error`, `last_tool_result`.
+- [core/nodes.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/nodes.py) содержит LangGraph-узлы: `summarize`, `agent`, `approval`, `tools`, `critic`, `prepare_retry`, а также provider-safe retry/control logic.
+- [core/state.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/state.py) описывает расширенное состояние графа, включая `session_id`, `run_id`, `critic_*`, `turn_outcome`, `retry_instruction`, `pending_approval`, `last_tool_error`, `last_tool_result`.
 - [core/session_store.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/session_store.py) хранит snapshot активной сессии для auto-resume, включая session-scoped approval mode.
 - [core/run_logger.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/run_logger.py) пишет JSONL events по сессиям.
 - [core/tool_policy.py](/D:/py_projects/simple_ai_agent/agent+stategraph/v7.3b/core/tool_policy.py) описывает metadata/policy для tool layer.
@@ -300,6 +303,7 @@ python agent_cli.py
 - filesystem и stream processor;
 - checkpoint runtime и SQLite persistence;
 - approval interrupts и resume flow;
+- provider-safe retry и internal retry message flow;
 - session store;
 - JSONL run logging;
 - safer process control;

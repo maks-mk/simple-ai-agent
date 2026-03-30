@@ -68,6 +68,7 @@ def create_agent_workflow(
     workflow.add_node("summarize", nodes.summarize_node)
     workflow.add_node("agent", nodes.agent_node)
     workflow.add_node("critic", nodes.critic_node)
+    workflow.add_node("prepare_retry", nodes.prepare_retry_node)
     workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
 
     workflow.add_edge(START, "summarize")
@@ -100,9 +101,11 @@ def create_agent_workflow(
         return "critic"
 
     def route_after_critic(state: AgentState):
-        if state.get("critic_status") == "FINISHED" and state.get("critic_source") == "agent":
+        if state.get("turn_outcome") == "finish_turn":
             return END
-        return "update_step"
+        if state.get("turn_outcome") == "retry_agent":
+            return "prepare_retry"
+        return END
 
     if tools_enabled:
         workflow.add_conditional_edges("agent", route_after_agent, ["approval", "tools", "critic", END])
@@ -111,7 +114,8 @@ def create_agent_workflow(
     else:
         workflow.add_conditional_edges("agent", route_after_agent, ["critic", END])
 
-    workflow.add_conditional_edges("critic", route_after_critic, ["update_step", END])
+    workflow.add_conditional_edges("critic", route_after_critic, ["prepare_retry", END])
+    workflow.add_edge("prepare_retry", "update_step")
 
     return workflow
 

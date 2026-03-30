@@ -28,11 +28,19 @@ class FakeLLM:
     async def ainvoke(self, context):
         self.invocations.append(context)
         if not self.responses:
-            return AIMessage(content="STATUS: FINISHED\nREASON: fallback\nNEXT_STEP: NONE")
+            return AIMessage(content="STATUS: FINISHED\nREASON: fallback\nNEXT_STEP: NONE\nCONTROL: FINISH_TURN")
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class ProviderSafeFakeLLM(FakeLLM):
+    async def ainvoke(self, context):
+        last_visible = next((message for message in reversed(context) if message.type != "system"), None)
+        if isinstance(last_visible, AIMessage):
+            raise AssertionError("provider-unsafe assistant-last context")
+        return await super().ainvoke(context)
 
 
 class FakeTool:
@@ -72,13 +80,15 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
 
     def _initial_state(self, task="Проверь задачу", session_id="session-test", run_id="run-test"):
         return {
-            "messages": [("user", task)],
+            "messages": [HumanMessage(content=task)],
             "steps": 0,
             "token_usage": {},
             "current_task": task,
             "critic_status": "",
             "critic_source": "",
             "critic_feedback": "",
+            "turn_outcome": "",
+            "retry_instruction": "",
             "session_id": session_id,
             "run_id": run_id,
             "turn_id": 1,
@@ -253,6 +263,50 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("you chose No", str(resumed["messages"][-1].content))
         self.assertEqual(resumed["critic_status"], "FINISHED")
         self.assertIsNone(resumed["open_tool_issue"])
+
+    async def test_approval_rejection_resume_keeps_provider_safe_order(self):
+        config = self._make_config(ENABLE_APPROVALS=True)
+        tool = FakeTool("danger_tool", "Изменение применено.")
+        nodes = AgentNodes(
+            config=config,
+            llm=FakeLLM(
+                [
+                    AIMessage(
+                        content=(
+                            "STATUS: INCOMPLETE\n"
+                            "REASON: The assistant is waiting for the user after denial.\n"
+                            "NEXT_STEP: wait for the next instruction\n"
+                            "CONTROL: FINISH_TURN"
+                        )
+                    )
+                ]
+            ),
+            tools=[tool],
+            llm_with_tools=ProviderSafeFakeLLM(
+                [
+                    AIMessage(content="", tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-safe"}]),
+                    AIMessage(content="Okay, I did not do that because you chose No. Tell me what you want to do instead."),
+                ]
+            ),
+            tool_metadata={
+                "danger_tool": ToolMetadata(
+                    name="danger_tool",
+                    mutating=True,
+                    destructive=True,
+                    requires_approval=True,
+                )
+            },
+        )
+        app = create_agent_workflow(nodes, config, tools_enabled=True).compile(checkpointer=MemorySaver())
+        thread_config = {"configurable": {"thread_id": "approval-thread-safe"}, "recursion_limit": 36}
+
+        interrupted = await app.ainvoke(self._initial_state("Сделай изменение"), config=thread_config)
+        self.assertIn("__interrupt__", interrupted)
+        resumed = await app.ainvoke(Command(resume={"approved": False}), config=thread_config)
+
+        self.assertEqual(tool.calls, [])
+        self.assertEqual(resumed["turn_outcome"], "finish_turn")
+        self.assertIn("you chose No", str(resumed["messages"][-1].content))
 
     async def test_tools_node_marks_approval_denied_as_open_issue_before_agent_ack(self):
         config = self._make_config(ENABLE_APPROVALS=True)

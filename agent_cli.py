@@ -405,18 +405,6 @@ def try_handle_command(
     return False
 
 
-def _format_policy_flags(policy: dict) -> str:
-    """Returns colored Rich markup string for tool policy flags."""
-    parts = []
-    if policy.get("destructive"):
-        parts.append("[approval.danger]destructive[/]")
-    if policy.get("mutating"):
-        parts.append("[approval.mutating]mutating[/]")
-    if policy.get("networked"):
-        parts.append("[approval.networked]networked[/]")
-    return "  ".join(parts) if parts else "[dim]protected[/]"
-
-
 def _summarize_approval_request(req_tools: list[dict]) -> ApprovalSummary:
     destructive_count = 0
     mutating_count = 0
@@ -478,40 +466,20 @@ def _approval_target_text(tool: dict) -> str:
     return ""
 
 
-def _approval_compact_action(tool: dict) -> str:
-    name = str(tool.get("name") or "action")
-    target = _approval_target_text(tool)
-    friendly = {
-        "write_file": "Save file",
-        "edit_file": "Edit file",
-        "safe_delete_file": "Delete file",
-        "delete_file": "Delete file",
-        "download_file": "Download file",
-        "cli_exec": "Run command",
-    }.get(name, name)
-    return f"{friendly}: {target}" if target else friendly
+def _approval_panel_body(req_tools: list[dict]) -> Group | str:
+    if not req_tools:
+        return "[approval.summary]Action pending approval[/]"
 
-
-def _approval_summary_line(summary: ApprovalSummary) -> str:
-    parts = []
-    if summary.destructive_count:
-        parts.append(f"[approval.danger]{summary.destructive_count} destructive[/]")
-    if summary.networked_count:
-        parts.append(f"[approval.networked]{summary.networked_count} networked[/]")
-    if summary.impacts and (summary.destructive_count or summary.networked_count):
-        parts.append(f"[dim]Affects:[/] {summary.impact_text}")
-    if not parts and summary.mutating_count:
-        parts.append("[dim]This will change local files.[/]")
-    return "  ".join(parts)
-
-
-def _use_detailed_approval_panel(summary: ApprovalSummary, req_tools: list[dict]) -> bool:
-    return len(req_tools) > 1 or summary.destructive_count > 0 or summary.networked_count > 0
+    lines: list[str] = []
+    for tool in req_tools:
+        tool_name = tool.get("name", "unknown_tool")
+        args_str = str(tool.get("args", {}))
+        args_str = (args_str[:96] + "…") if len(args_str) > 96 else args_str
+        lines.append(f"[tool.name]{tool_name}[/] [tool.args]{args_str}[/]")
+    return Group(*lines)
 
 
 def _approval_panel_style(summary: ApprovalSummary) -> str:
-    if summary.risk_level == "high":
-        return "approval.danger"
     if summary.risk_level == "low":
         return "approval.networked"
     return "approval.border"
@@ -584,33 +552,13 @@ async def prompt_for_interrupt(
         )
         return {"approved": True}
 
-    summary_line = _approval_summary_line(summary)
     panel_style = _approval_panel_style(summary)
-    panel_body: Group | str
-    if _use_detailed_approval_panel(summary, req_tools):
-        table = Table(box=box.ROUNDED, show_header=True, header_style="table.header", expand=False)
-        table.add_column("Tool", style="tool.name", no_wrap=True)
-        table.add_column("Args", style="tool.args")
-        table.add_column("Flags", no_wrap=True)
-        for tool in req_tools:
-            policy = tool.get("policy") or {}
-            args_str = str(tool.get("args", {}))
-            args_str = (args_str[:80] + "…") if len(args_str) > 80 else args_str
-            table.add_row(
-                tool.get("name", "unknown_tool"),
-                args_str,
-                _format_policy_flags(policy),
-            )
-        panel_body = Group(summary_line, table)
-    else:
-        tool = req_tools[0] if req_tools else {}
-        action_line = f"[approval.summary]{_approval_compact_action(tool)}[/]"
-        panel_body = action_line
+    panel_body = _approval_panel_body(req_tools)
 
     out.print(
         Panel(
             panel_body,
-            title=f"[{panel_style}]⚠  Approval Required[/]",
+            title=f"[{panel_style}]Confirmation Needed[/]",
             border_style=panel_style,
             padding=(0, 1),
         )

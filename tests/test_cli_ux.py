@@ -248,7 +248,7 @@ class CliUxTests(unittest.TestCase):
             agent_cli._approval_panel_style(
                 agent_cli.ApprovalSummary(1, 1, 0, False, "high", ("files",))
             ),
-            "approval.danger",
+            "approval.border",
         )
         self.assertEqual(
             agent_cli._approval_panel_style(
@@ -359,7 +359,7 @@ class CliUxTests(unittest.TestCase):
         self.assertEqual(snapshot.approval_mode, "prompt")
         output = out.export_text()
         self.assertIn("approved", output)
-        self.assertIn("Edit file:", output)
+        self.assertIn("edit_file", output)
         self.assertIn("demo.txt", output)
         self.assertNotIn("Args", output)
         self.assertNotIn("Flags", output)
@@ -392,9 +392,10 @@ class CliUxTests(unittest.TestCase):
         self.assertEqual(result, {"approved": False})
         self.assertEqual(snapshot.approval_mode, "prompt")
         output = out.export_text()
-        self.assertIn("Tool", output)
-        self.assertIn("Flags", output)
+        self.assertIn("safe_delete_file", output)
         self.assertNotIn("0 networked", output)
+        self.assertNotIn("Tool", output)
+        self.assertNotIn("Flags", output)
 
     def test_prompt_for_interrupt_always_persists_session_mode(self):
         tmp = self._workspace_tempdir()

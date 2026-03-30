@@ -25,6 +25,8 @@ class AgentState(TypedDict):
     critic_status: NotRequired[str]
     critic_source: NotRequired[str]
     critic_feedback: NotRequired[str]
+    turn_outcome: NotRequired[str]
+    retry_instruction: NotRequired[str]
 
     # Durable runtime/session info
     session_id: NotRequired[str]

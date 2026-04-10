@@ -74,6 +74,8 @@ class FilesystemManager:
             return format_error(ErrorType.NOT_FOUND, f"Directory not found: {path}")
         except NotADirectoryError:
             return format_error(ErrorType.VALIDATION, f"{path} is a file.")
+        except PermissionError as exc:
+            return str(exc)
         except OSError as exc:
             if exc.errno == errno.ENOTEMPTY:
                 return format_error(ErrorType.VALIDATION, "Directory is not empty. Set recursive=True to delete it.")

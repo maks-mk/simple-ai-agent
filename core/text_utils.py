@@ -378,20 +378,7 @@ def _format_list_output(content: str) -> str:
     return f"Listed {count} items: {preview}"
 
 
-OUTPUT_RULES: tuple[tuple[Callable[[str], bool], Callable[[str], str]], ...] = (
-    (lambda name: "web_search" in name, _format_web_search_output),
-    (lambda name: "crawl_site" in name, _format_crawl_output),
-    (lambda name: "cli_exec" in name or "shell" in name, _format_cli_output),
-    (lambda name: "list" in name and "directory" in name, _format_list_output),
-    (lambda name: "read" in name, lambda content: f"Read {len(content.splitlines())} lines ({len(content)} chars)"),
-    (lambda name: "write" in name or "save" in name, lambda content: "File saved successfully"),
-    (lambda name: "edit_file" in name, lambda content: "File edited successfully"),
-    (lambda name: "delete" in name, lambda content: "Deleted successfully"),
-    (lambda name: "fetch" in name or "download" in name, lambda content: f"Fetched content ({len(content)} chars)"),
-)
-
-
-def format_tool_output(name: str, content: str, is_error: bool) -> str:
+def format_tool_output(name: str, content: str, is_error: bool, ui_kind: str = "generic") -> str:
     content = str(content).strip()
 
     if is_error:
@@ -401,11 +388,23 @@ def format_tool_output(name: str, content: str, is_error: bool) -> str:
         summary = truncate_value(content, 120)
         return f"[red]{summary}[/][yellow italic]{_hint_for_error(content)}[/]"
 
-    name_lower = name.lower()
-    for predicate, formatter in OUTPUT_RULES:
-        if predicate(name_lower):
-            return formatter(content)
+    if ui_kind == "search":
+        if "pages processed" in content or "max_depth:" in content:
+            return _format_crawl_output(content)
+        return _format_web_search_output(content)
+    if ui_kind == "shell" or ui_kind == "process":
+        return _format_cli_output(content)
+    if ui_kind == "read":
+        return f"Read {len(content.splitlines())} lines ({len(content)} chars)"
+    if ui_kind == "write":
+        return "Saved successfully"
+    if ui_kind == "edit":
+        return "Edited successfully"
+    if ui_kind == "delete":
+        return "Deleted successfully"
 
+    if name.lower().endswith("list_directory"):
+        return _format_list_output(content)
     return truncate_value(content, 150)
 
 

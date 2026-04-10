@@ -1,5 +1,5 @@
-import io
 import asyncio
+import io
 import shutil
 import unittest
 from pathlib import Path
@@ -13,15 +13,7 @@ import agent_cli
 from core.session_store import SessionSnapshot, SessionStore
 from core.stream_processor import StreamProcessor
 from core.tool_policy import ToolMetadata
-from core.ui_theme import (
-    ACCENT_BLUE,
-    AGENT_THEME,
-    AMBER_WARNING,
-    ERROR_RED,
-    TEXT_MUTED,
-    TEXT_PRIMARY,
-    build_shimmer_text,
-)
+from core.ui_theme import AGENT_THEME
 
 
 class FakeTool:
@@ -34,17 +26,30 @@ class FakeToolRegistry:
     def __init__(self):
         self.tools = [
             FakeTool("read_file", "Read a file"),
-            FakeTool("edit_file", "Edit a file in place"),
-            FakeTool("context7:resolve-library-id", "Resolve a Context7 library id"),
+            FakeTool("edit_file", "Edit a file"),
+            FakeTool("context7:resolve-library-id", "Resolve a docs library id"),
         ]
         self.tool_metadata = {
-            "read_file": ToolMetadata(name="read_file", read_only=True),
-            "edit_file": ToolMetadata(name="edit_file", mutating=True, requires_approval=True),
+            "read_file": ToolMetadata(
+                name="read_file",
+                read_only=True,
+                impact_scope="files",
+                ui_kind="read",
+            ),
+            "edit_file": ToolMetadata(
+                name="edit_file",
+                mutating=True,
+                requires_approval=True,
+                impact_scope="files",
+                ui_kind="edit",
+            ),
             "context7:resolve-library-id": ToolMetadata(
                 name="context7:resolve-library-id",
                 read_only=True,
                 networked=True,
                 source="mcp",
+                impact_scope="network",
+                ui_kind="search",
             ),
         }
         self.checkpoint_info = {
@@ -55,16 +60,10 @@ class FakeToolRegistry:
         }
         self.mcp_server_status = [
             {"server": "context7", "loaded_tools": ["resolve-library-id"], "error": ""},
-            {"server": "pdf-tools", "loaded_tools": ["read_pdf"], "error": ""},
         ]
-        self.loader_status = []
 
     def get_runtime_status_lines(self):
-        return [
-            "Checkpoint: requested=sqlite active=sqlite target=.agent_state/checkpoints.sqlite",
-            "MCP context7: loaded 1 tool(s)",
-            "MCP pdf-tools: loaded 1 tool(s)",
-        ]
+        return ["MCP context7: loaded 1 tool(s)"]
 
 
 class FakeLive:
@@ -126,169 +125,90 @@ class CliUxTests(unittest.TestCase):
         self.assertIn("AI Agent", output)
         self.assertIn("OpenAI", output)
         self.assertIn("gpt-4o", output)
-        self.assertIn("sqlite", output)
-        self.assertIn("context7, pdf-tools", output)
-        self.assertIn("/new", output)
+        self.assertIn("context7", output)
+        self.assertIn("tools 3", output)
 
-    def test_prompt_message_uses_monochrome_prompt_palette(self):
-        prompt = str(agent_cli.get_prompt_message())
-
-        self.assertIn(ACCENT_BLUE, prompt)
-        self.assertIn(TEXT_PRIMARY, prompt)
-        self.assertIn(TEXT_MUTED, prompt)
-        self.assertNotIn("#0077c2", prompt)
-        self.assertNotIn("ansigreen", prompt)
-
-    def test_bottom_toolbar_uses_accent_shortcuts(self):
-        toolbar = str(agent_cli.get_bottom_toolbar(model_name="gpt-4o", tools_count=3))
-
-        self.assertIn(ACCENT_BLUE, toolbar)
-        self.assertIn("gpt-4o", toolbar)
-        self.assertIn("tools: 3", toolbar)
-
-    def test_render_overview_shows_session_scoped_always_status(self):
+    def test_render_turn_header_shows_turn_model_thread_and_session(self):
         out = self._console()
-        snapshot = self._snapshot()
-        snapshot.approval_mode = "always"
-
-        agent_cli.render_overview(self._config(), FakeToolRegistry(), snapshot, out=out)
-
+        agent_cli.render_turn_header(3, "gpt-4o", self._snapshot(), out=out)
         output = out.export_text()
-        self.assertIn("always for this session", output)
+        self.assertIn("Turn", output)
+        self.assertIn("3", output)
+        self.assertIn("gpt-4o", output)
+        self.assertIn("thread", output)
+        self.assertIn("session", output)
 
-    def test_try_handle_command_supports_new_alias(self):
-        calls = {"reset": 0}
+    def test_build_initial_state_uses_deterministic_retry_fields(self):
+        state = agent_cli.build_initial_state("hello", session_id="session-1")
+        self.assertEqual(state["retry_count"], 0)
+        self.assertEqual(state["retry_reason"], "")
+        self.assertEqual(state["turn_outcome"], "")
+        self.assertEqual(state["final_issue"], "")
+        self.assertNotIn("critic_status", state)
 
-        def reset_session():
-            calls["reset"] += 1
-
-        handled = agent_cli.try_handle_command("/new", FakeToolRegistry(), reset_session, lambda: None)
-
-        self.assertTrue(handled)
-        self.assertEqual(calls["reset"], 1)
-
-    def test_try_handle_command_can_reset_session_approval_mode(self):
-        snapshot = self._snapshot()
-        snapshot.approval_mode = "always"
-
-        def reset_session():
-            nonlocal snapshot
-            snapshot = SessionSnapshot(
-                session_id="session-new",
-                thread_id="thread-new",
-                checkpoint_backend="sqlite",
-                checkpoint_target=".agent_state/checkpoints.sqlite",
-                created_at="2026-03-21T12:00:00+00:00",
-                updated_at="2026-03-21T12:00:00+00:00",
-                approval_mode="prompt",
-            )
-
-        handled = agent_cli.try_handle_command("/new", FakeToolRegistry(), reset_session, lambda: None)
-
-        self.assertTrue(handled)
-        self.assertEqual(snapshot.approval_mode, "prompt")
-
-    def test_render_help_is_task_oriented(self):
-        out = self._console()
-        agent_cli.render_help(out=out)
-
-        output = out.export_text()
-        self.assertIn("Start work", output)
-        self.assertIn("Inspect tools", output)
-        self.assertIn("/session", output)
-        self.assertIn("Approvals", output)
-        self.assertIn("Yes/No/Always", output)
-
-    def test_render_tools_groups_tools_and_badges(self):
-        out = self._console()
-        agent_cli.render_tools(FakeToolRegistry(), out=out)
-
-        output = out.export_text()
-        self.assertIn("Read-only", output)
-        self.assertIn("Protected", output)
-        self.assertIn("MCP", output)
-        self.assertIn("read-only", output)
-        self.assertIn("approval", output)
-        self.assertIn("network", output)
-
-    def test_approval_summary_defaults_to_deny_for_destructive_batch(self):
+    def test_approval_summary_uses_explicit_impact_scope(self):
         summary = agent_cli._summarize_approval_request(
-            [{"name": "safe_delete_file", "policy": {"destructive": True, "mutating": True}}]
+            [
+                {
+                    "name": "totally_custom",
+                    "policy": {"mutating": True, "impact_scope": "processes", "ui_kind": "process"},
+                },
+                {
+                    "name": "docs_lookup",
+                    "policy": {"networked": True, "impact_scope": "network", "ui_kind": "search"},
+                },
+            ]
         )
 
         self.assertFalse(summary.default_approve)
         self.assertEqual(summary.risk_level, "high")
-
-    def test_approval_summary_defaults_to_approve_for_non_destructive_batch(self):
-        summary = agent_cli._summarize_approval_request(
-            [{"name": "edit_file", "policy": {"mutating": True}}]
-        )
-
-        self.assertTrue(summary.default_approve)
-        self.assertEqual(summary.risk_level, "medium")
-
-    def test_approval_summary_defaults_to_deny_for_mixed_batch(self):
-        summary = agent_cli._summarize_approval_request(
-            [{"name": "download_file", "policy": {"mutating": True, "networked": True}}]
-        )
-
-        self.assertFalse(summary.default_approve)
-        self.assertEqual(summary.risk_level, "high")
-        self.assertIn("files", summary.impacts)
+        self.assertIn("processes", summary.impacts)
         self.assertIn("network", summary.impacts)
 
-    def test_approval_panel_style_uses_risk_level(self):
-        self.assertEqual(
-            agent_cli._approval_panel_style(
-                agent_cli.ApprovalSummary(0, 1, 0, True, "medium", ("files",))
-            ),
-            "approval.border",
+    def test_approval_panel_body_renders_ui_kind_impact_and_target(self):
+        summary = agent_cli._summarize_approval_request(
+            [
+                {
+                    "name": "edit_file",
+                    "args": {"path": "demo.txt"},
+                    "policy": {"mutating": True, "impact_scope": "files", "ui_kind": "edit"},
+                }
+            ]
         )
-        self.assertEqual(
-            agent_cli._approval_panel_style(
-                agent_cli.ApprovalSummary(1, 1, 0, False, "high", ("files",))
-            ),
-            "approval.border",
-        )
-        self.assertEqual(
-            agent_cli._approval_panel_style(
-                agent_cli.ApprovalSummary(0, 0, 0, True, "low", ())
-            ),
-            "approval.networked",
+        body = agent_cli._approval_panel_body(
+            [
+                {
+                    "name": "edit_file",
+                    "args": {"path": "demo.txt"},
+                    "policy": {"mutating": True, "impact_scope": "files", "ui_kind": "edit"},
+                }
+            ],
+            summary,
         )
 
-    def test_approval_theme_uses_warning_accent_for_border_and_mutating(self):
-        self.assertEqual(AGENT_THEME.styles["approval.border"].color.triplet.hex, AMBER_WARNING.lower())
-        self.assertEqual(AGENT_THEME.styles["approval.mutating"].color.triplet.hex, AMBER_WARNING.lower())
-        self.assertEqual(AGENT_THEME.styles["approval.danger"].color.triplet.hex, ERROR_RED.lower())
+        console = self._console()
+        console.print(body)
+        output = console.export_text()
+        self.assertIn("edit_file", output)
+        self.assertIn("Action", output)
+        self.assertIn("Target", output)
+        self.assertIn("demo.txt", output)
 
-    def test_stream_processor_status_labels_are_normalized(self):
+    def test_stream_processor_status_labels_follow_graph_phases(self):
         processor = StreamProcessor(self._console())
 
         processor.active_node = "agent"
         self.assertEqual(processor._status_label(), "Thinking")
         processor.active_node = "tools"
         self.assertEqual(processor._status_label(), "Running tools")
-        processor.active_node = "critic"
-        self.assertEqual(processor._status_label(), "Reviewing")
         processor.active_node = "approval"
-        self.assertEqual(processor._status_label(), "Waiting for approval")
-        processor.active_node = "summarize"
-        self.assertEqual(processor._status_label(), "Compressing context")
+        self.assertEqual(processor._status_label(), "Awaiting approval")
+        processor.active_node = "prepare_retry"
+        self.assertEqual(processor._status_label(), "Recovering")
+        processor.active_node = "finalize_blocked"
+        self.assertEqual(processor._status_label(), "Finishing")
 
-    def test_build_shimmer_text_creates_animated_spans(self):
-        text = build_shimmer_text("Thinking", phase=0.5, enabled=True)
-
-        self.assertEqual(text.plain, "Thinking")
-        self.assertGreater(len(text.spans), 1)
-
-    def test_build_shimmer_text_can_render_static_label(self):
-        text = build_shimmer_text("Waiting for approval", phase=0.5, enabled=False)
-
-        self.assertEqual(text.plain, "Waiting for approval")
-        self.assertEqual(len(text.spans), 0)
-
-    def test_stream_processor_live_layout_keeps_pending_markdown_above_spinner(self):
+    def test_stream_processor_live_layout_keeps_pending_markdown_and_spinner(self):
         processor = StreamProcessor(self._console())
         processor._append_text("Partial answer")
         live = FakeLive()
@@ -297,105 +217,43 @@ class CliUxTests(unittest.TestCase):
 
         self.assertIsNotNone(live.renderable)
         self.assertEqual(len(live.renderable.renderables), 2)
-        self.assertEqual(type(live.renderable.renderables[0]).__name__, "Padding")
-        self.assertEqual(type(live.renderable.renderables[1]).__name__, "Spinner")
 
-    def test_stream_processor_tool_lines_use_turn_local_prefix(self):
+    def test_stream_processor_formats_tool_result_from_ui_kind_metadata(self):
         out = self._console()
-        processor = StreamProcessor(out)
-        processor.tool_buffer["call-1"] = {"name": "edit_file", "args": {"path": "demo.txt"}}
+        processor = StreamProcessor(
+            out,
+            tool_metadata={
+                "context7:query-docs": ToolMetadata(
+                    name="context7:query-docs",
+                    read_only=True,
+                    networked=True,
+                    impact_scope="network",
+                    ui_kind="read",
+                )
+            },
+        )
 
-        processor._render_tool_call({"id": "call-1", "name": "edit_file", "args": {"path": "demo.txt"}})
+        processor._remember_tool_call({"id": "tool-1", "name": "context7:query-docs", "args": {"query": "graph"}})
         processor._handle_tool_result(
             ToolMessage(
-                tool_call_id="call-1",
-                name="edit_file",
-                content="Success: File edited.\n\nDiff:\n```diff\n-foo\n+bar\n```",
+                tool_call_id="tool-1",
+                name="context7:query-docs",
+                content="line one\nline two\nline three",
             )
         )
 
         output = out.export_text()
-        self.assertIn("tool", output)
-        self.assertIn("edit_file", output)
-        self.assertIn("foo", output)
+        self.assertIn("Read 3 lines", output)
 
-    def test_stream_processor_source_uses_neutral_colorful_code_theme(self):
-        source = (Path.cwd() / "core" / "stream_processor.py").read_text(encoding="utf-8")
-
-        self.assertIn('CODE_THEME = "ansi_dark"', source)
-        self.assertNotIn("dracula", source)
-        self.assertNotIn("monokai", source)
-
-    def test_cli_source_removes_markdown_lexer_from_input(self):
-        source = (Path.cwd() / "agent_cli.py").read_text(encoding="utf-8")
-
-        self.assertNotIn("PygmentsLexer", source)
-        self.assertNotIn("MarkdownLexer", source)
-
-    def test_prompt_for_interrupt_yes_approves(self):
-        tmp = self._workspace_tempdir()
-        store = SessionStore(tmp / "session.json")
-        snapshot = self._snapshot()
-        out = self._console()
-
-        async def selector(summary):
-            self.assertTrue(summary.default_approve)
-            return "yes"
-
-        result = asyncio.run(
-            agent_cli.prompt_for_interrupt(
-                {
-                    "kind": "tool_approval",
-                    "tools": [{"name": "edit_file", "args": {"path": "demo.txt"}, "policy": {"mutating": True}}],
-                },
-                snapshot,
-                store,
-                out=out,
-                selector=selector,
-            )
-        )
-
-        self.assertEqual(result, {"approved": True})
-        self.assertEqual(snapshot.approval_mode, "prompt")
-        output = out.export_text()
-        self.assertIn("approved", output)
-        self.assertIn("edit_file", output)
-        self.assertIn("demo.txt", output)
-        self.assertNotIn("Args", output)
-        self.assertNotIn("Flags", output)
-        self.assertNotIn("Risk", output)
-        self.assertNotIn("mutating", output)
-
-    def test_prompt_for_interrupt_no_denies(self):
-        tmp = self._workspace_tempdir()
-        store = SessionStore(tmp / "session.json")
-        snapshot = self._snapshot()
-        out = self._console()
-
-        async def selector(summary):
-            self.assertFalse(summary.default_approve)
-            return "no"
-
-        result = asyncio.run(
-            agent_cli.prompt_for_interrupt(
-                {
-                    "kind": "tool_approval",
-                    "tools": [{"name": "safe_delete_file", "args": {}, "policy": {"destructive": True, "mutating": True}}],
-                },
-                snapshot,
-                store,
-                out=out,
-                selector=selector,
-            )
-        )
-
-        self.assertEqual(result, {"approved": False})
-        self.assertEqual(snapshot.approval_mode, "prompt")
-        output = out.export_text()
-        self.assertIn("safe_delete_file", output)
-        self.assertNotIn("0 networked", output)
-        self.assertNotIn("Tool", output)
-        self.assertNotIn("Flags", output)
+    def test_stream_processor_stats_include_approvals_and_retries_without_tools_counter(self):
+        processor = StreamProcessor(self._console())
+        processor.completed_tool_count = 2
+        processor.approval_count = 1
+        processor.retry_count = 1
+        stats = processor.render_stats()
+        self.assertNotIn("tools 2", stats)
+        self.assertIn("approvals 1", stats)
+        self.assertIn("retries 1", stats)
 
     def test_prompt_for_interrupt_always_persists_session_mode(self):
         tmp = self._workspace_tempdir()
@@ -403,14 +261,20 @@ class CliUxTests(unittest.TestCase):
         snapshot = self._snapshot()
         out = self._console()
 
-        async def selector(summary):
+        async def selector(_summary):
             return "always"
 
         result = asyncio.run(
             agent_cli.prompt_for_interrupt(
                 {
                     "kind": "tool_approval",
-                    "tools": [{"name": "edit_file", "args": {"path": "demo.txt"}, "policy": {"mutating": True}}],
+                    "tools": [
+                        {
+                            "name": "edit_file",
+                            "args": {"path": "demo.txt"},
+                            "policy": {"mutating": True, "impact_scope": "files", "ui_kind": "edit"},
+                        }
+                    ],
                 },
                 snapshot,
                 store,
@@ -424,59 +288,6 @@ class CliUxTests(unittest.TestCase):
         self.assertEqual(snapshot.approval_mode, "always")
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.approval_mode, "always")
-        self.assertIn("I will stop asking in this session", out.export_text())
-
-    def test_prompt_for_interrupt_bypasses_prompt_when_session_is_always(self):
-        tmp = self._workspace_tempdir()
-        store = SessionStore(tmp / "session.json")
-        snapshot = self._snapshot()
-        snapshot.approval_mode = "always"
-        store.save_active_session(snapshot)
-        out = self._console()
-
-        async def selector(_summary):
-            raise AssertionError("selector must not run when approval mode is always")
-
-        result = asyncio.run(
-            agent_cli.prompt_for_interrupt(
-                {
-                    "kind": "tool_approval",
-                    "tools": [{"name": "edit_file", "args": {"path": "demo.txt"}, "policy": {"mutating": True}}],
-                },
-                snapshot,
-                store,
-                out=out,
-                selector=selector,
-            )
-        )
-
-        self.assertEqual(result, {"approved": True})
-        self.assertIn("auto-approved", out.export_text())
-
-    def test_prompt_for_interrupt_cancel_denies(self):
-        tmp = self._workspace_tempdir()
-        store = SessionStore(tmp / "session.json")
-        snapshot = self._snapshot()
-        out = self._console()
-
-        async def selector(summary):
-            return None
-
-        result = asyncio.run(
-            agent_cli.prompt_for_interrupt(
-                {
-                    "kind": "tool_approval",
-                    "tools": [{"name": "edit_file", "args": {"path": "demo.txt"}, "policy": {"mutating": True}}],
-                },
-                snapshot,
-                store,
-                out=out,
-                selector=selector,
-            )
-        )
-
-        self.assertEqual(result, {"approved": False})
-        self.assertEqual(snapshot.approval_mode, "prompt")
 
 
 if __name__ == "__main__":

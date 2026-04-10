@@ -6,16 +6,9 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from langgraph.types import Command
-from prompt_toolkit import PromptSession
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import Completer, WordCompleter
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.shortcuts.choice_input import ChoiceInput
 from rich import box
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -23,15 +16,52 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import Completer, WordCompleter
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.shortcuts.choice_input import ChoiceInput
+    from prompt_toolkit.styles import Style as PromptStyle
+except ImportError:  # pragma: no cover - exercised in import-only environments
+    PromptSession = Any
+    AutoSuggestFromHistory = None
+    HTML = lambda value: value
+    KeyBindings = Any
+    PromptStyle = None
+
+    class Completer:  # type: ignore[override]
+        pass
+
+    class WordCompleter:  # type: ignore[override]
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class FileHistory:  # type: ignore[override]
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class ChoiceInput:  # type: ignore[override]
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("prompt_toolkit is required for interactive approval prompts")
+
 from core.cli_utils import format_exception_friendly, get_key_bindings
 from core.config import AgentConfig
 from core.constants import AGENT_VERSION, BASE_DIR
-from core.fuzzy_completer import FuzzyPathCompleter
 from core.logging_config import setup_logging
 from core.session_store import SessionSnapshot, SessionStore
 from core.session_utils import repair_session_if_needed
 from core.tool_policy import ToolMetadata
 from core.ui_theme import ACCENT_BLUE, AGENT_THEME, TEXT_MUTED, TEXT_PRIMARY
+
+try:
+    from core.fuzzy_completer import FuzzyPathCompleter
+except ImportError:  # pragma: no cover - import fallback for non-interactive test envs
+    class FuzzyPathCompleter:  # type: ignore[override]
+        def __init__(self, *_args, **_kwargs):
+            pass
 
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -45,6 +75,158 @@ COMMANDS = ["/help", "/tools", "/session", "/new", "/quit", "clear", "reset"]
 CLEAR_COMMAND = "cls" if os.name == "nt" else "clear"
 APPROVAL_MODE_PROMPT = "prompt"
 APPROVAL_MODE_ALWAYS = "always"
+PROMPT_TOOLKIT_STYLE = (
+    PromptStyle.from_dict(
+        {
+            "bottom-toolbar": f"fg:{TEXT_MUTED} bg:#101216 noreverse",
+        }
+    )
+    if PromptStyle is not None
+    else None
+)
+APPROVAL_CHOICE_STYLE = (
+    PromptStyle.from_dict(
+        {
+            "input-selection": f"fg:{TEXT_MUTED}",
+            "option": f"fg:{TEXT_MUTED}",
+            "number": f"fg:{TEXT_MUTED}",
+            "selected-option": f"fg:{TEXT_PRIMARY} bold",
+            "bottom-toolbar": f"fg:{TEXT_MUTED} bg:#101216 noreverse",
+        }
+    )
+    if PromptStyle is not None
+    else None
+)
+
+
+class _ErasingChoiceInput(ChoiceInput):
+    """ChoiceInput without numeric prefixes; clears menu after Enter."""
+
+    def _create_application(self):
+        try:
+            from prompt_toolkit.application import Application
+            from prompt_toolkit.filters import (
+                Condition,
+                is_done,
+                renderer_height_is_known,
+                to_filter,
+            )
+            from prompt_toolkit.key_binding import DynamicKeyBindings, KeyBindings, merge_key_bindings
+            from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
+            from prompt_toolkit.layout.dimension import Dimension
+            from prompt_toolkit.layout.controls import FormattedTextControl
+            from prompt_toolkit.utils import suspend_to_background_supported
+            from prompt_toolkit.widgets import Box, Frame, Label, RadioList
+        except Exception:
+            app = super()._create_application()
+            app.erase_when_done = True
+            return app
+
+        radio_list = RadioList(
+            values=self.options,
+            default=self.default,
+            select_on_focus=True,
+            open_character="",
+            select_character=self.symbol,
+            close_character="",
+            show_cursor=False,
+            show_numbers=False,
+            container_style="class:input-selection",
+            default_style="class:option",
+            selected_style="",
+            checked_style="class:selected-option",
+            number_style="class:number",
+            show_scrollbar=False,
+        )
+        container = HSplit(
+            [
+                Box(
+                    Label(text=self.message, dont_extend_height=True),
+                    padding_top=0,
+                    padding_left=1,
+                    padding_right=1,
+                    padding_bottom=0,
+                ),
+                Box(
+                    radio_list,
+                    padding_top=0,
+                    padding_left=3,
+                    padding_right=1,
+                    padding_bottom=0,
+                ),
+            ]
+        )
+
+        @Condition
+        def show_frame_filter() -> bool:
+            return to_filter(self.show_frame)()
+
+        show_bottom_toolbar = (
+            Condition(lambda: self.bottom_toolbar is not None)
+            & ~is_done
+            & renderer_height_is_known
+        )
+
+        container = ConditionalContainer(
+            Frame(container),
+            alternative_content=container,
+            filter=show_frame_filter,
+        )
+
+        bottom_toolbar = ConditionalContainer(
+            Window(
+                FormattedTextControl(lambda: self.bottom_toolbar, style="class:bottom-toolbar.text"),
+                style="class:bottom-toolbar",
+                dont_extend_height=True,
+                height=Dimension(min=1),
+            ),
+            filter=show_bottom_toolbar,
+        )
+
+        layout = Layout(
+            HSplit(
+                [
+                    container,
+                    ConditionalContainer(Window(), filter=show_bottom_toolbar),
+                    bottom_toolbar,
+                ]
+            ),
+            focused_element=radio_list,
+        )
+
+        kb = KeyBindings()
+
+        @kb.add("enter", eager=True)
+        def _accept_input(event):
+            event.app.exit(result=radio_list.current_value, style="class:accepted")
+
+        @Condition
+        def enable_interrupt() -> bool:
+            return to_filter(self.enable_interrupt)()
+
+        @kb.add("c-c", filter=enable_interrupt)
+        @kb.add("<sigint>", filter=enable_interrupt)
+        def _keyboard_interrupt(event):
+            event.app.exit(exception=self.interrupt_exception(), style="class:aborting")
+
+        suspend_supported = Condition(suspend_to_background_supported)
+
+        @Condition
+        def enable_suspend() -> bool:
+            return to_filter(self.enable_suspend)()
+
+        @kb.add("c-z", filter=suspend_supported & enable_suspend)
+        def _suspend(event):
+            event.app.suspend_to_background()
+
+        return Application(
+            layout=layout,
+            full_screen=False,
+            mouse_support=self.mouse_support,
+            key_bindings=merge_key_bindings([kb, DynamicKeyBindings(lambda: self.key_bindings)]),
+            style=self.style,
+            erase_when_done=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -86,6 +268,10 @@ def _resolve_console(out: Console | None) -> Console:
     return out or console
 
 
+def _error_panel(message: str) -> Panel:
+    return Panel(Text(message, style="status.error"), border_style="panel.error", padding=(0, 1))
+
+
 def _html_style(text: str, *, fg: str | None = None, bg: str | None = None, bold: bool = False) -> str:
     attrs = []
     if fg:
@@ -121,30 +307,18 @@ def get_prompt_message() -> HTML:
 
 def get_bottom_toolbar(mode: str = "normal", model_name: str = "", tools_count: int = 0) -> HTML:
     if mode == "approval":
-        return HTML(
-            f" {_html_style('Approval', fg=TEXT_PRIMARY, bold=True)}"
-            f" | {_html_style('↑↓', fg=ACCENT_BLUE, bold=True)} choose"
-            f" | {_html_style('Enter', fg=ACCENT_BLUE, bold=True)} confirm"
-            f" | {_html_style('Esc', fg=ACCENT_BLUE, bold=True)} cancel "
-        )
+        return HTML(_html_style(" Approval  |  Up/Down select  |  Enter confirm  |  Esc cancel ", fg=TEXT_MUTED))
 
-    model_part = (
-        f" | {_html_style(model_name, fg=TEXT_PRIMARY, bold=True)}"
-        if model_name
-        else ""
-    )
-    tools_part = (
-        f" | {_html_style(f'tools: {tools_count}', fg=TEXT_MUTED)}"
-        if tools_count
-        else ""
-    )
-    return HTML(
-        f" {_html_style('ALT+ENTER', fg=ACCENT_BLUE, bold=True)} multiline"
-        f" | {_html_style('/help', fg=ACCENT_BLUE, bold=True)} · {_html_style('/tools', fg=ACCENT_BLUE, bold=True)}"
-        f" · {_html_style('/session', fg=ACCENT_BLUE, bold=True)} · {_html_style('/new', fg=ACCENT_BLUE, bold=True)}"
-        f" | {_html_style('/quit', fg=ACCENT_BLUE, bold=True)} exit"
-        f"{tools_part}{model_part} "
-    )
+    parts = [
+        "Input Alt+Enter multiline",
+        "Commands /help /tools /session /new /quit",
+    ]
+    status_parts: list[str] = []
+    if model_name:
+        status_parts.append(model_name)
+    if status_parts:
+        parts.append("Status " + " · ".join(status_parts))
+    return HTML(_html_style(f" {'  |  '.join(parts)} ", fg=TEXT_MUTED))
 
 
 def _provider_model(config: AgentConfig) -> tuple[str, str]:
@@ -219,7 +393,6 @@ def render_overview(
 ) -> None:
     out = _resolve_console(out)
     provider_label, model_name = _provider_model(config)
-    provider_icon = "[status.spinner]◆[/]"
     checkpoint_info = getattr(tool_registry, "checkpoint_info", {}) or {}
     backend = checkpoint_info.get("resolved_backend", config.checkpoint_backend)
     tools_count = len(getattr(tool_registry, "tools", []))
@@ -232,36 +405,43 @@ def render_overview(
     mcp_text = ", ".join(mcp_servers) if mcp_servers else "none"
     issue_count = _runtime_issue_count(tool_registry)
     status_text = (
-        "[status.spinner]ready[/]"
+        "ready"
         if issue_count == 0
-        else f"[status.error]degraded ({issue_count} issue{'s' if issue_count != 1 else ''})[/]"
+        else f"degraded ({issue_count} issue{'s' if issue_count != 1 else ''})"
     )
 
-    table = Table.grid(expand=True, padding=(0, 1))
-    table.add_column(style="overview.label", justify="right", no_wrap=True)
-    table.add_column(style="overview.value", ratio=1)
-    table.add_column(style="overview.label", justify="right", no_wrap=True)
-    table.add_column(style="overview.value", ratio=1)
+    summary = Text()
+    summary.append(provider_label, style="overview.value")
+    summary.append("  ·  ", style="dim")
+    summary.append(model_name, style="overview.value")
+    summary.append("  ·  ", style="dim")
+    summary.append(f"tools {tools_count}", style="overview.value")
+    summary.append("  ·  ", style="dim")
+    summary.append(backend, style="overview.value")
+    summary.append("  ·  ", style="dim")
+    summary.append(f"approvals {approvals}", style="overview.value")
+    if mcp_text != "none":
+        summary.append("  ·  ", style="dim")
+        summary.append(f"mcp {mcp_text}", style="overview.value")
+    summary.append("  ·  ", style="dim")
+    summary.append(status_text, style="status.spinner" if issue_count == 0 else "status.error")
 
-    table.add_row("Provider", f"{provider_icon} {provider_label}", "Model", model_name)
-    table.add_row("Backend", backend, "Tools", str(tools_count))
-    table.add_row("Session", _short_id(snapshot.session_id), "Thread", _short_id(snapshot.thread_id))
-    table.add_row("Approvals", approvals, "MCP", mcp_text)
-    table.add_row("Status", status_text, "Config", "debug" if config.debug else "standard")
+    details = None
+    if not show_cheatsheet:
+        details = Text()
+        details.append(f"session {_short_id(snapshot.session_id)}", style="dim")
+        details.append("  ·  ", style="dim")
+        details.append(f"thread {_short_id(snapshot.thread_id)}", style="dim")
 
+    body = Group(summary, details) if details else summary
     out.print(
         Panel(
-            table,
+            body,
             title=f"[panel.title]AI Agent[/] [dim]v{AGENT_VERSION}[/]",
             border_style="panel.border",
             padding=(0, 1),
         )
     )
-    if show_cheatsheet:
-        out.print(
-            "[dim]/help[/] workflow guide  ·  [dim]/tools[/] inspect capabilities  ·  [dim]/session[/] overview  ·  [dim]/new[/] fresh session  ·  [dim]Alt+Enter[/] multiline"
-        )
-
 
 def render_tools(tool_registry, out: Console | None = None) -> None:
     out = _resolve_console(out)
@@ -322,7 +502,7 @@ def render_help(out: Console | None = None) -> None:
     table.add_row("Exit", "/quit closes the CLI")
     table.add_row("", "")
     table.add_row("Input", "Alt+Enter adds a new line  ·  ↑↓ reuses history")
-    table.add_row("Approvals", "↑↓ choose Yes/No/Always  ·  Enter confirms  ·  Esc cancels")
+    table.add_row("Approvals", "↑↓ choose  ·  Enter confirms  ·  Esc cancels")
     table.add_row("Stop", "Ctrl+C cancels the current generation")
     out.print(Panel(table, title="[panel.title]Help[/]", border_style="panel.border", padding=(0, 1)))
 
@@ -355,6 +535,7 @@ def create_session() -> PromptSession:
         completer=MergeCompleter([WordCompleter(COMMANDS), FuzzyPathCompleter(root_dir=".")]),
         key_bindings=get_key_bindings(),
         auto_suggest=AutoSuggestFromHistory(),
+        style=PROMPT_TOOLKIT_STYLE,
     )
 
 
@@ -364,9 +545,10 @@ def build_initial_state(user_input: str, session_id: str, safety_mode: str = "de
         "steps": 0,
         "token_usage": {},
         "current_task": user_input,
-        "critic_status": "",
-        "critic_source": "",
-        "critic_feedback": "",
+        "retry_count": 0,
+        "retry_reason": "",
+        "turn_outcome": "",
+        "final_issue": "",
         "session_id": session_id,
         "run_id": uuid.uuid4().hex,
         "turn_id": 1,
@@ -413,22 +595,17 @@ def _summarize_approval_request(req_tools: list[dict]) -> ApprovalSummary:
 
     for tool in req_tools:
         policy = tool.get("policy") or {}
-        name = (tool.get("name") or "").lower()
         destructive = bool(policy.get("destructive"))
         mutating = bool(policy.get("mutating"))
         networked = bool(policy.get("networked"))
+        impact_scope = str(policy.get("impact_scope") or "unknown").strip() or "unknown"
 
         destructive_count += int(destructive)
         mutating_count += int(mutating)
         networked_count += int(networked)
 
-        if destructive or mutating:
-            if any(token in name for token in ("process", "pid", "port", "shell", "exec", "command")):
-                impacts.add("processes")
-            elif any(token in name for token in ("file", "directory", "path", "write", "edit", "delete", "download")):
-                impacts.add("files")
-            else:
-                impacts.add("local state")
+        if destructive or mutating or impact_scope != "unknown":
+            impacts.add(impact_scope.replace("_", " "))
         if networked:
             impacts.add("network")
 
@@ -466,17 +643,25 @@ def _approval_target_text(tool: dict) -> str:
     return ""
 
 
-def _approval_panel_body(req_tools: list[dict]) -> Group | str:
+def _approval_panel_body(req_tools: list[dict], _summary: ApprovalSummary) -> Group | str:
     if not req_tools:
         return "[approval.summary]Action pending approval[/]"
 
-    lines: list[str] = []
+    table = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="table.header",
+        expand=True,
+        pad_edge=False,
+    )
+    table.add_column("Action", style="tool.name", no_wrap=True)
+    table.add_column("Target", style="overview.value")
+
     for tool in req_tools:
         tool_name = tool.get("name", "unknown_tool")
-        args_str = str(tool.get("args", {}))
-        args_str = (args_str[:96] + "…") if len(args_str) > 96 else args_str
-        lines.append(f"[tool.name]{tool_name}[/] [tool.args]{args_str}[/]")
-    return Group(*lines)
+        target = _approval_target_text(tool)
+        table.add_row(tool_name, target or "local action")
+    return table
 
 
 def _approval_panel_style(summary: ApprovalSummary) -> str:
@@ -497,16 +682,18 @@ async def _run_approval_selector(summary: ApprovalSummary) -> str | None:
     def _cancel_interrupt(event) -> None:
         event.app.exit(result=None)
 
-    prompt = ChoiceInput(
-        message="Approval choice:",
+    prompt = _ErasingChoiceInput(
+        message="↳ approve:",
         options=[
-            ("yes", "Yes     Approve this batch"),
-            ("no", "No      Deny this batch"),
-            ("always", "Always  Approve future protected actions in this session"),
+            ("yes", "yes          — once"),
+            ("no", "no           — deny"),
+            ("always", "always       — this session"),
         ],
         default=default_choice,
         mouse_support=True,
-        symbol="(*)",
+        symbol="›",
+        style=APPROVAL_CHOICE_STYLE,
+        bottom_toolbar=lambda: get_bottom_toolbar(mode="approval"),
         show_frame=False,
         enable_interrupt=False,
         key_bindings=kb,
@@ -516,16 +703,32 @@ async def _run_approval_selector(summary: ApprovalSummary) -> str | None:
 
 def render_user_turn(user_input: str, out: Console | None = None) -> None:
     out = _resolve_console(out)
-    grid = Table.grid(expand=True, padding=(0, 1))
-    grid.add_column(width=7, no_wrap=True)
-    grid.add_column(ratio=1)
-    grid.add_row("[turn.user]You[/]", Text(user_input))
-    out.print(grid)
+    line = Text()
+    line.append("You", style="turn.user")
+    line.append("  ")
+    line.append(user_input)
+    out.print(line)
+
+
+def render_turn_header(
+    turn_number: int,
+    model_name: str,
+    snapshot: SessionSnapshot,
+    out: Console | None = None,
+) -> None:
+    out = _resolve_console(out)
+    header = Table.grid(expand=True, padding=(0, 1))
+    header.add_column(style="overview.label", no_wrap=True)
+    header.add_column(ratio=1, style="overview.value")
+    header.add_row(
+        "Turn",
+        f"{turn_number}  ·  model {model_name}  ·  thread {_short_id(snapshot.thread_id, 12)}  ·  session {_short_id(snapshot.session_id, 12)}",
+    )
+    out.print(Panel(header, border_style="panel.border", padding=(0, 1)))
 
 
 def render_assistant_turn(out: Console | None = None) -> None:
-    out = _resolve_console(out)
-    out.print("[turn.assistant]Agent[/]")
+    return None
 
 
 async def prompt_for_interrupt(
@@ -546,24 +749,8 @@ async def prompt_for_interrupt(
     summary = _summarize_approval_request(req_tools)
     current_session.approval_mode = _normalize_approval_mode(getattr(current_session, "approval_mode", APPROVAL_MODE_PROMPT))
     if current_session.approval_mode == APPROVAL_MODE_ALWAYS:
-        out.print(
-            "  [approval.summary]Action[/] [status.success]auto-approved[/] "
-            "[dim](always for this session · /new resets)[/]"
-        )
+        out.print("  [tool.badge]↳[/] [status.success]approved:[/] [overview.value]always[/]")
         return {"approved": True}
-
-    panel_style = _approval_panel_style(summary)
-    panel_body = _approval_panel_body(req_tools)
-
-    out.print(
-        Panel(
-            panel_body,
-            title=f"[{panel_style}]Confirmation Needed[/]",
-            border_style=panel_style,
-            padding=(0, 1),
-        )
-    )
-    out.print("  [dim]Choose Yes, No or Always. Enter confirms.[/]")
 
     selected = await (selector(summary) if selector else _run_approval_selector(summary))
     approved = False
@@ -574,10 +761,14 @@ async def prompt_for_interrupt(
     elif selected == "yes":
         approved = True
 
-    status = "[status.success]approved[/]" if approved else "[status.error]denied[/]"
-    out.print(f"  [approval.summary]Action[/] {status}")
     if selected == "always":
-        out.print("  [dim]I will stop asking in this session. Use /new to reset.[/]")
+        out.print("  [tool.badge]↳[/] [status.success]approved:[/] [overview.value]always[/]")
+    elif selected == "yes":
+        out.print("  [tool.badge]↳[/] [status.success]approved:[/] [overview.value]yes[/]")
+    elif selected == "no":
+        out.print("  [tool.badge]↳[/] [status.error]denied:[/] [overview.value]no[/]")
+    else:
+        out.print("  [tool.badge]↳[/] [status.error]denied:[/] [overview.value]cancel[/]")
     return {"approved": approved}
 
 
@@ -593,6 +784,7 @@ async def run_user_request(
     *,
     model_name: str = "",
     tools_count: int = 0,
+    tool_metadata: dict[str, ToolMetadata] | None = None,
 ):
     from core.stream_processor import StreamProcessResult
 
@@ -605,7 +797,7 @@ async def run_user_request(
             config=build_graph_config(thread_id, config.max_loops),
             stream_mode=["messages", "updates"],
         )
-        processor = stream_processor_cls(console)
+        processor = stream_processor_cls(console, tool_metadata=tool_metadata)
         result: StreamProcessResult = await processor.process_stream(stream)
         if result.interrupt is None:
             return result.stats
@@ -638,9 +830,7 @@ async def main():
     try:
         config = setup_runtime()
     except Exception as e:
-        console.print(
-            Panel(f"[status.error]Config error:[/] {e}", border_style="panel.error", padding=(0, 1))
-        )
+        console.print(_error_panel(f"Config error: {e}"))
         return
 
     store = SessionStore(config.session_state_path)
@@ -649,9 +839,7 @@ async def main():
     try:
         agent_app, tool_registry = await initialize_agent(config)
     except Exception as e:
-        console.print(
-            Panel(f"[status.error]Init error:[/] {e}", border_style="panel.error", padding=(0, 1))
-        )
+        console.print(_error_panel(f"Init error: {e}"))
         return
 
     checkpoint_info = tool_registry.checkpoint_info
@@ -721,6 +909,7 @@ async def main():
                 store,
                 model_name=model_name,
                 tools_count=len(tools),
+                tool_metadata=getattr(tool_registry, "tool_metadata", {}),
             )
             store.save_active_session(current_session)
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -728,13 +917,7 @@ async def main():
             continue
         except Exception as e:
             friendly = format_exception_friendly(e)
-            console.print(
-                Panel(
-                    f"[status.error]{friendly}[/]",
-                    border_style="panel.error",
-                    padding=(0, 1),
-                )
-            )
+            console.print(_error_panel(friendly))
 
     await close_runtime_resources(tool_registry)
 

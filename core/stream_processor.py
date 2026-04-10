@@ -12,6 +12,7 @@ from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.spinner import Spinner
 from rich.syntax import Syntax
+from rich.text import Text
 from core.cli_utils import (
     TokenTracker,
     format_tool_display,
@@ -20,6 +21,7 @@ from core.cli_utils import (
     prepare_markdown_for_render,
 )
 from core.message_utils import is_tool_message_error, stringify_content
+from core.tool_policy import ToolMetadata
 from core.ui_theme import build_shimmer_text, shimmer_supported
 
 DIFF_REGEX = re.compile(r"```diff\r?\n(.*?)```", re.DOTALL)
@@ -44,12 +46,16 @@ class StreamProcessor:
         'printed_tool_ids',
         'tool_buffer',
         'tool_start_times',
+        'tool_metadata',
         'start_time',
         'pending_interrupt',
         'active_node',
+        'retry_count',
+        'approval_count',
+        'completed_tool_count',
     )
 
-    def __init__(self, console: Console):
+    def __init__(self, console: Console, tool_metadata: Optional[Dict[str, ToolMetadata]] = None):
         self.console = console
         self.tracker = TokenTracker()
         self.full_text = ""
@@ -59,9 +65,13 @@ class StreamProcessor:
         self.printed_tool_ids: Set[str] = set()
         self.tool_buffer: Dict[str, Dict[str, Any]] = {}
         self.tool_start_times: Dict[str, float] = {}
+        self.tool_metadata = tool_metadata or {}
         self.start_time = time.time()
         self.pending_interrupt: Optional[Dict[str, Any]] = None
         self.active_node: str = "agent"
+        self.retry_count = 0
+        self.approval_count = 0
+        self.completed_tool_count = 0
 
     async def process_stream(self, stream):
         """Consumes the agent event stream and updates the UI."""
@@ -78,7 +88,7 @@ class StreamProcessor:
                     if self.pending_interrupt is not None:
                         break
         except (KeyboardInterrupt, asyncio.CancelledError):
-            self.console.print("\n[bold red]✕ cancelled[/][/]")
+            self.console.print("\n[bold red]x cancelled[/]")
             return StreamProcessResult(stats=None)
 
         self._commit_printed_text()
@@ -86,8 +96,7 @@ class StreamProcessor:
             interrupt_payload = self.pending_interrupt
             self.pending_interrupt = None
             return StreamProcessResult(stats=None, interrupt=interrupt_payload)
-        duration = time.time() - self.start_time
-        return StreamProcessResult(stats=self.tracker.render(duration))
+        return StreamProcessResult(stats=self.render_stats())
 
     def _handle_stream_event(self, mode: str, payload: Any) -> None:
         if mode == "updates":
@@ -109,6 +118,7 @@ class StreamProcessor:
     def _handle_updates(self, payload: Dict) -> None:
         if "__interrupt__" in payload:
             self.active_node = "approval"
+            self.approval_count += 1
             interrupt_entries = payload.get("__interrupt__") or []
             if interrupt_entries:
                 interrupt_value = getattr(interrupt_entries[0], "value", interrupt_entries[0])
@@ -119,6 +129,7 @@ class StreamProcessor:
             return
         self.tracker.update_from_node_update(payload)
         self._commit_printed_text()
+        self._update_state_from_payload(payload)
 
         summarize_payload = payload.get("summarize") or {}
         if summarize_payload:
@@ -134,6 +145,17 @@ class StreamProcessor:
             for tool_call in last_msg.tool_calls:
                 self._remember_tool_call(tool_call)
                 self._render_tool_call(tool_call)
+
+    def _update_state_from_payload(self, payload: Dict[str, Any]) -> None:
+        ordered_nodes = ("summarize", "prepare_retry", "finalize_blocked", "tools", "approval", "agent")
+        for node_name in ordered_nodes:
+            node_payload = payload.get(node_name)
+            if not isinstance(node_payload, dict):
+                continue
+            self.active_node = node_name
+            if "retry_count" in node_payload:
+                self.retry_count = int(node_payload.get("retry_count", 0) or 0)
+            break
 
     def _handle_summarize_update(self, payload: Dict[str, Any]) -> None:
         summary_text = payload.get("summary")
@@ -203,7 +225,7 @@ class StreamProcessor:
         else:
             display_styled = f"[tool.name]{display_str}[/]"
 
-        self.console.print(Padding(f"[tool.badge]tool[/] [tool.badge]▶[/] {display_styled}", (0, 0, 0, 4)))
+        self.console.print(Padding(f"[tool.badge]tool >[/] {display_styled}", (0, 0, 0, 4)))
         self.printed_tool_ids.add(tool_id)
         self.active_node = "tools"
 
@@ -214,9 +236,14 @@ class StreamProcessor:
 
         content_str = stringify_content(msg.content)
         is_error = is_tool_message_error(msg)
-        summary = format_tool_output(msg.name, content_str, is_error)
+        metadata = self.tool_metadata.get(msg.name)
+        summary = format_tool_output(
+            msg.name,
+            content_str,
+            is_error,
+            ui_kind=metadata.ui_kind if metadata else "generic",
+        )
         style = "tool.error" if is_error else "tool.result"
-        icon = "[tool.error]✖ [/]" if is_error else "[tool.result]✔ [/]"
 
         # Compute and show tool execution duration
         elapsed_str = ""
@@ -225,7 +252,10 @@ class StreamProcessor:
             elapsed = time.time() - start_t
             elapsed_str = f" [tool.timing]{elapsed:.1f}s[/]"
 
-        self.console.print(Padding(f"[tool.badge]tool[/] {icon}[{style}]{summary}[/]{elapsed_str}", (0, 0, 0, 4)))
+        icon = "[status.error]✖[/]" if is_error else "[status.success]✔[/]"
+        prefix = "  [tool.badge]↳[/] "
+        self.console.print(Padding(f"{prefix}{icon} [{style}]{summary}[/]{elapsed_str}", (0, 0, 0, 4)))
+        self.completed_tool_count += 1
 
         if not is_error:
             self._render_diff_preview(content_str)
@@ -283,10 +313,11 @@ class StreamProcessor:
     def _status_label(self) -> str:
         node_labels = {
             "agent": "Thinking",
-            "critic": "Reviewing",
             "tools": "Running tools",
             "summarize": "Compressing context",
-            "approval": "Waiting for approval",
+            "approval": "Awaiting approval",
+            "prepare_retry": "Recovering",
+            "finalize_blocked": "Finishing",
         }
         return node_labels.get(self.active_node, "Thinking")
 
@@ -323,3 +354,14 @@ class StreamProcessor:
         except Exception as e:
             logger.debug("Live display update failed: %s", e)
 
+    def render_stats(self) -> str:
+        duration = time.time() - self.start_time
+        parts = [self.tracker.render(duration)]
+        extras = []
+        if self.approval_count:
+            extras.append(f"approvals {self.approval_count}")
+        if self.retry_count:
+            extras.append(f"retries {self.retry_count}")
+        if extras:
+            parts.append(f"[dim]| {' · '.join(extras)}[/]")
+        return " ".join(parts)

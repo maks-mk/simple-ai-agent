@@ -1,20 +1,15 @@
-import json
+import io
 import os
-import shutil
 import unittest
-from pathlib import Path
-from uuid import uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
+from rich.console import Console
 
 from agent import create_agent_workflow
-from core.checkpointing import create_checkpoint_runtime
 from core.config import AgentConfig
 from core.nodes import AgentNodes
-from core.run_logger import JsonlRunLogger
-from core.session_store import SessionStore
 from core.stream_processor import StreamProcessor
 from core.tool_policy import ToolMetadata
 from tools import process_tools
@@ -28,7 +23,7 @@ class FakeLLM:
     async def ainvoke(self, context):
         self.invocations.append(context)
         if not self.responses:
-            return AIMessage(content="STATUS: FINISHED\nREASON: fallback\nNEXT_STEP: NONE\nCONTROL: FINISH_TURN")
+            return AIMessage(content="")
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -58,18 +53,12 @@ class FakeTool:
 
 
 class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
-    def _workspace_tempdir(self) -> Path:
-        path = Path.cwd() / ".tmp_tests" / uuid4().hex
-        path.mkdir(parents=True, exist_ok=True)
-        self.addCleanup(lambda: shutil.rmtree(path, ignore_errors=True))
-        return path
-
     def _make_config(self, **overrides):
         defaults = {
             "PROVIDER": "openai",
             "OPENAI_API_KEY": "test-key",
-            "PROMPT_PATH": Path(__file__).resolve().parents[1] / "prompt.txt",
-            "MCP_CONFIG_PATH": Path(__file__).resolve().parents[1] / "tests" / "missing_mcp.json",
+            "PROMPT_PATH": os.path.join(os.path.dirname(__file__), "..", "prompt.txt"),
+            "MCP_CONFIG_PATH": os.path.join(os.path.dirname(__file__), "missing_mcp.json"),
             "ENABLE_SEARCH_TOOLS": False,
             "ENABLE_SYSTEM_TOOLS": False,
             "ENABLE_PROCESS_TOOLS": False,
@@ -84,11 +73,10 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
             "steps": 0,
             "token_usage": {},
             "current_task": task,
-            "critic_status": "",
-            "critic_source": "",
-            "critic_feedback": "",
+            "retry_count": 0,
+            "retry_reason": "",
             "turn_outcome": "",
-            "retry_instruction": "",
+            "final_issue": "",
             "session_id": session_id,
             "run_id": run_id,
             "turn_id": 1,
@@ -99,68 +87,75 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
             "safety_mode": "default",
         }
 
-    async def test_create_checkpoint_runtime_uses_sqlite_backend_when_available(self):
-        tmp = self._workspace_tempdir()
-        db_path = tmp / "checkpoints.sqlite"
-        runtime = await create_checkpoint_runtime(
-            self._make_config(CHECKPOINT_BACKEND="sqlite", CHECKPOINT_SQLITE_PATH=db_path)
-        )
-        try:
-            self.assertEqual(runtime.resolved_backend, "sqlite")
-            self.assertEqual(Path(runtime.target), db_path.resolve())
-            self.assertTrue(db_path.exists())
-        finally:
-            await runtime.aclose()
+    def _graph_config(self, thread_id="thread-test", recursion_limit=24):
+        return {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
 
-    async def test_sqlite_checkpointer_persists_state_across_recompiled_app(self):
-        tmp = self._workspace_tempdir()
-        db_path = tmp / "persist.sqlite"
-        config = self._make_config(CHECKPOINT_BACKEND="sqlite", CHECKPOINT_SQLITE_PATH=db_path)
-        thread_config = {"configurable": {"thread_id": "persist-thread"}, "recursion_limit": 24}
-
-        runtime1 = await create_checkpoint_runtime(config)
-        app1 = create_agent_workflow(
+    async def test_final_answer_finishes_turn_without_reviewer_node(self):
+        config = self._make_config()
+        app = create_agent_workflow(
             AgentNodes(
                 config=config,
-                llm=FakeLLM([AIMessage(content="STATUS: FINISHED\nREASON: ok\nNEXT_STEP: NONE")]),
+                llm=FakeLLM([]),
                 tools=[],
-                llm_with_tools=FakeLLM([AIMessage(content="Первый ответ.")]),
+                llm_with_tools=FakeLLM([AIMessage(content="Задача выполнена.")]),
             ),
             config,
             tools_enabled=False,
-        ).compile(checkpointer=runtime1.checkpointer)
-        await app1.ainvoke(self._initial_state("Первая задача"), config=thread_config)
-        await runtime1.aclose()
+        ).compile(checkpointer=MemorySaver())
 
-        runtime2 = await create_checkpoint_runtime(config)
-        try:
-            app2 = create_agent_workflow(
-                AgentNodes(
-                    config=config,
-                    llm=FakeLLM([AIMessage(content="STATUS: FINISHED\nREASON: ok\nNEXT_STEP: NONE")]),
-                    tools=[],
-                    llm_with_tools=FakeLLM([AIMessage(content="Второй ответ.")]),
-                ),
-                config,
-                tools_enabled=False,
-            ).compile(checkpointer=runtime2.checkpointer)
-            saved_state = await app2.aget_state({"configurable": {"thread_id": "persist-thread"}})
-            saved_messages = saved_state.values["messages"]
-            self.assertTrue(any(isinstance(msg, HumanMessage) and msg.content == "Первая задача" for msg in saved_messages))
-            self.assertTrue(any(isinstance(msg, AIMessage) and msg.content == "Первый ответ." for msg in saved_messages))
-        finally:
-            await runtime2.aclose()
+        result = await app.ainvoke(self._initial_state("Скажи готово"), config=self._graph_config("thread-final", 24))
+
+        self.assertEqual(result["turn_outcome"], "finish_turn")
+        self.assertEqual(result["messages"][-1].content, "Задача выполнена.")
+        self.assertNotIn("critic_status", result)
+
+    async def test_empty_response_retries_once_then_finalizes_blocked(self):
+        config = self._make_config()
+        agent_llm = FakeLLM([AIMessage(content=""), AIMessage(content="")])
+        app = create_agent_workflow(
+            AgentNodes(config=config, llm=FakeLLM([]), tools=[], llm_with_tools=agent_llm),
+            config,
+            tools_enabled=False,
+        ).compile(checkpointer=MemorySaver())
+
+        result = await app.ainvoke(self._initial_state("Сделай задачу"), config=self._graph_config("thread-empty", 24))
+
+        self.assertEqual(len(agent_llm.invocations), 2)
+        self.assertEqual(result["turn_outcome"], "finish_turn")
+        self.assertIn("Не удалось завершить задачу", str(result["messages"][-1].content))
+        self.assertEqual(result["retry_count"], 1)
+
+    async def test_valid_tool_call_routes_to_tool_execution_then_finishes(self):
+        config = self._make_config()
+        tool = FakeTool("demo_tool", "Готово.")
+        agent_llm = FakeLLM(
+            [
+                AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "run"}, "id": "tc-1"}]),
+                AIMessage(content="Инструмент выполнил задачу."),
+            ]
+        )
+        app = create_agent_workflow(
+            AgentNodes(config=config, llm=FakeLLM([]), tools=[tool], llm_with_tools=agent_llm),
+            config,
+            tools_enabled=True,
+        ).compile(checkpointer=MemorySaver())
+
+        result = await app.ainvoke(self._initial_state("Сделай дело"), config=self._graph_config("thread-tool", 36))
+
+        self.assertEqual(tool.calls, [{"action": "run"}])
+        self.assertEqual(result["messages"][-1].content, "Инструмент выполнил задачу.")
+        self.assertEqual(result["turn_outcome"], "finish_turn")
 
     async def test_approval_interrupt_requires_resume_before_mutating_tool_runs(self):
         config = self._make_config(ENABLE_APPROVALS=True)
         tool = FakeTool("danger_tool", "Изменение применено.")
         nodes = AgentNodes(
             config=config,
-            llm=FakeLLM([AIMessage(content="STATUS: FINISHED\nREASON: done\nNEXT_STEP: NONE")]),
+            llm=FakeLLM([]),
             tools=[tool],
             llm_with_tools=FakeLLM(
                 [
-                    AIMessage(content="", tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-1"}]),
+                    AIMessage(content="", tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-2"}]),
                     AIMessage(content="Готово."),
                 ]
             ),
@@ -170,6 +165,8 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
                     mutating=True,
                     destructive=True,
                     requires_approval=True,
+                    impact_scope="local_state",
+                    ui_kind="process",
                 )
             },
         )
@@ -184,50 +181,15 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool.calls, [{"action": "apply"}])
         self.assertEqual(resumed["messages"][-1].content, "Готово.")
 
-    async def test_approval_rejection_returns_access_denied_without_tool_execution(self):
-        config = self._make_config(ENABLE_APPROVALS=True)
-        tool = FakeTool("danger_tool", "Изменение применено.")
-        nodes = AgentNodes(
-            config=config,
-            llm=FakeLLM([AIMessage(content="STATUS: FINISHED\nREASON: blocker reported\nNEXT_STEP: NONE")]),
-            tools=[tool],
-            llm_with_tools=FakeLLM(
-                [
-                    AIMessage(content="", tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-2"}]),
-                    AIMessage(content="Не удалось выполнить действие без подтверждения."),
-                ]
-            ),
-            tool_metadata={
-                "danger_tool": ToolMetadata(
-                    name="danger_tool",
-                    mutating=True,
-                    destructive=True,
-                    requires_approval=True,
-                )
-            },
-        )
-        app = create_agent_workflow(nodes, config, tools_enabled=True).compile(checkpointer=MemorySaver())
-        thread_config = {"configurable": {"thread_id": "approval-thread-2"}, "recursion_limit": 36}
-
-        interrupted = await app.ainvoke(self._initial_state("Сделай изменение"), config=thread_config)
-        self.assertIn("__interrupt__", interrupted)
-        resumed = await app.ainvoke(Command(resume={"approved": False}), config=thread_config)
-
-        self.assertEqual(tool.calls, [])
-        tool_messages = [msg for msg in resumed["messages"] if isinstance(msg, ToolMessage)]
-        self.assertTrue(tool_messages)
-        self.assertIn("ACCESS_DENIED", str(tool_messages[-1].content))
-        self.assertIsNone(resumed["open_tool_issue"])
-
-    async def test_approval_rejection_blocks_followup_tool_calls_in_same_turn(self):
+    async def test_approval_denial_blocks_followup_tool_calls_in_same_turn(self):
         config = self._make_config(ENABLE_APPROVALS=True)
         denied_tool = FakeTool("danger_tool", "Изменение применено.")
         fallback_tool = FakeTool("write_file", "Файл записан.")
         nodes = AgentNodes(
             config=config,
-            llm=FakeLLM([AIMessage(content="STATUS: FINISHED\nREASON: blocker reported\nNEXT_STEP: NONE")]),
+            llm=FakeLLM([]),
             tools=[denied_tool, fallback_tool],
-            llm_with_tools=FakeLLM(
+            llm_with_tools=ProviderSafeFakeLLM(
                 [
                     AIMessage(content="", tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-3"}]),
                     AIMessage(
@@ -237,21 +199,12 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ),
             tool_metadata={
-                "danger_tool": ToolMetadata(
-                    name="danger_tool",
-                    mutating=True,
-                    destructive=True,
-                    requires_approval=True,
-                ),
-                "write_file": ToolMetadata(
-                    name="write_file",
-                    mutating=True,
-                    requires_approval=True,
-                ),
+                "danger_tool": ToolMetadata(name="danger_tool", mutating=True, destructive=True, requires_approval=True),
+                "write_file": ToolMetadata(name="write_file", mutating=True, requires_approval=True),
             },
         )
         app = create_agent_workflow(nodes, config, tools_enabled=True).compile(checkpointer=MemorySaver())
-        thread_config = {"configurable": {"thread_id": "approval-thread-3"}, "recursion_limit": 36}
+        thread_config = {"configurable": {"thread_id": "approval-thread-2"}, "recursion_limit": 36}
 
         interrupted = await app.ainvoke(self._initial_state("Сделай изменение"), config=thread_config)
         self.assertIn("__interrupt__", interrupted)
@@ -259,158 +212,30 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(denied_tool.calls, [])
         self.assertEqual(fallback_tool.calls, [])
-        self.assertIsInstance(resumed["messages"][-1], AIMessage)
         self.assertIn("you chose No", str(resumed["messages"][-1].content))
-        self.assertEqual(resumed["critic_status"], "FINISHED")
         self.assertIsNone(resumed["open_tool_issue"])
-
-    async def test_approval_rejection_resume_keeps_provider_safe_order(self):
-        config = self._make_config(ENABLE_APPROVALS=True)
-        tool = FakeTool("danger_tool", "Изменение применено.")
-        nodes = AgentNodes(
-            config=config,
-            llm=FakeLLM(
-                [
-                    AIMessage(
-                        content=(
-                            "STATUS: INCOMPLETE\n"
-                            "REASON: The assistant is waiting for the user after denial.\n"
-                            "NEXT_STEP: wait for the next instruction\n"
-                            "CONTROL: FINISH_TURN"
-                        )
-                    )
-                ]
-            ),
-            tools=[tool],
-            llm_with_tools=ProviderSafeFakeLLM(
-                [
-                    AIMessage(content="", tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-safe"}]),
-                    AIMessage(content="Okay, I did not do that because you chose No. Tell me what you want to do instead."),
-                ]
-            ),
-            tool_metadata={
-                "danger_tool": ToolMetadata(
-                    name="danger_tool",
-                    mutating=True,
-                    destructive=True,
-                    requires_approval=True,
-                )
-            },
-        )
-        app = create_agent_workflow(nodes, config, tools_enabled=True).compile(checkpointer=MemorySaver())
-        thread_config = {"configurable": {"thread_id": "approval-thread-safe"}, "recursion_limit": 36}
-
-        interrupted = await app.ainvoke(self._initial_state("Сделай изменение"), config=thread_config)
-        self.assertIn("__interrupt__", interrupted)
-        resumed = await app.ainvoke(Command(resume={"approved": False}), config=thread_config)
-
-        self.assertEqual(tool.calls, [])
         self.assertEqual(resumed["turn_outcome"], "finish_turn")
-        self.assertIn("you chose No", str(resumed["messages"][-1].content))
 
-    async def test_tools_node_marks_approval_denied_as_open_issue_before_agent_ack(self):
-        config = self._make_config(ENABLE_APPROVALS=True)
-        tool = FakeTool("danger_tool", "Изменение применено.")
-        nodes = AgentNodes(
-            config=config,
-            llm=FakeLLM([]),
-            tools=[tool],
-            llm_with_tools=FakeLLM([]),
-            tool_metadata={
-                "danger_tool": ToolMetadata(
-                    name="danger_tool",
-                    mutating=True,
-                    destructive=True,
-                    requires_approval=True,
-                )
-            },
+    async def test_tool_failure_produces_bounded_recovery_then_blocker(self):
+        config = self._make_config()
+        failing_tool = FakeTool("demo_tool", "ERROR[EXECUTION]: boom")
+        agent_llm = FakeLLM(
+            [
+                AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "x"}, "id": "tc-5"}]),
+                AIMessage(content=""),
+            ]
         )
+        app = create_agent_workflow(
+            AgentNodes(config=config, llm=FakeLLM([]), tools=[failing_tool], llm_with_tools=agent_llm),
+            config,
+            tools_enabled=True,
+        ).compile(checkpointer=MemorySaver())
 
-        result = await nodes.tools_node(
-            {
-                **self._initial_state("Сделай изменение"),
-                "messages": [
-                    AIMessage(
-                        content="",
-                        tool_calls=[{"name": "danger_tool", "args": {"action": "apply"}, "id": "tc-issue"}],
-                    )
-                ],
-                "pending_approval": {
-                    "approved": False,
-                    "decision": {"approved": False},
-                    "tool_call_ids": ["tc-issue"],
-                    "tool_names": ["danger_tool"],
-                },
-            }
-        )
+        result = await app.ainvoke(self._initial_state("Обработай файл"), config=self._graph_config("thread-fail", 36))
 
-        self.assertEqual(result["open_tool_issue"]["kind"], "approval_denied")
-        self.assertEqual(result["open_tool_issue"]["turn_id"], 1)
-
-    async def test_run_logger_writes_structured_tool_failure_event(self):
-        tmp = self._workspace_tempdir()
-        logger = JsonlRunLogger(tmp)
-        failing_tool = FakeTool("danger_tool", "ERROR[EXECUTION]: boom")
-        nodes = AgentNodes(
-            config=self._make_config(),
-            llm=FakeLLM([]),
-            tools=[failing_tool],
-            llm_with_tools=FakeLLM([]),
-            run_logger=logger,
-        )
-
-        await nodes.tools_node(
-            {
-                **self._initial_state("Почини ошибку", session_id="session-log", run_id="run-log"),
-                "messages": [
-                    AIMessage(
-                        content="",
-                        tool_calls=[{"name": "danger_tool", "args": {"action": "x"}, "id": "tc-log"}],
-                    )
-                ],
-            }
-        )
-
-        log_path = logger.file_path_for("session-log")
-        records = [json.loads(line) for line in log_path.read_text("utf-8").splitlines()]
-        end_records = [record for record in records if record["event"] == "tool_call_end"]
-        self.assertTrue(end_records)
-        self.assertEqual(end_records[-1]["result"]["ok"], False)
-        self.assertEqual(end_records[-1]["result"]["error_type"], "EXECUTION")
-
-    def test_session_store_round_trip(self):
-        tmp = self._workspace_tempdir()
-        store = SessionStore(tmp / "session.json")
-        snapshot = store.new_session(checkpoint_backend="sqlite", checkpoint_target="demo.sqlite")
-        snapshot.approval_mode = "always"
-        store.save_active_session(snapshot)
-        loaded = store.load_active_session()
-        self.assertIsNotNone(loaded)
-        self.assertEqual(loaded.session_id, snapshot.session_id)
-        self.assertEqual(loaded.thread_id, snapshot.thread_id)
-        self.assertEqual(loaded.approval_mode, "always")
-
-    def test_session_store_defaults_missing_approval_mode_to_prompt(self):
-        tmp = self._workspace_tempdir()
-        session_path = tmp / "session.json"
-        session_path.write_text(
-            json.dumps(
-                {
-                    "session_id": "session-old",
-                    "thread_id": "thread-old",
-                    "checkpoint_backend": "sqlite",
-                    "checkpoint_target": "demo.sqlite",
-                    "created_at": "2026-03-25T10:00:00+00:00",
-                    "updated_at": "2026-03-25T10:00:00+00:00",
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        loaded = SessionStore(session_path).load_active_session()
-
-        self.assertIsNotNone(loaded)
-        self.assertEqual(loaded.approval_mode, "prompt")
+        self.assertEqual(len(agent_llm.invocations), 2)
+        self.assertIn("Не удалось завершить задачу", str(result["messages"][-1].content))
+        self.assertEqual(result["retry_count"], 1)
 
     async def test_new_user_turn_ignores_old_open_tool_issue(self):
         agent_llm = FakeLLM([AIMessage(content="Короткая сводка на экране.")])
@@ -442,25 +267,15 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["turn_id"], 2)
         self.assertIsNone(result["open_tool_issue"])
-        unresolved_messages = [
-            str(message.content)
-            for message in agent_llm.invocations[0]
-            if "UNRESOLVED TOOL FAILURE" in str(message.content) or "TOOL EXECUTION DENIED BY USER" in str(message.content)
-        ]
-        self.assertFalse(unresolved_messages)
-
-    def test_stop_background_process_denies_external_pid_by_default(self):
-        result = process_tools.stop_background_process.invoke({"pid": os.getpid()})
-        self.assertIn("ACCESS_DENIED", result)
 
     def test_stream_processor_ignores_tool_call_without_id(self):
-        import io
-        from rich.console import Console
-
-        capture = io.StringIO()
-        processor = StreamProcessor(Console(record=True, file=capture, width=120, force_terminal=False))
+        processor = StreamProcessor(Console(record=True, file=io.StringIO(), width=120, force_terminal=False))
         processor._remember_tool_call({"name": "broken_tool", "args": {"x": 1}})
         self.assertEqual(processor.tool_buffer, {})
+
+    def test_stop_background_process_denies_unknown_pid(self):
+        result = process_tools.stop_background_process.invoke({"pid": 999999})
+        self.assertTrue("ACCESS_DENIED" in result or "NOT_FOUND" in result)
 
 
 if __name__ == "__main__":

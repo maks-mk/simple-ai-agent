@@ -1,7 +1,7 @@
 import os
 from openai import OpenAI
 
-api_key = os.environ.get("NVIDIA_API_KEY", "nvapi-dDb1d......................................")
+api_key = os.environ.get("NVIDIA_API_KEY", "nvapi-...............................")
 
 client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",

@@ -3,6 +3,8 @@ import shutil
 from functools import lru_cache
 from pathlib import Path
 
+from core.destructive_guardrails import deny_recursive_destructive_path
+
 
 IGNORED_DIRS = {
     ".git", ".hg", ".svn",
@@ -123,6 +125,9 @@ def resolve_existing_path(cwd: Path, virtual_mode: bool, path: str, expected: st
 
 
 def delete_directory_path(target: Path, recursive: bool) -> None:
+    denied = deny_recursive_destructive_path(target, recursive=recursive)
+    if denied:
+        raise PermissionError(denied)
     if recursive:
         shutil.rmtree(target)
         return

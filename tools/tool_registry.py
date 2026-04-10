@@ -4,7 +4,6 @@ import inspect
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence, Union
@@ -15,54 +14,6 @@ from core.config import AgentConfig
 from core.tool_policy import ToolMetadata, default_tool_metadata
 
 logger = logging.getLogger(__name__)
-_MCP_MUTATING_KEYWORDS = {
-    "append",
-    "create",
-    "download",
-    "edit",
-    "insert",
-    "mkdir",
-    "modify",
-    "move",
-    "patch",
-    "rename",
-    "replace",
-    "save",
-    "update",
-    "upload",
-    "write",
-}
-_MCP_DESTRUCTIVE_KEYWORDS = {
-    "delete",
-    "destroy",
-    "erase",
-    "kill",
-    "purge",
-    "remove",
-    "rm",
-    "rmdir",
-    "terminate",
-    "trash",
-    "unlink",
-    "wipe",
-}
-_MCP_EXECUTION_KEYWORDS = {
-    "bash",
-    "cmd",
-    "command",
-    "exec",
-    "execute",
-    "powershell",
-    "process",
-    "python",
-    "run",
-    "script",
-    "shell",
-    "spawn",
-    "start",
-    "terminal",
-}
-_MCP_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(frozen=True)
@@ -130,39 +81,45 @@ class ToolRegistry:
                 ),
                 configure=self._configure_safety,
                 metadata={
-                    "file_info_tool": ToolMetadata(name="file_info", read_only=True),
-                    "read_file_tool": ToolMetadata(name="read_file", read_only=True),
+                    "file_info_tool": ToolMetadata(name="file_info", read_only=True, impact_scope="files", ui_kind="read"),
+                    "read_file_tool": ToolMetadata(name="read_file", read_only=True, impact_scope="files", ui_kind="read"),
                     "write_file_tool": ToolMetadata(
-                        name="write_file", mutating=True, requires_approval=True
+                        name="write_file", mutating=True, requires_approval=True, impact_scope="files", ui_kind="write"
                     ),
                     "edit_file_tool": ToolMetadata(
-                        name="edit_file", mutating=True, requires_approval=True
+                        name="edit_file", mutating=True, requires_approval=True, impact_scope="files", ui_kind="edit"
                     ),
-                    "list_directory_tool": ToolMetadata(name="list_directory", read_only=True),
+                    "list_directory_tool": ToolMetadata(name="list_directory", read_only=True, impact_scope="files", ui_kind="read"),
                     "safe_delete_file": ToolMetadata(
                         name="safe_delete_file",
                         mutating=True,
                         destructive=True,
                         requires_approval=True,
+                        impact_scope="files",
+                        ui_kind="delete",
                     ),
                     "safe_delete_directory": ToolMetadata(
                         name="safe_delete_directory",
                         mutating=True,
                         destructive=True,
                         requires_approval=True,
+                        impact_scope="files",
+                        ui_kind="delete",
                     ),
                     "download_file": ToolMetadata(
                         name="download_file",
                         mutating=True,
                         requires_approval=True,
                         networked=True,
+                        impact_scope="files",
+                        ui_kind="write",
                     ),
-                    "search_in_file_tool": ToolMetadata(name="search_in_file", read_only=True),
+                    "search_in_file_tool": ToolMetadata(name="search_in_file", read_only=True, impact_scope="files", ui_kind="search"),
                     "search_in_directory_tool": ToolMetadata(
-                        name="search_in_directory", read_only=True
+                        name="search_in_directory", read_only=True, impact_scope="files", ui_kind="search"
                     ),
-                    "tail_file_tool": ToolMetadata(name="tail_file", read_only=True),
-                    "find_file_tool": ToolMetadata(name="find_file", read_only=True),
+                    "tail_file_tool": ToolMetadata(name="tail_file", read_only=True, impact_scope="files", ui_kind="read"),
+                    "find_file_tool": ToolMetadata(name="find_file", read_only=True, impact_scope="files", ui_kind="search"),
                 },
             ),
             ToolLoaderSpec(
@@ -176,12 +133,16 @@ class ToolRegistry:
                         mutating=True,
                         destructive=True,
                         requires_approval=True,
+                        impact_scope="files",
+                        ui_kind="delete",
                     ),
                     "safe_delete_directory": ToolMetadata(
                         name="safe_delete_directory",
                         mutating=True,
                         destructive=True,
                         requires_approval=True,
+                        impact_scope="files",
+                        ui_kind="delete",
                     ),
                 },
             ),
@@ -193,16 +154,16 @@ class ToolRegistry:
                 optional_tool_names=("crawl_site",),
                 configure=self._configure_search,
                 metadata={
-                    "web_search": ToolMetadata(name="web_search", read_only=True, networked=True),
+                    "web_search": ToolMetadata(name="web_search", read_only=True, networked=True, impact_scope="network", ui_kind="search"),
                     "batch_web_search": ToolMetadata(
-                        name="batch_web_search", read_only=True, networked=True
+                        name="batch_web_search", read_only=True, networked=True, impact_scope="network", ui_kind="search"
                     ),
                     "fetch_content": ToolMetadata(
-                        name="fetch_content", read_only=True, networked=True
+                        name="fetch_content", read_only=True, networked=True, impact_scope="network", ui_kind="read"
                     ),
                 },
                 optional_metadata={
-                    "crawl_site": ToolMetadata(name="crawl_site", read_only=True, networked=True)
+                    "crawl_site": ToolMetadata(name="crawl_site", read_only=True, networked=True, impact_scope="network", ui_kind="search")
                 },
             ),
             ToolLoaderSpec(
@@ -212,14 +173,14 @@ class ToolRegistry:
                 tool_names=("get_public_ip", "lookup_ip_info", "get_system_info", "get_local_network_info"),
                 metadata={
                     "get_public_ip": ToolMetadata(
-                        name="get_public_ip", read_only=True, networked=True
+                        name="get_public_ip", read_only=True, networked=True, impact_scope="network", ui_kind="read"
                     ),
                     "lookup_ip_info": ToolMetadata(
-                        name="lookup_ip_info", read_only=True, networked=True
+                        name="lookup_ip_info", read_only=True, networked=True, impact_scope="network", ui_kind="read"
                     ),
-                    "get_system_info": ToolMetadata(name="get_system_info", read_only=True),
+                    "get_system_info": ToolMetadata(name="get_system_info", read_only=True, impact_scope="local_state", ui_kind="read"),
                     "get_local_network_info": ToolMetadata(
-                        name="get_local_network_info", read_only=True
+                        name="get_local_network_info", read_only=True, impact_scope="network", ui_kind="read"
                     ),
                 },
             ),
@@ -234,15 +195,19 @@ class ToolRegistry:
                         name="run_background_process",
                         mutating=True,
                         requires_approval=True,
+                        impact_scope="processes",
+                        ui_kind="process",
                     ),
                     "stop_background_process": ToolMetadata(
                         name="stop_background_process",
                         mutating=True,
                         destructive=True,
                         requires_approval=True,
+                        impact_scope="processes",
+                        ui_kind="process",
                     ),
                     "find_process_by_port": ToolMetadata(
-                        name="find_process_by_port", read_only=True
+                        name="find_process_by_port", read_only=True, impact_scope="processes", ui_kind="process"
                     ),
                 },
             ),
@@ -258,6 +223,8 @@ class ToolRegistry:
                         mutating=True,
                         destructive=True,
                         requires_approval=True,
+                        impact_scope="local_state",
+                        ui_kind="shell",
                     )
                 },
             ),
@@ -329,23 +296,40 @@ class ToolRegistry:
 
     @staticmethod
     def _infer_mcp_metadata(tool_name: str) -> ToolMetadata:
-        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", tool_name).lower()
-        tokens = set(_MCP_TOKEN_RE.findall(normalized))
+        base = default_tool_metadata(tool_name, source="mcp")
+        lowered = tool_name.lower()
+        if any(token in lowered for token in ("read", "search", "find")):
+            ui_kind = "read" if "read" in lowered else "search"
+            return ToolMetadata(
+                name=tool_name,
+                read_only=True,
+                mutating=False,
+                destructive=False,
+                requires_approval=False,
+                networked=True,
+                source="mcp",
+                impact_scope="network",
+                ui_kind=ui_kind,
+            )
+        return base
 
-        destructive = bool(tokens & _MCP_DESTRUCTIVE_KEYWORDS)
-        execution = bool(tokens & _MCP_EXECUTION_KEYWORDS)
-        mutating = destructive or execution or bool(tokens & _MCP_MUTATING_KEYWORDS)
-        requires_approval = mutating or destructive
+    @staticmethod
+    def _metadata_override_for_tool(server_name: str, cfg: Dict[str, Any], tool_name: str) -> ToolMetadata | None:
+        overrides = cfg.get("tool_metadata")
+        if not isinstance(overrides, dict):
+            return None
 
-        return ToolMetadata(
-            name=tool_name,
-            read_only=not mutating and not destructive,
-            mutating=mutating,
-            destructive=destructive or execution,
-            requires_approval=requires_approval,
-            networked=True,
-            source="mcp",
+        short_name = tool_name.split(":", 1)[-1]
+        candidates = (
+            tool_name,
+            short_name,
+            f"{server_name}:{short_name}",
         )
+        for candidate in candidates:
+            raw = overrides.get(candidate)
+            if isinstance(raw, dict):
+                return ToolMetadata.from_dict(tool_name, raw, source="mcp")
+        return None
 
     async def _load_single_mcp_server(
         self,
@@ -419,13 +403,8 @@ class ToolRegistry:
                 if mcp_tools:
                     self.tools.extend(mcp_tools)
                     for tool in mcp_tools:
-                        metadata = self._infer_mcp_metadata(tool.name)
+                        metadata = self._metadata_override_for_tool(name, cfg, tool.name) or self._infer_mcp_metadata(tool.name)
                         self.tool_metadata[tool.name] = metadata
-                        if metadata.requires_approval:
-                            logger.warning(
-                                "MCP tool '%s' was marked as approval-required by heuristic policy detection.",
-                                tool.name,
-                            )
                     self.mcp_server_status.append(
                         {
                             "server": name,

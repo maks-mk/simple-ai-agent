@@ -3,6 +3,7 @@ import os
 from typing import Optional
 from langchain_core.tools import tool
 
+from core.destructive_guardrails import deny_recursive_destructive_command
 from core.utils import truncate_output
 from core.errors import format_error, ErrorType
 from core.safety_policy import SafetyPolicy
@@ -85,6 +86,10 @@ async def cli_exec(command: str) -> str:
 
     if not command.strip():
         return format_error(ErrorType.VALIDATION, "Command cannot be empty.")
+
+    denied = deny_recursive_destructive_command(command)
+    if denied:
+        return denied
 
     try:
         # Используем нативный asyncio.subprocess вместо потоков

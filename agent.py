@@ -60,15 +60,15 @@ def create_agent_workflow(
     config: AgentConfig,
     tools_enabled: Optional[bool] = None,
 ) -> StateGraph:
-    """Builds the LangGraph workflow where critic validates only final agent answers."""
+    """Builds the deterministic LangGraph workflow for a single user turn."""
     tools_enabled = bool(nodes.tools) and config.model_supports_tools if tools_enabled is None else tools_enabled
 
     workflow = StateGraph(AgentState)
 
     workflow.add_node("summarize", nodes.summarize_node)
     workflow.add_node("agent", nodes.agent_node)
-    workflow.add_node("critic", nodes.critic_node)
     workflow.add_node("prepare_retry", nodes.prepare_retry_node)
+    workflow.add_node("finalize_blocked", nodes.finalize_blocked_node)
     workflow.add_node("update_step", lambda state: {"steps": state.get("steps", 0) + 1})
 
     workflow.add_edge(START, "summarize")
@@ -83,39 +83,51 @@ def create_agent_workflow(
         steps = state.get("steps", 0)
 
         if steps >= config.max_loops:
-            logger.debug(f"🛑 Loop Guard: {steps} steps reached.")
-            return END
+            logger.debug("🛑 Loop Guard: %s steps reached.", steps)
+            return "finalize_blocked"
 
         messages = state.get("messages") or []
         if not messages:
-            logger.warning("Agent node returned no messages; routing to critic for a safe fallback.")
-            return "critic"
+            logger.warning("Agent node returned no messages; routing to deterministic fallback.")
+            return "prepare_retry" if int(state.get("retry_count", 0) or 0) < 1 else "finalize_blocked"
 
         last_msg = messages[-1]
+        open_tool_issue = state.get("open_tool_issue")
+        retry_count = int(state.get("retry_count", 0) or 0)
 
         if tools_enabled and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
             if nodes.tool_calls_require_approval(last_msg.tool_calls):
                 return "approval"
             return "tools"
 
-        return "critic"
-
-    def route_after_critic(state: AgentState):
         if state.get("turn_outcome") == "finish_turn":
             return END
         if state.get("turn_outcome") == "retry_agent":
             return "prepare_retry"
-        return END
+        if state.get("turn_outcome") == "finalize_blocked":
+            return "finalize_blocked"
+
+        if isinstance(last_msg, AIMessage) and str(last_msg.content).strip() and not open_tool_issue:
+            return END
+        return "prepare_retry" if retry_count < 1 else "finalize_blocked"
+
+    def route_after_tools(state: AgentState):
+        issue = state.get("open_tool_issue")
+        if not isinstance(issue, dict):
+            return "update_step"
+        if issue.get("kind") == "approval_denied":
+            return "update_step"
+        return "prepare_retry" if int(state.get("retry_count", 0) or 0) < 1 else "finalize_blocked"
 
     if tools_enabled:
-        workflow.add_conditional_edges("agent", route_after_agent, ["approval", "tools", "critic", END])
+        workflow.add_conditional_edges("agent", route_after_agent, ["approval", "tools", "prepare_retry", "finalize_blocked", END])
         workflow.add_edge("approval", "tools")
-        workflow.add_edge("tools", "update_step")
+        workflow.add_conditional_edges("tools", route_after_tools, ["update_step", "prepare_retry", "finalize_blocked"])
     else:
-        workflow.add_conditional_edges("agent", route_after_agent, ["critic", END])
+        workflow.add_conditional_edges("agent", route_after_agent, ["prepare_retry", "finalize_blocked", END])
 
-    workflow.add_conditional_edges("critic", route_after_critic, ["prepare_retry", END])
     workflow.add_edge("prepare_retry", "update_step")
+    workflow.add_edge("finalize_blocked", END)
 
     return workflow
 

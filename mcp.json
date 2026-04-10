@@ -1,20 +1,4 @@
 {
-  "filesystem": {
-    "command": "mcp-server-filesystem",
-    "args": [
-      "."
-    ],
-    "transport": "stdio",
-    "enabled": false
-  },
-  "mcp-cli-exec": {
-    "command": "mcp-cli-exec",
-    "args": [
-      ""
-    ],
-    "transport": "stdio",
-    "enabled": false
-  },
   "context7": {
     "type": "remote",
     "url": "https://mcp.context7.com/mcp",

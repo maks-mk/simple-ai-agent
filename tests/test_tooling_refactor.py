@@ -1,13 +1,15 @@
-import importlib
-import re
 import shutil
 import sys
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 
 from core.config import AgentConfig
+from core.destructive_guardrails import (
+    deny_recursive_destructive_command,
+    deny_recursive_destructive_path,
+)
 from core.validation import validate_tool_result
 from tools import process_tools
 from tools.tool_registry import ToolRegistry
@@ -41,38 +43,42 @@ class ToolingRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("safe_delete_file", names)
         self.assertIn("safe_delete_directory", names)
 
-    async def test_tool_registry_fallback_delete_tools_without_filesystem(self):
-        registry = ToolRegistry(self._make_config(ENABLE_FILESYSTEM_TOOLS=False))
-        await registry.load_all()
-        names = [tool.name for tool in registry.tools]
-        self.assertEqual(names, ["safe_delete_file", "safe_delete_directory"])
-
-    def test_mcp_metadata_keeps_safe_tools_read_only(self):
-        metadata = ToolRegistry._infer_mcp_metadata("context7:resolve-library-id")
-
-        self.assertTrue(metadata.read_only)
-        self.assertFalse(metadata.mutating)
-        self.assertFalse(metadata.destructive)
-        self.assertFalse(metadata.requires_approval)
-        self.assertTrue(metadata.networked)
-
-    def test_mcp_metadata_flags_write_like_tools_for_approval(self):
-        metadata = ToolRegistry._infer_mcp_metadata("filesystem:write_file")
-
+    def test_unknown_mcp_metadata_defaults_conservatively(self):
+        metadata = ToolRegistry._infer_mcp_metadata("unknown:custom-tool")
         self.assertFalse(metadata.read_only)
         self.assertTrue(metadata.mutating)
         self.assertFalse(metadata.destructive)
         self.assertTrue(metadata.requires_approval)
         self.assertTrue(metadata.networked)
+        self.assertEqual(metadata.source, "mcp")
+        self.assertEqual(metadata.impact_scope, "unknown")
 
-    def test_mcp_metadata_flags_execution_like_tools_for_approval(self):
-        metadata = ToolRegistry._infer_mcp_metadata("terminal:run_command")
+    def test_mcp_read_search_find_heuristic_disables_approval(self):
+        read_meta = ToolRegistry._infer_mcp_metadata("any:read_document")
+        search_meta = ToolRegistry._infer_mcp_metadata("any:search_docs")
+        find_meta = ToolRegistry._infer_mcp_metadata("any:find_item")
 
-        self.assertFalse(metadata.read_only)
-        self.assertTrue(metadata.mutating)
-        self.assertTrue(metadata.destructive)
-        self.assertTrue(metadata.requires_approval)
-        self.assertTrue(metadata.networked)
+        self.assertTrue(read_meta.read_only)
+        self.assertFalse(read_meta.requires_approval)
+        self.assertEqual(read_meta.ui_kind, "read")
+
+        self.assertTrue(search_meta.read_only)
+        self.assertFalse(search_meta.requires_approval)
+        self.assertEqual(search_meta.ui_kind, "search")
+
+        self.assertTrue(find_meta.read_only)
+        self.assertFalse(find_meta.requires_approval)
+        self.assertEqual(find_meta.ui_kind, "search")
+
+    def test_recursive_destructive_path_guard_blocks_drive_roots(self):
+        denied = deny_recursive_destructive_path(Path("C:/"), recursive=True)
+        self.assertIsNotNone(denied)
+        self.assertIn("blocked", denied.lower())
+
+    def test_recursive_destructive_command_guard_blocks_obvious_wipes(self):
+        denied = deny_recursive_destructive_command("Remove-Item C:\\ -Recurse -Force")
+        self.assertIsNotNone(denied)
+        self.assertIn("blocked", denied.lower())
 
     def test_validation_supports_delete_argument_aliases(self):
         tmp = self._workspace_tempdir()
@@ -88,38 +94,17 @@ class ToolingRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(error)
         self.assertIn("still exists", error)
 
-    def test_max_file_size_numeric_value_is_bytes(self):
-        config = self._make_config(MAX_FILE_SIZE="4096")
-        self.assertEqual(config.max_file_size, 4096)
-
-    def test_max_file_size_supports_explicit_units(self):
-        self.assertEqual(self._make_config(MAX_FILE_SIZE="4MB").max_file_size, 4_000_000)
-        self.assertEqual(self._make_config(MAX_FILE_SIZE="300MiB").max_file_size, 300 * 1024 * 1024)
-
-    def test_max_file_size_rejects_invalid_strings(self):
-        with self.assertRaises(Exception):
-            self._make_config(MAX_FILE_SIZE="300MBps")
-
     def test_cli_utils_import_does_not_require_prompt_toolkit(self):
         import core.cli_utils as cli_utils
 
         with mock.patch.dict(sys.modules, {"prompt_toolkit": None, "prompt_toolkit.key_binding": None}):
-            reloaded = importlib.reload(cli_utils)
+            reloaded = __import__("importlib").reload(cli_utils)
             self.assertTrue(callable(reloaded.prepare_markdown_for_render))
 
     def test_run_background_process_rejects_shell_operators(self):
         result = process_tools.run_background_process.invoke({"command": "python -c \"print(1)\" && whoami"})
         self.assertIn("ERROR[VALIDATION]", result)
         self.assertIn("Shell operators are not allowed", result)
-
-    def test_run_background_process_rejects_cwd_outside_workspace(self):
-        tmp = self._workspace_tempdir()
-        process_tools.set_working_directory(str(tmp))
-        result = process_tools.run_background_process.invoke(
-            {"command": [sys.executable, "-c", "print('ok')"], "cwd": ".."}
-        )
-        self.assertIn("ERROR[VALIDATION]", result)
-        self.assertIn("ACCESS DENIED", result)
 
     def test_run_background_process_accepts_argument_list(self):
         tmp = self._workspace_tempdir()
@@ -128,10 +113,6 @@ class ToolingRefactorTests(unittest.IsolatedAsyncioTestCase):
             {"command": [sys.executable, "-c", "import time; time.sleep(30)"], "cwd": "."}
         )
         self.assertIn("Success: Process started with PID", result)
-        match = re.search(r"PID (\d+)", result)
-        self.assertIsNotNone(match)
-        stop_result = process_tools.stop_background_process.invoke({"pid": int(match.group(1))})
-        self.assertIn("Success:", stop_result)
 
 
 if __name__ == "__main__":

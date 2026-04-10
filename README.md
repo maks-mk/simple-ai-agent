@@ -6,7 +6,8 @@
 
 - Граф без `critic`-узла: контроль хода делается через явные поля состояния (`retry_count`, `retry_reason`, `turn_outcome`, `final_issue`).
 - Маршрутизация после `agent` детерминированная: `approval | tools | prepare_retry | finalize_blocked | END`.
-- Retry-бюджет ограничен: 1 авто-повтор для пустого/протокольно-сломанного ответа или нерешённой tool-проблемы.
+- Retry/recovery-бюджет ограничен и настраивается через `MAX_RECOVERY_ATTEMPTS`; по умолчанию агент допускает несколько LLM-recoverable попыток в одном ходе, а не только один авто-повтор.
+- После реального прогресса recovery-счётчик сбрасывается, чтобы успешные промежуточные шаги не “съедали” шанс на дальнейшую нормальную работу.
 - Approval flow построен через LangGraph `interrupt`, с решениями `Yes / No / Always` в CLI.
 - Tool metadata задаётся явно для локальных tools; для MCP применяется безопасный дефолт + минимальная эвристика.
 - Для MCP-tools по умолчанию включён approval; авто-исключение только для имён с `read`, `search`, `find`.
@@ -60,6 +61,7 @@ finalize_blocked -> END
   - `tool > <tool_name>(args)`
   - `             └→ <result/error> <duration>`
 - Фазы рантайма: `Thinking`, `Running tools`, `Awaiting approval`, `Recovering`, `Finishing`.
+- При tool-ошибках граф не останавливается сразу: если ошибка выглядит recoverable, агент получает повторный шанс перепланировать ход; если бюджет исчерпан, ход завершается контролируемо через `finalize_blocked`.
 - Approval-панель в минимальном виде (`Action`, `Target`) без лишних метаданных.
 - Выбор approval через стрелки `↑/↓`, подтверждение `Enter`, отмена `Esc`.
 - Нижний toolbar в едином спокойном стиле, без визуального шума.
@@ -119,8 +121,15 @@ Slash-команды:
 - `ENABLE_FILESYSTEM_TOOLS`, `ENABLE_SEARCH_TOOLS`, `ENABLE_SYSTEM_TOOLS`, `ENABLE_PROCESS_TOOLS`, `ENABLE_SHELL_TOOL`, `ENABLE_APPROVALS`
 - `ALLOW_EXTERNAL_PROCESS_CONTROL`
 - `MAX_LOOPS`, `MAX_RETRIES`, `RETRY_DELAY`
+- `MAX_RECOVERY_ATTEMPTS`
 - `SESSION_SIZE`, `SUMMARY_KEEP_LAST`
 - `MAX_TOOL_OUTPUT`, `MAX_FILE_SIZE`, `MAX_READ_LINES`, `MAX_SEARCH_CHARS`, `MAX_BACKGROUND_PROCESSES`
+
+### Recovery policy
+
+- `MAX_RETRIES` относится к низкоуровневым попыткам вызова модели.
+- `MAX_RECOVERY_ATTEMPTS` ограничивает LLM-recoverable перепланирование внутри одного user turn.
+- Любой успешный tool-result или новый валидный tool-call сбрасывает recovery streak.
 
 ## MCP
 

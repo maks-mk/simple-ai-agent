@@ -403,6 +403,9 @@ class AgentNodes:
             )
         return "\n".join(overlay_lines).strip()
 
+    def _has_recovery_budget(self, retry_count: int) -> bool:
+        return retry_count < self.config.effective_max_recovery_attempts
+
     def _build_agent_result(
         self,
         response: AIMessage,
@@ -457,9 +460,11 @@ class AgentNodes:
         response_text = stringify_content(response.content).strip()
         retry_reason = ""
         turn_outcome = ""
+        next_retry_count = retry_count
 
         if has_tool_calls:
             turn_outcome = "run_tools"
+            next_retry_count = 0
         elif protocol_error:
             retry_reason = protocol_error
         elif not response_text:
@@ -467,20 +472,22 @@ class AgentNodes:
         elif resolved_issue and resolved_issue.get("kind") == "approval_denied":
             turn_outcome = "finish_turn"
             resolved_issue = None
+            next_retry_count = 0
         elif resolved_issue:
             retry_reason = str(resolved_issue.get("summary") or "An unresolved tool issue remains.").strip()
         else:
             turn_outcome = "finish_turn"
+            next_retry_count = 0
 
         if retry_reason:
-            turn_outcome = "retry_agent" if retry_count < 1 else "finalize_blocked"
+            turn_outcome = "retry_agent" if self._has_recovery_budget(retry_count) else "finalize_blocked"
 
         return {
             "messages": outbound_messages,
             "turn_id": turn_id,
             "current_task": current_task,
             "retry_reason": retry_reason,
-            "retry_count": retry_count,
+            "retry_count": next_retry_count,
             "turn_outcome": turn_outcome,
             "final_issue": "",
             "pending_approval": None,
@@ -721,6 +728,7 @@ class AgentNodes:
         last_result = ""
         tool_issues: List[Dict[str, Any]] = []
         approval_state = state.get("pending_approval") or {}
+        successful_results = 0
 
         # Оптимизация: собираем историю вызовов один раз, а не для каждого инструмента.
         # ВАЖНО: исключаем последний AI message, чтобы текущий вызов не считался "повтором".
@@ -747,6 +755,7 @@ class AgentNodes:
                     tool_issues.append(issue)
                 parsed = parse_tool_execution_result(tool_msg.content)
                 if parsed.ok:
+                    successful_results += 1
                     last_result = parsed.message
                 else:
                     last_error = parsed.message
@@ -765,18 +774,23 @@ class AgentNodes:
                     tool_issues.append(issue)
                 parsed = parse_tool_execution_result(tool_msg.content)
                 if parsed.ok:
+                    successful_results += 1
                     last_result = parsed.message
                 else:
                     last_error = parsed.message
+
+        merged_issue = self._merge_open_tool_issues(tool_issues, current_turn_id)
+        next_retry_count = 0 if successful_results > 0 or not merged_issue else int(state.get("retry_count", 0) or 0)
 
         return {
             "messages": final_messages,
             "turn_id": current_turn_id,
             "turn_outcome": "run_tools",
             "retry_reason": "",
+            "retry_count": next_retry_count,
             "final_issue": "",
             "pending_approval": None,
-            "open_tool_issue": self._merge_open_tool_issues(tool_issues, current_turn_id),
+            "open_tool_issue": merged_issue,
             "last_tool_error": last_error,
             "last_tool_result": last_result,
         }

@@ -437,7 +437,7 @@ def render_overview(
     out.print(
         Panel(
             body,
-            title=f"[panel.title]AI Agent[/] [dim]v{AGENT_VERSION}[/]",
+            title=f"[panel.title]AI Agent[/] [gold3]v{AGENT_VERSION}[/]",
             border_style="panel.border",
             padding=(0, 1),
         )

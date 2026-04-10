@@ -109,8 +109,8 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["messages"][-1].content, "Задача выполнена.")
         self.assertNotIn("critic_status", result)
 
-    async def test_empty_response_retries_once_then_finalizes_blocked(self):
-        config = self._make_config()
+    async def test_empty_response_retries_until_recovery_budget_exhausted(self):
+        config = self._make_config(MAX_RECOVERY_ATTEMPTS=2)
         agent_llm = FakeLLM([AIMessage(content=""), AIMessage(content="")])
         app = create_agent_workflow(
             AgentNodes(config=config, llm=FakeLLM([]), tools=[], llm_with_tools=agent_llm),
@@ -120,10 +120,10 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
 
         result = await app.ainvoke(self._initial_state("Сделай задачу"), config=self._graph_config("thread-empty", 24))
 
-        self.assertEqual(len(agent_llm.invocations), 2)
+        self.assertEqual(len(agent_llm.invocations), 3)
         self.assertEqual(result["turn_outcome"], "finish_turn")
         self.assertIn("Не удалось завершить задачу", str(result["messages"][-1].content))
-        self.assertEqual(result["retry_count"], 1)
+        self.assertEqual(result["retry_count"], 2)
 
     async def test_valid_tool_call_routes_to_tool_execution_then_finishes(self):
         config = self._make_config()
@@ -217,7 +217,7 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed["turn_outcome"], "finish_turn")
 
     async def test_tool_failure_produces_bounded_recovery_then_blocker(self):
-        config = self._make_config()
+        config = self._make_config(MAX_RECOVERY_ATTEMPTS=2)
         failing_tool = FakeTool("demo_tool", "ERROR[EXECUTION]: boom")
         agent_llm = FakeLLM(
             [
@@ -233,9 +233,48 @@ class RuntimeRefactorTests(unittest.IsolatedAsyncioTestCase):
 
         result = await app.ainvoke(self._initial_state("Обработай файл"), config=self._graph_config("thread-fail", 36))
 
-        self.assertEqual(len(agent_llm.invocations), 2)
+        self.assertEqual(len(agent_llm.invocations), 3)
         self.assertIn("Не удалось завершить задачу", str(result["messages"][-1].content))
-        self.assertEqual(result["retry_count"], 1)
+        self.assertEqual(result["retry_count"], 2)
+
+    async def test_successful_tool_progress_resets_recovery_budget_for_later_failures(self):
+        config = self._make_config(MAX_RECOVERY_ATTEMPTS=1)
+
+        def tool_result(args):
+            action = args.get("action")
+            if action in {"fail-1", "fail-2"}:
+                return "ERROR[EXECUTION]: transient failure"
+            return "Success: progress made"
+
+        tool = FakeTool("demo_tool", tool_result)
+        agent_llm = FakeLLM(
+            [
+                AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "fail-1"}, "id": "tc-r1"}]),
+                AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "success"}, "id": "tc-r2"}]),
+                AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "fail-2"}, "id": "tc-r3"}]),
+                AIMessage(content="", tool_calls=[{"name": "demo_tool", "args": {"action": "success-2"}, "id": "tc-r4"}]),
+                AIMessage(content="Удалось продолжить после второй ошибки."),
+            ]
+        )
+        app = create_agent_workflow(
+            AgentNodes(config=config, llm=FakeLLM([]), tools=[tool], llm_with_tools=agent_llm),
+            config,
+            tools_enabled=True,
+        ).compile(checkpointer=MemorySaver())
+
+        result = await app.ainvoke(self._initial_state("Продолжай несмотря на ошибки"), config=self._graph_config("thread-reset", 48))
+
+        self.assertEqual(
+            tool.calls,
+            [
+                {"action": "fail-1"},
+                {"action": "success"},
+                {"action": "fail-2"},
+                {"action": "success-2"},
+            ],
+        )
+        self.assertEqual(result["messages"][-1].content, "Удалось продолжить после второй ошибки.")
+        self.assertEqual(result["turn_outcome"], "finish_turn")
 
     async def test_new_user_turn_ignores_old_open_tool_issue(self):
         agent_llm = FakeLLM([AIMessage(content="Короткая сводка на экране.")])

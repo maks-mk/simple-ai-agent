@@ -89,7 +89,7 @@ def create_agent_workflow(
         messages = state.get("messages") or []
         if not messages:
             logger.warning("Agent node returned no messages; routing to deterministic fallback.")
-            return "prepare_retry" if int(state.get("retry_count", 0) or 0) < 1 else "finalize_blocked"
+            return "prepare_retry" if nodes._has_recovery_budget(int(state.get("retry_count", 0) or 0)) else "finalize_blocked"
 
         last_msg = messages[-1]
         open_tool_issue = state.get("open_tool_issue")
@@ -109,7 +109,7 @@ def create_agent_workflow(
 
         if isinstance(last_msg, AIMessage) and str(last_msg.content).strip() and not open_tool_issue:
             return END
-        return "prepare_retry" if retry_count < 1 else "finalize_blocked"
+        return "prepare_retry" if nodes._has_recovery_budget(retry_count) else "finalize_blocked"
 
     def route_after_tools(state: AgentState):
         issue = state.get("open_tool_issue")
@@ -117,7 +117,7 @@ def create_agent_workflow(
             return "update_step"
         if issue.get("kind") == "approval_denied":
             return "update_step"
-        return "prepare_retry" if int(state.get("retry_count", 0) or 0) < 1 else "finalize_blocked"
+        return "prepare_retry" if nodes._has_recovery_budget(int(state.get("retry_count", 0) or 0)) else "finalize_blocked"
 
     if tools_enabled:
         workflow.add_conditional_edges("agent", route_after_agent, ["approval", "tools", "prepare_retry", "finalize_blocked", END])

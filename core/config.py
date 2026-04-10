@@ -111,6 +111,7 @@ class AgentConfig(BaseSettings):
     tool_loop_window: Optional[int] = Field(default=None, alias="TOOL_LOOP_WINDOW")
     tool_loop_limit_mutating: Optional[int] = Field(default=None, alias="TOOL_LOOP_LIMIT_MUTATING")
     tool_loop_limit_readonly: Optional[int] = Field(default=None, alias="TOOL_LOOP_LIMIT_READONLY")
+    max_recovery_attempts: Optional[int] = Field(default=None, alias="MAX_RECOVERY_ATTEMPTS")
 
     # Features Toggle
     enable_search_tools: bool = Field(default=True, alias="ENABLE_SEARCH_TOOLS")
@@ -223,6 +224,7 @@ class AgentConfig(BaseSettings):
         "tool_loop_window",
         "tool_loop_limit_mutating",
         "tool_loop_limit_readonly",
+        "max_recovery_attempts",
         mode="before",
     )
     @classmethod
@@ -265,6 +267,13 @@ class AgentConfig(BaseSettings):
         if self.tool_loop_limit_readonly is not None:
             return self.tool_loop_limit_readonly
         return max(6, min(20, self.max_loops // 4))
+
+    @functools.cached_property
+    def effective_max_recovery_attempts(self) -> int:
+        """Semantic recovery budget for LLM-recoverable failures within one user turn."""
+        if self.max_recovery_attempts is not None:
+            return self.max_recovery_attempts
+        return max(2, min(4, self.max_loops // 12 or 1))
 
     @functools.cached_property
     def safety(self):

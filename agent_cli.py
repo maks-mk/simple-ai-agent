@@ -704,9 +704,9 @@ async def _run_approval_selector(summary: ApprovalSummary) -> str | None:
 def render_user_turn(user_input: str, out: Console | None = None) -> None:
     out = _resolve_console(out)
     line = Text()
-    line.append("You", style="turn.user")
-    line.append("  ")
-    line.append(user_input)
+    #line.append("You", style="turn.user")
+    #line.append("  ")
+    #line.append(user_input)
     out.print(line)
 
 
